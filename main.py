@@ -1,4 +1,5 @@
 from fastapi import Depends, FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from auth_deps import CurrentShopContext, get_current_shop_context
 from config import get_settings
@@ -7,6 +8,20 @@ from generations_api import router as generations_router
 from images_api import router as images_router
 
 app = FastAPI(title="Ai Vastra Backend")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://192.168.1.9:5173",
+        "http://192.168.1.7:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 app.include_router(folders_router)
 app.include_router(images_router)

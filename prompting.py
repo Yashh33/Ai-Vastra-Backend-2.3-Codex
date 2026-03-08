@@ -19,6 +19,7 @@ Hard constraints:
 Output requirements:
 - Return one photorealistic image.
 - Maintain visual realism and stitching/fabric drape consistency.
+- Output image aspect image should be same as the original aspect ratio of Hero image 
 """.strip()
 
 

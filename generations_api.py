@@ -745,3 +745,76 @@ def match_color_on_generation_output(
         "edited": True,
         "applied_edits": len(normalized_edits),
     }
+
+
+@router.delete("/{generation_id}")
+def delete_generation_output(
+    generation_id: str,
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    supabase = get_supabase_admin_client()
+    generation_id = _clean_id(generation_id, "generation_id")
+
+    try:
+        result = (
+            supabase.table("generations")
+            .select("id, status, output_path")
+            .eq("id", generation_id)
+            .eq("shop_id", current.shop_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch generation",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Generation not found",
+        )
+
+    row = rows[0]
+    generation_status = str(row.get("status") or "").strip().lower()
+    output_path = str(row.get("output_path") or "").strip()
+
+    # V1: delete is only for saved outputs.
+    if generation_status != "done" or not output_path:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only completed outputs can be deleted",
+        )
+
+    try:
+        (
+            supabase.table("generations")
+            .delete()
+            .eq("id", generation_id)
+            .eq("shop_id", current.shop_id)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete generation",
+        ) from exc
+
+    storage_warning = None
+    try:
+        supabase.storage.from_("generated-outputs").remove([output_path])
+    except Exception as exc:
+        # Keep delete successful even if storage cleanup fails.
+        storage_warning = f"Generation deleted, but storage cleanup failed: {exc}"
+
+    response = {
+        "deleted": True,
+        "generation_id": generation_id,
+        "output_path": output_path,
+    }
+    if storage_warning:
+        response["warning"] = storage_warning
+
+    return response

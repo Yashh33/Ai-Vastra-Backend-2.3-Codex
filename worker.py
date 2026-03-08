@@ -160,6 +160,10 @@ def call_gemini_image_generation(
         ],
         config=types.GenerateContentConfig(
             response_modalities=["IMAGE"],
+            image_config=types.ImageConfig(
+            aspect_ratio="3:4",
+            image_size="2K",
+            ),
         ),
     )
 
