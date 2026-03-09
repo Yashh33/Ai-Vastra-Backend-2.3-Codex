@@ -365,9 +365,15 @@ def main() -> None:
     print(f"[worker] model: {settings.GEMINI_IMAGE_MODEL_ID}")
 
     while True:
-        handled = process_one_job(supabase, gemini_client, settings)
-        if not handled:
-            time.sleep(settings.WORKER_POLL_INTERVAL_SECONDS)
+        try:
+            handled = process_one_job(supabase, gemini_client, settings)
+            if not handled:
+                time.sleep(settings.WORKER_POLL_INTERVAL_SECONDS)
+        except Exception as exc:
+            print(f"[worker] loop error: {short_error_message(exc)}")
+            traceback.print_exc()
+            # Prevent transient network/service errors from crashing the worker process.
+            time.sleep(max(5, settings.WORKER_POLL_INTERVAL_SECONDS))
 
 
 if __name__ == "__main__":
