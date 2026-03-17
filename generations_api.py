@@ -12,11 +12,19 @@ from supabase_client import get_supabase_admin_client
 router = APIRouter(prefix="/generations", tags=["Generations"])
 
 _ALLOWED_STATUSES = {"queued", "processing", "done", "failed"}
+_ALLOWED_APPLY_TO = {"shirt", "pant", "suit_full_body", "suit_upper", "koti"}
+
+
+class GenerationCreateFabricItem(BaseModel):
+    fabric_image_id: str = Field(..., min_length=1)
+    apply_to: str = Field(..., min_length=1)
 
 
 class GenerationCreateRequest(BaseModel):
     hero_image_id: str = Field(..., min_length=1)
-    fabric_image_id: str = Field(..., min_length=1)
+    # Backward-compatible single-fabric field (older clients).
+    fabric_image_id: Optional[str] = Field(default=None, min_length=1)
+    fabrics: list[GenerationCreateFabricItem] = Field(default_factory=list)
 
 
 class GenerationMatchColorEdit(BaseModel):
@@ -98,6 +106,68 @@ def _load_folder_prompt_context_for_hero_image(
         )
 
     return folder_rows[0]
+
+
+def _normalize_generation_fabrics(body: GenerationCreateRequest) -> list[dict[str, str]]:
+    raw_fabrics = list(body.fabrics or [])
+
+    if not raw_fabrics and body.fabric_image_id:
+        # Backward-compatible path: treat single legacy fabric as full-body garment material.
+        raw_fabrics = [
+            GenerationCreateFabricItem(
+                fabric_image_id=body.fabric_image_id,
+                apply_to="suit_full_body",
+            )
+        ]
+
+    if not raw_fabrics:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one fabric is required",
+        )
+
+    if len(raw_fabrics) > 3:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At most 3 fabrics are allowed per generation",
+        )
+
+    normalized: list[dict[str, str]] = []
+    seen_apply_to: set[str] = set()
+
+    for item in raw_fabrics:
+        fabric_image_id = _clean_id(item.fabric_image_id, "fabric_image_id")
+        apply_to = (item.apply_to or "").strip().lower()
+        if apply_to not in _ALLOWED_APPLY_TO:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Invalid apply_to value. Allowed values: "
+                    "shirt, pant, suit_full_body, suit_upper, koti"
+                ),
+            )
+
+        if apply_to in seen_apply_to:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Duplicate apply_to value: {apply_to}",
+            )
+        seen_apply_to.add(apply_to)
+
+        normalized.append(
+            {
+                "fabric_image_id": fabric_image_id,
+                "apply_to": apply_to,
+            }
+        )
+
+    if len(normalized) > 1 and any(item["apply_to"] == "suit_full_body" for item in normalized):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="suit_full_body cannot be combined with other apply_to values",
+        )
+
+    return normalized
 
 
 def _normalize_hex_color(value: str) -> str:
@@ -406,7 +476,8 @@ def create_generation(
     settings = get_settings()
 
     hero_image_id = _clean_id(body.hero_image_id, "hero_image_id")
-    fabric_image_id = _clean_id(body.fabric_image_id, "fabric_image_id")
+    normalized_fabrics = _normalize_generation_fabrics(body)
+    primary_fabric_image_id = normalized_fabrics[0]["fabric_image_id"]
 
     # Build prompt before charging credits so prompt lookup failures do not debit the user.
     folder_context = _load_folder_prompt_context_for_hero_image(
@@ -417,16 +488,17 @@ def create_generation(
     prompt_used = build_generation_prompt(
         folder_name=folder_context.get("name"),
         folder_prompt_template=folder_context.get("prompt_template"),
+        fabric_assignments=normalized_fabrics,
     )
 
     try:
         result = (
             supabase.rpc(
-                "create_generation_with_credit_debit",
+                "create_generation_with_credit_debit_v2",
                 {
                     "p_shop_id": current.shop_id,
                     "p_hero_image_id": hero_image_id,
-                    "p_fabric_image_id": fabric_image_id,
+                    "p_fabrics": normalized_fabrics,
                     "p_credits_cost": settings.CREDITS_PER_GENERATION,
                 },
             )
@@ -453,6 +525,24 @@ def create_generation(
                 detail="Fabric image not found for this shop",
             ) from exc
 
+        if "one or more fabric images not found" in message:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="One or more fabric images not found for this shop",
+            ) from exc
+
+        if (
+            "invalid apply_to value" in message
+            or "duplicate apply_to value" in message
+            or "suit_full_body cannot be combined" in message
+            or "count must be between 1 and 3" in message
+            or "must include fabric_image_id and apply_to" in message
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create generation",
@@ -475,7 +565,13 @@ def create_generation(
     try:
         (
             supabase.table("generations")
-            .update({"prompt_used": prompt_used})
+            .update(
+                {
+                    "prompt_used": prompt_used,
+                    # Keep legacy column populated for backward compatibility.
+                    "fabric_image_id": primary_fabric_image_id,
+                }
+            )
             .eq("id", generation_id)
             .eq("shop_id", current.shop_id)
             .execute()
@@ -818,3 +914,5 @@ def delete_generation_output(
         response["warning"] = storage_warning
 
     return response
+
+

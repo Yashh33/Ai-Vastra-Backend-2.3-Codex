@@ -41,7 +41,7 @@ def fetch_generation_assets(supabase, job: dict) -> dict:
     generation_id = str(job["id"])
     shop_id = str(job["shop_id"])
     hero_image_id = str(job["hero_image_id"])
-    fabric_image_id = str(job["fabric_image_id"])
+    legacy_fabric_image_id = str(job["fabric_image_id"]) if job.get("fabric_image_id") else ""
 
     gen_result = (
         supabase.table("generations")
@@ -69,18 +69,75 @@ def fetch_generation_assets(supabase, job: dict) -> dict:
         raise RuntimeError("Hero image metadata missing")
     hero = hero_rows[0]
 
-    fabric_result = (
-        supabase.table("fabric_images")
-        .select("id, shop_id, storage_path, mime_type")
-        .eq("id", fabric_image_id)
+    mapping_result = (
+        supabase.table("generation_fabrics")
+        .select("fabric_image_id, apply_to, sort_order")
+        .eq("generation_id", generation_id)
         .eq("shop_id", shop_id)
-        .limit(1)
+        .order("sort_order", desc=False)
         .execute()
     )
-    fabric_rows = getattr(fabric_result, "data", None) or []
-    if not fabric_rows:
-        raise RuntimeError("Fabric image metadata missing")
-    fabric = fabric_rows[0]
+    mapping_rows = getattr(mapping_result, "data", None) or []
+
+    mapped_fabrics: list[dict] = []
+
+    if mapping_rows:
+        for row in mapping_rows:
+            fabric_image_id = str(row.get("fabric_image_id") or "").strip()
+            if not fabric_image_id:
+                raise RuntimeError("generation_fabrics row missing fabric_image_id")
+
+            fabric_result = (
+                supabase.table("fabric_images")
+                .select("id, shop_id, storage_path, mime_type")
+                .eq("id", fabric_image_id)
+                .eq("shop_id", shop_id)
+                .limit(1)
+                .execute()
+            )
+            fabric_rows = getattr(fabric_result, "data", None) or []
+            if not fabric_rows:
+                raise RuntimeError(
+                    f"Fabric image metadata missing for fabric_image_id={fabric_image_id}"
+                )
+
+            fabric = fabric_rows[0]
+            mapped_fabrics.append(
+                {
+                    "id": str(fabric["id"]),
+                    "storage_path": str(fabric["storage_path"]),
+                    "mime_type": str(fabric.get("mime_type") or "image/jpeg"),
+                    "apply_to": str(row.get("apply_to") or ""),
+                    "sort_order": int(row.get("sort_order") or 0),
+                }
+            )
+    else:
+        # Backward-compatible fallback for legacy single-fabric generations.
+        if not legacy_fabric_image_id:
+            raise RuntimeError("Fabric image metadata missing")
+
+        fabric_result = (
+            supabase.table("fabric_images")
+            .select("id, shop_id, storage_path, mime_type")
+            .eq("id", legacy_fabric_image_id)
+            .eq("shop_id", shop_id)
+            .limit(1)
+            .execute()
+        )
+        fabric_rows = getattr(fabric_result, "data", None) or []
+        if not fabric_rows:
+            raise RuntimeError("Fabric image metadata missing")
+
+        fabric = fabric_rows[0]
+        mapped_fabrics.append(
+            {
+                "id": str(fabric["id"]),
+                "storage_path": str(fabric["storage_path"]),
+                "mime_type": str(fabric.get("mime_type") or "image/jpeg"),
+                "apply_to": "suit_full_body",
+                "sort_order": 1,
+            }
+        )
 
     prompt_used = generation.get("prompt_used")
     if not prompt_used:
@@ -89,7 +146,7 @@ def fetch_generation_assets(supabase, job: dict) -> dict:
     return {
         "generation": generation,
         "hero": hero,
-        "fabric": fabric,
+        "fabrics": mapped_fabrics,
         "prompt_used": str(prompt_used),
     }
 
@@ -142,22 +199,27 @@ def call_gemini_image_generation(
     prompt: str,
     hero_image_bytes: bytes,
     hero_mime_type: str,
-    fabric_image_bytes: bytes,
-    fabric_mime_type: str,
+    fabric_inputs: list[dict[str, Any]],
 ) -> Tuple[bytes, str, Optional[str]]:
+    contents: list[Any] = [
+        prompt,
+        types.Part.from_bytes(
+            data=hero_image_bytes,
+            mime_type=hero_mime_type or "image/jpeg",
+        ),
+    ]
+
+    for fabric_input in fabric_inputs:
+        contents.append(
+            types.Part.from_bytes(
+                data=fabric_input["bytes"],
+                mime_type=str(fabric_input.get("mime_type") or "image/jpeg"),
+            )
+        )
+
     response = client.models.generate_content(
         model=model_id,
-        contents=[
-            prompt,
-            types.Part.from_bytes(
-                data=hero_image_bytes,
-                mime_type=hero_mime_type or "image/jpeg",
-            ),
-            types.Part.from_bytes(
-                data=fabric_image_bytes,
-                mime_type=fabric_mime_type or "image/jpeg",
-            ),
-        ],
+        contents=contents,
         config=types.GenerateContentConfig(
             response_modalities=["IMAGE"],
             image_config=types.ImageConfig(
@@ -268,20 +330,33 @@ def process_one_job(supabase, gemini_client: genai.Client, settings) -> bool:
         assets = fetch_generation_assets(supabase, job)
 
         hero = assets["hero"]
-        fabric = assets["fabric"]
+        fabrics = assets["fabrics"]
         prompt_used = assets["prompt_used"]
 
         hero_path = str(hero["storage_path"])
-        fabric_path = str(fabric["storage_path"])
-
         hero_mime = str(hero.get("mime_type") or "image/jpeg")
-        fabric_mime = str(fabric.get("mime_type") or "image/jpeg")
 
         print(f"[worker] downloading hero image: {hero_path}")
         hero_bytes = download_storage_bytes(supabase, "hero-images", hero_path)
 
-        print(f"[worker] downloading fabric image: {fabric_path}")
-        fabric_bytes = download_storage_bytes(supabase, "fabric-images", fabric_path)
+        fabric_inputs: list[dict[str, Any]] = []
+        for idx, fabric in enumerate(fabrics, start=1):
+            fabric_path = str(fabric["storage_path"])
+            fabric_mime = str(fabric.get("mime_type") or "image/jpeg")
+            apply_to = str(fabric.get("apply_to") or "unknown")
+
+            print(
+                "[worker] downloading fabric image "
+                f"{idx}/{len(fabrics)} apply_to={apply_to}: {fabric_path}"
+            )
+            fabric_bytes = download_storage_bytes(supabase, "fabric-images", fabric_path)
+            fabric_inputs.append(
+                {
+                    "bytes": fabric_bytes,
+                    "mime_type": fabric_mime,
+                    "apply_to": apply_to,
+                }
+            )
 
         print(f"[worker] calling Gemini model: {settings.GEMINI_IMAGE_MODEL_ID}")
         output_bytes, output_mime, external_request_id = call_gemini_image_generation(
@@ -290,8 +365,7 @@ def process_one_job(supabase, gemini_client: genai.Client, settings) -> bool:
             prompt_used,
             hero_bytes,
             hero_mime,
-            fabric_bytes,
-            fabric_mime,
+            fabric_inputs,
         )
 
         ext = guess_output_extension(output_mime)
