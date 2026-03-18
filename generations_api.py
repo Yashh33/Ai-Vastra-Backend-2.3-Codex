@@ -1,5 +1,5 @@
 import io
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -18,6 +18,8 @@ _ALLOWED_APPLY_TO = {"shirt", "pant", "suit_full_body", "suit_upper", "koti"}
 class GenerationCreateFabricItem(BaseModel):
     fabric_image_id: str = Field(..., min_length=1)
     apply_to: str = Field(..., min_length=1)
+    fabric_code: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    fabric_color: Optional[str] = Field(default=None, min_length=1, max_length=120)
 
 
 class GenerationCreateRequest(BaseModel):
@@ -52,6 +54,158 @@ def _clean_id(value: str, field_name: str) -> str:
         )
     return cleaned
 
+
+
+def _clean_optional_text(value: Optional[str], max_length: int = 120) -> Optional[str]:
+    if value is None:
+        return None
+
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+
+    return cleaned[:max_length]
+
+
+def _format_apply_to_label(value: str) -> str:
+    mapping = {
+        "shirt": "Shirt",
+        "pant": "Pant",
+        "suit_full_body": "Suit-Full Body",
+        "suit_upper": "Suit-Upper",
+        "koti": "Koti",
+    }
+    key = (value or "").strip().lower()
+    return mapping.get(key, value or "Garment")
+
+
+def _build_fabric_summary_label(fabrics: list[dict[str, Any]]) -> Optional[str]:
+    if not fabrics:
+        return None
+
+    parts: list[str] = []
+    ordered = sorted(fabrics, key=lambda item: int(item.get("sort_order") or 0))
+
+    for item in ordered:
+        apply_to_label = _format_apply_to_label(str(item.get("apply_to") or ""))
+        fabric_code = _clean_optional_text(item.get("fabric_code"))
+
+        if fabric_code:
+            parts.append(f"{apply_to_label}: {fabric_code}")
+        elif apply_to_label:
+            parts.append(apply_to_label)
+
+    if not parts:
+        return None
+
+    return " | ".join(parts)
+
+
+def _attach_generation_fabric_metadata(
+    *,
+    supabase,
+    shop_id: str,
+    generation_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not generation_rows:
+        return generation_rows
+
+    generation_ids = [str(row.get("id") or "").strip() for row in generation_rows]
+    generation_ids = [value for value in generation_ids if value]
+    if not generation_ids:
+        return generation_rows
+
+    try:
+        result = (
+            supabase.table("generation_fabrics")
+            .select("generation_id, apply_to, sort_order, fabric_code, fabric_color")
+            .eq("shop_id", shop_id)
+            .in_("generation_id", generation_ids)
+            .order("sort_order", desc=False)
+            .execute()
+        )
+        fabric_rows = getattr(result, "data", None) or []
+    except Exception as exc:
+        # Backward-compatible fallback if DB columns are not migrated yet.
+        message = str(exc).lower()
+        if "fabric_code" in message or "fabric_color" in message:
+            try:
+                fallback_result = (
+                    supabase.table("generation_fabrics")
+                    .select("generation_id, apply_to, sort_order")
+                    .eq("shop_id", shop_id)
+                    .in_("generation_id", generation_ids)
+                    .order("sort_order", desc=False)
+                    .execute()
+                )
+                fallback_rows = getattr(fallback_result, "data", None) or []
+                fabric_rows = [
+                    {
+                        **row,
+                        "fabric_code": None,
+                        "fabric_color": None,
+                    }
+                    for row in fallback_rows
+                ]
+            except Exception:
+                return generation_rows
+        else:
+            return generation_rows
+
+    by_generation: dict[str, list[dict[str, Any]]] = {}
+    for item in fabric_rows:
+        generation_id = str(item.get("generation_id") or "").strip()
+        if not generation_id:
+            continue
+        by_generation.setdefault(generation_id, []).append(item)
+
+    enriched: list[dict[str, Any]] = []
+    for row in generation_rows:
+        generation_id = str(row.get("id") or "").strip()
+        fabrics = by_generation.get(generation_id, [])
+
+        next_row = dict(row)
+        if fabrics:
+            next_row["generation_fabrics"] = fabrics
+            summary = _build_fabric_summary_label(fabrics)
+            if summary:
+                next_row["fabric_summary_label"] = summary
+
+        enriched.append(next_row)
+
+    return enriched
+
+
+def _persist_generation_fabric_metadata(
+    *,
+    supabase,
+    shop_id: str,
+    generation_id: str,
+    normalized_fabrics: list[dict[str, Any]],
+) -> Optional[str]:
+    if not normalized_fabrics:
+        return None
+
+    try:
+        for item in normalized_fabrics:
+            payload = {
+                "fabric_code": _clean_optional_text(item.get("fabric_code")),
+                "fabric_color": _clean_optional_text(item.get("fabric_color")),
+            }
+
+            (
+                supabase.table("generation_fabrics")
+                .update(payload)
+                .eq("generation_id", generation_id)
+                .eq("shop_id", shop_id)
+                .eq("fabric_image_id", item["fabric_image_id"])
+                .eq("apply_to", item["apply_to"])
+                .execute()
+            )
+    except Exception as exc:
+        return f"Generation queued, but fabric metadata could not be saved: {exc}"
+
+    return None
 
 def _load_folder_prompt_context_for_hero_image(
     *,
@@ -108,15 +262,19 @@ def _load_folder_prompt_context_for_hero_image(
     return folder_rows[0]
 
 
-def _normalize_generation_fabrics(body: GenerationCreateRequest) -> list[dict[str, str]]:
+def _normalize_generation_fabrics(body: GenerationCreateRequest) -> list[dict[str, Any]]:
     raw_fabrics = list(body.fabrics or [])
+    is_legacy_single = False
 
     if not raw_fabrics and body.fabric_image_id:
         # Backward-compatible path: treat single legacy fabric as full-body garment material.
+        is_legacy_single = True
         raw_fabrics = [
             GenerationCreateFabricItem(
                 fabric_image_id=body.fabric_image_id,
                 apply_to="suit_full_body",
+                fabric_code=None,
+                fabric_color=None,
             )
         ]
 
@@ -132,7 +290,7 @@ def _normalize_generation_fabrics(body: GenerationCreateRequest) -> list[dict[st
             detail="At most 3 fabrics are allowed per generation",
         )
 
-    normalized: list[dict[str, str]] = []
+    normalized: list[dict[str, Any]] = []
     seen_apply_to: set[str] = set()
 
     for item in raw_fabrics:
@@ -154,10 +312,19 @@ def _normalize_generation_fabrics(body: GenerationCreateRequest) -> list[dict[st
             )
         seen_apply_to.add(apply_to)
 
+        fabric_code = _clean_optional_text(item.fabric_code)
+        if not fabric_code and not is_legacy_single:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="fabric_code is required for each fabric",
+            )
+
         normalized.append(
             {
                 "fabric_image_id": fabric_image_id,
                 "apply_to": apply_to,
+                "fabric_code": fabric_code,
+                "fabric_color": _clean_optional_text(item.fabric_color),
             }
         )
 
@@ -537,6 +704,7 @@ def create_generation(
             or "suit_full_body cannot be combined" in message
             or "count must be between 1 and 3" in message
             or "must include fabric_image_id and apply_to" in message
+            or "fabric_code is required" in message
         ):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -580,6 +748,13 @@ def create_generation(
         prompt_saved = False
         prompt_save_warning = f"Generation queued, but prompt could not be saved: {exc}"
 
+    fabric_metadata_warning = _persist_generation_fabric_metadata(
+        supabase=supabase,
+        shop_id=current.shop_id,
+        generation_id=generation_id,
+        normalized_fabrics=normalized_fabrics,
+    )
+
     response = {
         "id": generation_id,
         "status": row["status"],
@@ -589,8 +764,14 @@ def create_generation(
         "prompt_saved": prompt_saved,
     }
 
+    warnings: list[str] = []
     if prompt_save_warning:
-        response["warning"] = prompt_save_warning
+        warnings.append(prompt_save_warning)
+    if fabric_metadata_warning:
+        warnings.append(fabric_metadata_warning)
+
+    if warnings:
+        response["warning"] = " | ".join(warnings)
 
     return response
 
@@ -636,7 +817,12 @@ def list_generations(
             detail="Failed to fetch generations",
         ) from exc
 
-    return getattr(result, "data", None) or []
+    rows = getattr(result, "data", None) or []
+    return _attach_generation_fabric_metadata(
+        supabase=supabase,
+        shop_id=current.shop_id,
+        generation_rows=rows,
+    )
 
 
 @router.get("/{generation_id}")
@@ -670,7 +856,12 @@ def get_generation(
             detail="Generation not found",
         )
 
-    return rows[0]
+    enriched = _attach_generation_fabric_metadata(
+        supabase=supabase,
+        shop_id=current.shop_id,
+        generation_rows=rows,
+    )
+    return enriched[0]
 
 
 @router.get("/{generation_id}/download-url")
@@ -914,5 +1105,4 @@ def delete_generation_output(
         response["warning"] = storage_warning
 
     return response
-
 
