@@ -207,6 +207,66 @@ def _persist_generation_fabric_metadata(
 
     return None
 
+
+def _find_generation_ids_by_fabric_filters(
+    *,
+    supabase,
+    shop_id: str,
+    fabric_code: Optional[str],
+    fabric_color: Optional[str],
+) -> Optional[list[str]]:
+    code_filter = _clean_optional_text(fabric_code)
+    color_filter = _clean_optional_text(fabric_color)
+
+    if not code_filter and not color_filter:
+        return None
+
+    query = (
+        supabase.table("generation_fabrics")
+        .select("generation_id")
+        .eq("shop_id", shop_id)
+    )
+
+    if code_filter:
+        query = query.ilike("fabric_code", f"%{code_filter}%")
+
+    if color_filter:
+        query = query.ilike("fabric_color", f"%{color_filter}%")
+
+    query = query.limit(5000)
+
+    try:
+        result = query.execute()
+    except Exception as exc:
+        message = str(exc).lower()
+        if "fabric_code" in message or "fabric_color" in message:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    "Fabric filter columns are missing in database. "
+                    "Run migration for generation_fabrics.fabric_code/fabric_color."
+                ),
+            ) from exc
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to filter generations by fabric metadata",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    seen: set[str] = set()
+    generation_ids: list[str] = []
+
+    for row in rows:
+        generation_id = str(row.get("generation_id") or "").strip()
+        if not generation_id or generation_id in seen:
+            continue
+
+        seen.add(generation_id)
+        generation_ids.append(generation_id)
+
+    return generation_ids
+
 def _load_folder_prompt_context_for_hero_image(
     *,
     supabase,
@@ -780,6 +840,8 @@ def create_generation(
 def list_generations(
     status_filter: Optional[str] = Query(default=None, alias="status"),
     folder_id: Optional[str] = Query(default=None),
+    fabric_code: Optional[str] = Query(default=None),
+    fabric_color: Optional[str] = Query(default=None),
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     current: CurrentShopContext = Depends(get_current_shop_context),
@@ -794,6 +856,13 @@ def list_generations(
                 detail="Invalid status filter",
             )
 
+    filtered_generation_ids = _find_generation_ids_by_fabric_filters(
+        supabase=supabase,
+        shop_id=current.shop_id,
+        fabric_code=fabric_code,
+        fabric_color=fabric_color,
+    )
+
     query = (
         supabase.table("generations")
         .select("*")
@@ -806,6 +875,11 @@ def list_generations(
 
     if folder_id and folder_id.strip():
         query = query.eq("folder_id", folder_id.strip())
+
+    if filtered_generation_ids is not None:
+        if not filtered_generation_ids:
+            return []
+        query = query.in_("id", filtered_generation_ids)
 
     query = query.range(offset, offset + limit - 1)
 
