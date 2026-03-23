@@ -50,3 +50,19 @@ export type AdminHeroImageRow = {
   created_at: string;
 };
 
+export type AdminCatalogImageRow = {
+  id: string;
+  shop_id: string;
+  folder_id: string;
+  storage_path: string;
+  original_filename: string | null;
+  mime_type: string | null;
+  file_size_bytes: number | null;
+  width: number | null;
+  height: number | null;
+  sort_order: number;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+};
+

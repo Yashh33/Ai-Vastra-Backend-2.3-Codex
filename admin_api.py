@@ -316,6 +316,22 @@ def _remove_storage_paths(*, supabase, bucket: str, paths: list[str]) -> list[st
     return warnings
 
 
+def _get_folder_start_sort_order(*, supabase, shop_id: str, folder_id: str) -> int:
+    result = (
+        supabase.table("catalog_images")
+        .select("sort_order")
+        .eq("shop_id", shop_id)
+        .eq("folder_id", folder_id)
+        .order("sort_order", desc=True)
+        .limit(1)
+        .execute()
+    )
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        return 0
+    return int(rows[0].get("sort_order") or 0) + 1
+
+
 def _delete_generation_fabrics_if_present(*, supabase, shop_id: str) -> None:
     try:
         supabase.table("generation_fabrics").delete().eq("shop_id", shop_id).execute()
@@ -654,12 +670,19 @@ def delete_shop(shop_id: str):
         column="output_path",
         shop_id=shop_id,
     )
+    catalog_paths = _collect_column_values(
+        supabase=supabase,
+        table="catalog_images",
+        column="storage_path",
+        shop_id=shop_id,
+    )
     logo_path = str(shop.get("logo_path") or "").strip()
 
     try:
         _delete_generation_fabrics_if_present(supabase=supabase, shop_id=shop_id)
         supabase.table("credit_ledger").delete().eq("shop_id", shop_id).execute()
         supabase.table("generations").delete().eq("shop_id", shop_id).execute()
+        supabase.table("catalog_images").delete().eq("shop_id", shop_id).execute()
         supabase.table("hero_images").delete().eq("shop_id", shop_id).execute()
         supabase.table("fabric_images").delete().eq("shop_id", shop_id).execute()
         supabase.table("hero_folders").delete().eq("shop_id", shop_id).execute()
@@ -675,6 +698,7 @@ def delete_shop(shop_id: str):
     warnings.extend(_remove_storage_paths(supabase=supabase, bucket="hero-images", paths=hero_paths))
     warnings.extend(_remove_storage_paths(supabase=supabase, bucket="fabric-images", paths=fabric_paths))
     warnings.extend(_remove_storage_paths(supabase=supabase, bucket="generated-outputs", paths=output_paths))
+    warnings.extend(_remove_storage_paths(supabase=supabase, bucket="catalog-images", paths=catalog_paths))
     if logo_path:
         warnings.extend(_remove_storage_paths(supabase=supabase, bucket="shop-logos", paths=[logo_path]))
 
@@ -970,4 +994,130 @@ async def upload_shop_hero_image(
         )
 
     return rows[0]
+
+
+@router.get("/shops/{shop_id}/catalog-images")
+def list_shop_catalog_images(
+    shop_id: str,
+    folder_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    supabase = get_supabase_admin_client()
+
+    query = (
+        supabase.table("catalog_images")
+        .select("*")
+        .eq("shop_id", shop_id)
+        .order("sort_order", desc=False)
+        .order("created_at", desc=False)
+    )
+
+    if folder_id and folder_id.strip():
+        query = query.eq("folder_id", folder_id.strip())
+
+    query = query.range(offset, offset + limit - 1)
+
+    result = query.execute()
+    return getattr(result, "data", None) or []
+
+
+@router.post("/shops/{shop_id}/catalog-images/upload-bulk")
+async def upload_shop_catalog_images_bulk(
+    shop_id: str,
+    folder_id: str = Form(...),
+    files: list[UploadFile] = File(...),
+):
+    supabase = get_supabase_admin_client()
+
+    normalized_folder_id = _clean_text(folder_id, "folder_id")
+
+    folder_check = (
+        supabase.table("hero_folders")
+        .select("id")
+        .eq("id", normalized_folder_id)
+        .eq("shop_id", shop_id)
+        .limit(1)
+        .execute()
+    )
+    folder_rows = getattr(folder_check, "data", None) or []
+    if not folder_rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Folder not found for this shop",
+        )
+
+    active_files = [file for file in files if file and (file.filename or "").strip()]
+    if not active_files:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one image file is required",
+        )
+
+    start_sort_order = _get_folder_start_sort_order(
+        supabase=supabase,
+        shop_id=shop_id,
+        folder_id=normalized_folder_id,
+    )
+
+    inserted_rows: list[dict[str, Any]] = []
+    sort_order = start_sort_order
+
+    for file in active_files:
+        content_type = (file.content_type or "").strip().lower() or "image/jpeg"
+        if not content_type.startswith("image/"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Only image files are allowed ({file.filename})",
+            )
+
+        data = await file.read()
+        if not data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Uploaded image file is empty ({file.filename})",
+            )
+
+        ext = _guess_extension(file.filename, content_type)
+        filename = f"{int(datetime.now().timestamp())}-{uuid4().hex[:8]}.{ext}"
+        storage_path = f"{shop_id}/{normalized_folder_id}/{filename}"
+
+        _upload_bytes_to_bucket(
+            supabase=supabase,
+            bucket="catalog-images",
+            path=storage_path,
+            data=data,
+            content_type=content_type,
+        )
+
+        metadata_payload = {
+            "shop_id": shop_id,
+            "folder_id": normalized_folder_id,
+            "storage_path": storage_path,
+            "original_filename": file.filename,
+            "mime_type": content_type,
+            "file_size_bytes": len(data),
+            "width": None,
+            "height": None,
+            "sort_order": sort_order,
+            "is_active": True,
+        }
+
+        result = supabase.table("catalog_images").insert(metadata_payload).execute()
+        rows = getattr(result, "data", None) or []
+        if not rows:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Catalog image metadata created but no response returned ({file.filename})",
+            )
+
+        inserted_rows.append(rows[0])
+        sort_order += 1
+
+    return {
+        "shop_id": shop_id,
+        "folder_id": normalized_folder_id,
+        "uploaded_count": len(inserted_rows),
+        "items": inserted_rows,
+    }
 

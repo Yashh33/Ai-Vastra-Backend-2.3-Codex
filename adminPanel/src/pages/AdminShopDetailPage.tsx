@@ -3,7 +3,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { adminFetch } from "../lib/api";
 import { useAdminAuth } from "../lib/auth";
-import type { AdminFolderRow, AdminHeroImageRow, AdminShopRow } from "../lib/types";
+import type { AdminCatalogImageRow, AdminFolderRow, AdminHeroImageRow, AdminShopRow } from "../lib/types";
 
 export function AdminShopDetailPage() {
   const { shopId = "" } = useParams();
@@ -13,6 +13,7 @@ export function AdminShopDetailPage() {
   const [shop, setShop] = useState<AdminShopRow | null>(null);
   const [folders, setFolders] = useState<AdminFolderRow[]>([]);
   const [heroImages, setHeroImages] = useState<AdminHeroImageRow[]>([]);
+  const [catalogImages, setCatalogImages] = useState<AdminCatalogImageRow[]>([]);
 
   const [loading, setLoading] = useState(false);
   const [statusText, setStatusText] = useState("Loading shop...");
@@ -35,11 +36,17 @@ export function AdminShopDetailPage() {
   const [selectedFolderId, setSelectedFolderId] = useState("");
   const [heroFile, setHeroFile] = useState<File | null>(null);
   const [uploadingHero, setUploadingHero] = useState(false);
+  const [catalogFiles, setCatalogFiles] = useState<File[]>([]);
+  const [uploadingCatalog, setUploadingCatalog] = useState(false);
 
   const [processingSuspend, setProcessingSuspend] = useState(false);
   const [deletingShop, setDeletingShop] = useState(false);
 
   const canUploadHero = useMemo(() => !!selectedFolderId && !!heroFile, [selectedFolderId, heroFile]);
+  const canUploadCatalog = useMemo(
+    () => !!selectedFolderId && catalogFiles.length > 0,
+    [selectedFolderId, catalogFiles]
+  );
 
   async function loadShopData() {
     if (!session || !shopId) return;
@@ -89,6 +96,24 @@ export function AdminShopDetailPage() {
     }
   }
 
+  async function loadCatalogImages(folderId: string) {
+    if (!session || !shopId || !folderId) {
+      setCatalogImages([]);
+      return;
+    }
+
+    try {
+      const rows = await adminFetch<AdminCatalogImageRow[]>(
+        session,
+        `/admin/shops/${encodeURIComponent(shopId)}/catalog-images?folder_id=${encodeURIComponent(folderId)}&limit=30`,
+        { method: "GET" }
+      );
+      setCatalogImages(rows);
+    } catch {
+      setCatalogImages([]);
+    }
+  }
+
   useEffect(() => {
     void loadShopData();
   }, [session, shopId]);
@@ -96,9 +121,10 @@ export function AdminShopDetailPage() {
   useEffect(() => {
     if (!selectedFolderId) {
       setHeroImages([]);
+      setCatalogImages([]);
       return;
     }
-    void loadHeroImages(selectedFolderId);
+    void Promise.all([loadHeroImages(selectedFolderId), loadCatalogImages(selectedFolderId)]);
   }, [selectedFolderId, session, shopId]);
 
   async function handleShopUpdate(event: FormEvent<HTMLFormElement>) {
@@ -233,6 +259,40 @@ export function AdminShopDetailPage() {
       setStatusText(`Hero upload failed: ${err instanceof Error ? err.message : "Unknown error"}`);
     } finally {
       setUploadingHero(false);
+    }
+  }
+
+  async function handleCatalogBulkUpload(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!session || !shopId || !selectedFolderId || !catalogFiles.length) return;
+
+    setUploadingCatalog(true);
+    try {
+      const formData = new FormData();
+      formData.append("folder_id", selectedFolderId);
+      for (const file of catalogFiles) {
+        formData.append("files", file);
+      }
+
+      const result = await adminFetch<{
+        uploaded_count: number;
+        items: AdminCatalogImageRow[];
+      }>(
+        session,
+        `/admin/shops/${encodeURIComponent(shopId)}/catalog-images/upload-bulk`,
+        {
+          method: "POST",
+          body: formData,
+        }
+      );
+
+      setCatalogFiles([]);
+      setCatalogImages((prev) => [...result.items, ...prev]);
+      setStatusText(`Catalog upload completed. ${result.uploaded_count} image(s) added.`);
+    } catch (err) {
+      setStatusText(`Catalog upload failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      setUploadingCatalog(false);
     }
   }
 
@@ -472,6 +532,48 @@ export function AdminShopDetailPage() {
               ) : (
                 <ul className="hero-list">
                   {heroImages.map((row) => (
+                    <li key={row.id}>
+                      <span>{row.original_filename || row.id}</span>
+                      <code>{row.storage_path}</code>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          ) : null}
+        </section>
+
+        <section className="card stack">
+          <h2>Upload Catalog Images (Bulk)</h2>
+          <p className="tiny muted">These images appear in customer Catalog under the selected folder.</p>
+
+          <label className="field">
+            <span>Select Images (multiple)</span>
+            <input
+              type="file"
+              accept="image/*"
+              multiple
+              onChange={(event) => {
+                const nextFiles = Array.from(event.target.files ?? []);
+                setCatalogFiles(nextFiles);
+              }}
+            />
+          </label>
+
+          <form onSubmit={handleCatalogBulkUpload}>
+            <button className="btn btn-dark" type="submit" disabled={uploadingCatalog || !canUploadCatalog}>
+              {uploadingCatalog ? "Uploading..." : "Upload Catalog Images"}
+            </button>
+          </form>
+
+          {selectedFolderId ? (
+            <div className="stack">
+              <p className="tiny muted">Recent catalog images in selected folder:</p>
+              {catalogImages.length === 0 ? (
+                <div className="empty-box">No catalog images found.</div>
+              ) : (
+                <ul className="hero-list">
+                  {catalogImages.map((row) => (
                     <li key={row.id}>
                       <span>{row.original_filename || row.id}</span>
                       <code>{row.storage_path}</code>
