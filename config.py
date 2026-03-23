@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     CREDITS_PER_GENERATION: int = Field(default=1, gt=0)
     WORKER_POLL_INTERVAL_SECONDS: float = Field(default=3, gt=0)
 
+    # Used by /admin endpoints. Keep this long and private.
+    ADMIN_PANEL_SECRET: str = Field(default="")
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
