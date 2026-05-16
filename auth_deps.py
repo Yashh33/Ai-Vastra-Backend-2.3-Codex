@@ -1,4 +1,4 @@
-from typing import Optional
+﻿from typing import Optional
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -93,10 +93,36 @@ def get_current_shop_context(
         )
 
     row = rows[0]
+    shop_id = str(row["shop_id"])
+
+    # Optional shop suspension gate (requires shops.is_suspended column).
+    try:
+        shop_result = (
+            supabase.table("shops")
+            .select("is_suspended")
+            .eq("id", shop_id)
+            .limit(1)
+            .execute()
+        )
+        shop_rows = getattr(shop_result, "data", None) or []
+        if shop_rows and bool(shop_rows[0].get("is_suspended", False)):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Shop access is suspended",
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Backward-compatible fallback if column migration is not applied yet.
+        if "is_suspended" not in str(exc).lower():
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to resolve shop status",
+            ) from exc
 
     return CurrentShopContext(
         auth_user_id=auth_user_id,
         email=email,
-        shop_id=str(row["shop_id"]),
+        shop_id=shop_id,
         role=str(row["role"]),
     )

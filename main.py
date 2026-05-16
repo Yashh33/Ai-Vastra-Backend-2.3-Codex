@@ -5,6 +5,7 @@ from admin_api import router as admin_router
 from auth_deps import CurrentShopContext, get_current_shop_context
 from config import get_settings
 from folders_api import router as folders_router
+from garment_types_api import router as garment_types_router
 from generations_api import router as generations_router
 from images_api import router as images_router
 
@@ -28,6 +29,7 @@ app.add_middleware(
 
 
 app.include_router(folders_router)
+app.include_router(garment_types_router)
 app.include_router(images_router)
 app.include_router(generations_router)
 app.include_router(admin_router)

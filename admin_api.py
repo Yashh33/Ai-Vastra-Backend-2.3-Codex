@@ -39,6 +39,10 @@ class AdminCreateFolderRequest(BaseModel):
     prompt_template: str = ""
 
 
+class AdminUpdateDefaultHeroRequest(BaseModel):
+    default_hero_image_id: Optional[str] = Field(...)
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -893,6 +897,67 @@ def create_shop_folder(shop_id: str, body: AdminCreateFolderRequest):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Folder created but no response was returned",
+        )
+
+    return rows[0]
+
+
+@router.patch("/shops/{shop_id}/folders/{folder_id}/default-hero")
+def update_shop_folder_default_hero(
+    shop_id: str,
+    folder_id: str,
+    body: AdminUpdateDefaultHeroRequest,
+):
+    supabase = get_supabase_admin_client()
+
+    default_hero_image_id = body.default_hero_image_id
+    if default_hero_image_id is not None:
+        default_hero_image_id = default_hero_image_id.strip()
+        if not default_hero_image_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="default_hero_image_id must be a UUID string or null",
+            )
+
+        image_check = (
+            supabase.table("hero_images")
+            .select("id")
+            .eq("id", default_hero_image_id)
+            .eq("shop_id", shop_id)
+            .limit(1)
+            .execute()
+        )
+        image_rows = getattr(image_check, "data", None) or []
+        if not image_rows:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Hero image not found for this shop",
+            )
+
+    try:
+        result = (
+            supabase.table("hero_folders")
+            .update(
+                {
+                    "default_hero_image_id": default_hero_image_id,
+                    "updated_at": _utc_now_iso(),
+                }
+            )
+            .eq("id", folder_id)
+            .eq("shop_id", shop_id)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update default hero image",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Folder not found for this shop",
         )
 
     return rows[0]
