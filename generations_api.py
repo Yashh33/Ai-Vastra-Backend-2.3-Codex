@@ -20,6 +20,10 @@ class GenerationCreateFabricItem(BaseModel):
     apply_to: str = Field(..., min_length=1)
     fabric_code: Optional[str] = Field(default=None, min_length=1, max_length=120)
     fabric_color: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    fabric_scale: Optional[str] = Field(
+        default=None,
+        description="Pattern scale hint: 'fine', 'medium', or 'bold'",
+    )
 
 
 class GenerationCreateRequest(BaseModel):
@@ -385,6 +389,7 @@ def _normalize_generation_fabrics(body: GenerationCreateRequest) -> list[dict[st
                 "apply_to": apply_to,
                 "fabric_code": fabric_code,
                 "fabric_color": _clean_optional_text(item.fabric_color),
+                "fabric_scale": _clean_optional_text(item.fabric_scale),
             }
         )
 
@@ -712,10 +717,15 @@ def create_generation(
         shop_id=current.shop_id,
         hero_image_id=hero_image_id,
     )
+    fabric_scale = None
+    if normalized_fabrics:
+        fabric_scale = normalized_fabrics[0].get("fabric_scale")
+
     prompt_used = build_generation_prompt(
         folder_name=folder_context.get("name"),
         folder_prompt_template=folder_context.get("prompt_template"),
         fabric_assignments=normalized_fabrics,
+        fabric_scale=fabric_scale,
     )
 
     try:
