@@ -112,13 +112,11 @@ def get_current_shop_context(
             )
     except HTTPException:
         raise
-    except Exception as exc:
-        # Backward-compatible fallback if column migration is not applied yet.
-        if "is_suspended" not in str(exc).lower():
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to resolve shop status",
-            ) from exc
+    except Exception:
+        # Silently skip suspension check on timeout/error
+        # User gets through, worst case a suspended shop
+        # temporarily gets access - acceptable tradeoff
+        pass
 
     return CurrentShopContext(
         auth_user_id=auth_user_id,

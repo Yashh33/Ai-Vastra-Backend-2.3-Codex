@@ -1,16 +1,516 @@
-﻿import { useEffect, useMemo, useState, type FormEvent } from "react";
+﻿=== D:\AiVastraBackend 2.3 Codex\adminPanel\src\lib\api.ts ===
+import type { AdminSession } from "./types";
+
+function getErrorMessage(status: number, payload: unknown): string {
+  if (typeof payload === "string" && payload.trim()) return payload;
+
+  if (payload && typeof payload === "object" && "detail" in payload) {
+    const detail = (payload as { detail?: unknown }).detail;
+    if (typeof detail === "string" && detail.trim()) return detail;
+  }
+
+  return `HTTP ${status}`;
+}
+
+export async function adminFetch<T>(
+  session: AdminSession,
+  path: string,
+  init: RequestInit = {}
+): Promise<T> {
+  const headers = new Headers(init.headers ?? {});
+  headers.set("x-admin-secret", session.adminSecret);
+
+  if (init.body && !(init.body instanceof FormData) && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+
+  const response = await fetch(`${session.apiBaseUrl}${path}`, {
+    ...init,
+    headers,
+  });
+
+  const text = await response.text();
+  let payload: unknown = null;
+
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = text;
+    }
+  }
+
+  if (!response.ok) {
+    throw new Error(getErrorMessage(response.status, payload));
+  }
+
+  return payload as T;
+}
+
+export async function verifyAdminSession(session: AdminSession): Promise<void> {
+  await adminFetch<{ ok: boolean }>(session, "/admin/session", { method: "GET" });
+}
+
+=== D:\AiVastraBackend 2.3 Codex\adminPanel\src\lib\auth.tsx ===
+import {
+  createContext,
+  useContext,
+  useMemo,
+  useState,
+  type ReactNode,
+} from "react";
+
+import { verifyAdminSession } from "./api";
+import {
+  normalizeApiBaseUrl,
+  readSessionFromStorage,
+  writeSessionToStorage,
+} from "./storage";
+import type { AdminSession } from "./types";
+
+type AdminAuthContextValue = {
+  session: AdminSession | null;
+  isAuthenticated: boolean;
+  signIn: (payload: { apiBaseUrl: string; adminSecret: string }) => Promise<void>;
+  signOut: () => void;
+};
+
+const AdminAuthContext = createContext<AdminAuthContextValue | undefined>(undefined);
+
+export function AdminAuthProvider({ children }: { children: ReactNode }) {
+  const [session, setSession] = useState<AdminSession | null>(() => readSessionFromStorage());
+
+  const value = useMemo<AdminAuthContextValue>(
+    () => ({
+      session,
+      isAuthenticated: !!session,
+      signIn: async ({ apiBaseUrl, adminSecret }) => {
+        const normalized: AdminSession = {
+          apiBaseUrl: normalizeApiBaseUrl(apiBaseUrl),
+          adminSecret: adminSecret.trim(),
+        };
+
+        if (!normalized.apiBaseUrl || !normalized.adminSecret) {
+          throw new Error("Backend URL and admin secret are required");
+        }
+
+        await verifyAdminSession(normalized);
+        setSession(normalized);
+        writeSessionToStorage(normalized);
+      },
+      signOut: () => {
+        setSession(null);
+        writeSessionToStorage(null);
+      },
+    }),
+    [session]
+  );
+
+  return <AdminAuthContext.Provider value={value}>{children}</AdminAuthContext.Provider>;
+}
+
+export function useAdminAuth() {
+  const ctx = useContext(AdminAuthContext);
+  if (!ctx) {
+    throw new Error("useAdminAuth must be used within AdminAuthProvider");
+  }
+  return ctx;
+}
+
+=== D:\AiVastraBackend 2.3 Codex\adminPanel\src\lib\env.ts ===
+const rawApiBaseUrl = import.meta.env.VITE_ADMIN_API_BASE_URL || "http://localhost:8000";
+
+export const ADMIN_ENV = {
+  apiBaseUrl: String(rawApiBaseUrl),
+};
+
+=== D:\AiVastraBackend 2.3 Codex\adminPanel\src\lib\storage.ts ===
+import type { AdminSession } from "./types";
+
+const SESSION_KEY = "aivastra_admin_session";
+
+export function normalizeApiBaseUrl(value: string) {
+  return value.trim().replace(/\/+$/, "");
+}
+
+export function readSessionFromStorage(): AdminSession | null {
+  const raw = window.localStorage.getItem(SESSION_KEY);
+  if (!raw) return null;
+
+  try {
+    const parsed = JSON.parse(raw) as AdminSession;
+    if (!parsed?.apiBaseUrl || !parsed?.adminSecret) return null;
+    return {
+      apiBaseUrl: normalizeApiBaseUrl(parsed.apiBaseUrl),
+      adminSecret: parsed.adminSecret,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function writeSessionToStorage(session: AdminSession | null) {
+  if (!session) {
+    window.localStorage.removeItem(SESSION_KEY);
+    return;
+  }
+
+  window.localStorage.setItem(
+    SESSION_KEY,
+    JSON.stringify({
+      apiBaseUrl: normalizeApiBaseUrl(session.apiBaseUrl),
+      adminSecret: session.adminSecret,
+    })
+  );
+}
+
+=== D:\AiVastraBackend 2.3 Codex\adminPanel\src\lib\types.ts ===
+export type AdminSession = {
+  apiBaseUrl: string;
+  adminSecret: string;
+};
+
+export type AdminShopRow = {
+  id: string;
+  name: string;
+  header_display_text?: string | null;
+  carousel_mode_default?: boolean;
+  logo_path?: string | null;
+  is_suspended?: boolean;
+  created_at?: string;
+  updated_at?: string;
+  owner_auth_user_id?: string | null;
+  credits_balance?: number;
+};
+
+export type AdminCreateShopResponse = {
+  shop_id: string;
+  shop_name: string;
+  auth_user_id: string;
+  email: string;
+  role: string;
+  opening_credits: number;
+  balance_before: number;
+  balance_after: number;
+};
+
+export type AdminFolderRow = {
+  id: string;
+  shop_id: string;
+  name: string;
+  prompt_template: string;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type AdminHeroImageRow = {
+  id: string;
+  shop_id: string;
+  folder_id: string;
+  storage_path: string;
+  original_filename: string | null;
+  mime_type: string | null;
+  file_size_bytes: number | null;
+  width: number | null;
+  height: number | null;
+  created_at: string;
+};
+
+export type AdminCatalogImageRow = {
+  id: string;
+  shop_id: string;
+  folder_id: string;
+  storage_path: string;
+  original_filename: string | null;
+  mime_type: string | null;
+  file_size_bytes: number | null;
+  width: number | null;
+  height: number | null;
+  sort_order: number;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+
+=== D:\AiVastraBackend 2.3 Codex\adminPanel\src\pages\AdminDashboardPage.tsx ===
+import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { Link } from "react-router-dom";
+
+import { adminFetch } from "../lib/api";
+import { useAdminAuth } from "../lib/auth";
+import type { AdminCreateShopResponse, AdminShopRow } from "../lib/types";
+
+export function AdminDashboardPage() {
+  const { session, signOut } = useAdminAuth();
+
+  const [shops, setShops] = useState<AdminShopRow[]>([]);
+  const [searchText, setSearchText] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [statusText, setStatusText] = useState("Loading shops...");
+
+  const [shopName, setShopName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [openingCredits, setOpeningCredits] = useState("0");
+  const [creating, setCreating] = useState(false);
+
+  const canCreate = useMemo(
+    () => !!shopName.trim() && !!email.trim() && password.trim().length >= 6,
+    [shopName, email, password]
+  );
+
+  async function loadShops() {
+    if (!session) return;
+    setLoading(true);
+    try {
+      const params = new URLSearchParams({ limit: "100" });
+      if (searchText.trim()) {
+        params.set("search", searchText.trim());
+      }
+
+      const rows = await adminFetch<AdminShopRow[]>(session, `/admin/shops?${params.toString()}`, {
+        method: "GET",
+      });
+
+      setShops(rows);
+      setStatusText(rows.length ? `Loaded ${rows.length} shop(s)` : "No shops found");
+    } catch (err) {
+      setStatusText(`Failed to load shops: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadShops();
+  }, [session]);
+
+  async function handleCreateShop(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!session) return;
+
+    setCreating(true);
+    try {
+      const payload = {
+        shop_name: shopName.trim(),
+        email: email.trim(),
+        password,
+        opening_credits: Math.max(0, Number(openingCredits) || 0),
+        carousel_mode_default: false,
+      };
+
+      const response = await adminFetch<AdminCreateShopResponse>(session, "/admin/shops", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+
+      setShopName("");
+      setEmail("");
+      setPassword("");
+      setOpeningCredits("0");
+
+      setStatusText(
+        `Shop created: ${response.shop_name} | Login: ${response.email} | Balance: ${response.balance_after}`
+      );
+
+      await loadShops();
+    } catch (err) {
+      setStatusText(`Create failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  return (
+    <main className="screen">
+      <section className="page-shell">
+        <header className="header-row">
+          <div>
+            <h1>Admin Panel</h1>
+            <p className="muted">Onboard shops and manage catalog setup.</p>
+            <p className="tiny muted">{statusText}</p>
+          </div>
+          <div className="row">
+            <button className="btn btn-light" onClick={loadShops} disabled={loading}>
+              {loading ? "Refreshing..." : "Refresh"}
+            </button>
+            <button className="btn btn-light" onClick={signOut}>
+              Logout
+            </button>
+          </div>
+        </header>
+
+        <section className="card stack">
+          <h2>Create Shop Login</h2>
+          <form className="stack" onSubmit={handleCreateShop}>
+            <div className="grid-2">
+              <label className="field">
+                <span>Shop Name</span>
+                <input
+                  value={shopName}
+                  onChange={(event) => setShopName(event.target.value)}
+                  placeholder="e.g. ABC Mens Wear"
+                  disabled={creating}
+                />
+              </label>
+
+              <label className="field">
+                <span>Shop Email (username)</span>
+                <input
+                  type="email"
+                  value={email}
+                  onChange={(event) => setEmail(event.target.value)}
+                  placeholder="shop@example.com"
+                  disabled={creating}
+                />
+              </label>
+
+              <label className="field">
+                <span>Password</span>
+                <input
+                  type="text"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  placeholder="Minimum 6 characters"
+                  disabled={creating}
+                />
+              </label>
+
+              <label className="field">
+                <span>Opening Credits</span>
+                <input
+                  type="number"
+                  min={0}
+                  value={openingCredits}
+                  onChange={(event) => setOpeningCredits(event.target.value)}
+                  disabled={creating}
+                />
+              </label>
+            </div>
+
+            <button className="btn btn-dark" type="submit" disabled={creating || !canCreate}>
+              {creating ? "Creating..." : "Create Shop"}
+            </button>
+          </form>
+        </section>
+
+        <section className="card stack">
+          <div className="row">
+            <h2 className="grow">Shops</h2>
+            <input
+              className="search-input"
+              placeholder="Search by name"
+              value={searchText}
+              onChange={(event) => setSearchText(event.target.value)}
+            />
+            <button className="btn btn-light" onClick={loadShops} disabled={loading}>
+              Search
+            </button>
+          </div>
+
+          {shops.length === 0 ? (
+            <div className="empty-box">No shops yet.</div>
+          ) : (
+            <div className="shop-grid">
+              {shops.map((shop) => (
+                <article key={shop.id} className="shop-card">
+                  <h3>{shop.name}</h3>
+                  <p className="tiny muted">Shop ID: {shop.id}</p>
+                  <p className="tiny muted">Credits: {shop.credits_balance ?? 0}</p>
+                  <p className="tiny muted">Owner UID: {shop.owner_auth_user_id || "-"}</p>
+                  <Link className="btn btn-dark" to={`/shops/${encodeURIComponent(shop.id)}`}>
+                    Manage Shop
+                  </Link>
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
+      </section>
+    </main>
+  );
+}
+
+
+
+=== D:\AiVastraBackend 2.3 Codex\adminPanel\src\pages\AdminLoginPage.tsx ===
+import { useState, type FormEvent } from "react";
+
+import { ADMIN_ENV } from "../lib/env";
+import { useAdminAuth } from "../lib/auth";
+
+export function AdminLoginPage() {
+  const { signIn } = useAdminAuth();
+
+  const [apiBaseUrl, setApiBaseUrl] = useState(ADMIN_ENV.apiBaseUrl);
+  const [adminSecret, setAdminSecret] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError("");
+    setBusy(true);
+
+    try {
+      await signIn({ apiBaseUrl, adminSecret });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to login");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <main className="screen auth-screen">
+      <section className="card auth-card">
+        <h1>Ai Vastra Admin</h1>
+        <p className="muted">Private control panel access</p>
+
+        <form className="stack" onSubmit={handleSubmit}>
+          <label className="field">
+            <span>Backend URL</span>
+            <input
+              type="text"
+              value={apiBaseUrl}
+              onChange={(event) => setApiBaseUrl(event.target.value)}
+              placeholder="http://localhost:8000"
+              disabled={busy}
+            />
+          </label>
+
+          <label className="field">
+            <span>Admin Secret</span>
+            <input
+              type="password"
+              value={adminSecret}
+              onChange={(event) => setAdminSecret(event.target.value)}
+              placeholder="Enter ADMIN_PANEL_SECRET"
+              disabled={busy}
+            />
+          </label>
+
+          {error ? <p className="error-text">{error}</p> : null}
+
+          <button className="btn btn-dark" type="submit" disabled={busy}>
+            {busy ? "Checking..." : "Enter Admin Panel"}
+          </button>
+        </form>
+      </section>
+    </main>
+  );
+}
+
+
+=== D:\AiVastraBackend 2.3 Codex\adminPanel\src\pages\AdminShopDetailPage.tsx ===
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { adminFetch } from "../lib/api";
 import { useAdminAuth } from "../lib/auth";
-import { createSignedUrl } from "../lib/storage";
-import type {
-  AdminCatalogImageRow,
-  AdminFolderRow,
-  AdminHeroImageRow,
-  AdminSetDefaultHeroRequest,
-  AdminShopRow,
-} from "../lib/types";
+import type { AdminCatalogImageRow, AdminFolderRow, AdminHeroImageRow, AdminShopRow } from "../lib/types";
 
 export function AdminShopDetailPage() {
   const { shopId = "" } = useParams();
@@ -20,7 +520,6 @@ export function AdminShopDetailPage() {
   const [shop, setShop] = useState<AdminShopRow | null>(null);
   const [folders, setFolders] = useState<AdminFolderRow[]>([]);
   const [heroImages, setHeroImages] = useState<AdminHeroImageRow[]>([]);
-  const [heroSignedUrls, setHeroSignedUrls] = useState<Record<string, string>>({});
   const [catalogImages, setCatalogImages] = useState<AdminCatalogImageRow[]>([]);
 
   const [loading, setLoading] = useState(false);
@@ -54,10 +553,6 @@ export function AdminShopDetailPage() {
   const canUploadCatalog = useMemo(
     () => !!selectedFolderId && catalogFiles.length > 0,
     [selectedFolderId, catalogFiles]
-  );
-  const selectedFolder = useMemo(
-    () => folders.find((folder) => folder.id === selectedFolderId) || null,
-    [folders, selectedFolderId]
   );
 
   async function loadShopData() {
@@ -93,7 +588,6 @@ export function AdminShopDetailPage() {
   async function loadHeroImages(folderId: string) {
     if (!session || !shopId || !folderId) {
       setHeroImages([]);
-      setHeroSignedUrls({});
       return;
     }
 
@@ -104,24 +598,9 @@ export function AdminShopDetailPage() {
         { method: "GET" }
       );
       setHeroImages(rows);
-      await loadHeroSignedUrls(rows);
     } catch {
       setHeroImages([]);
-      setHeroSignedUrls({});
     }
-  }
-
-  async function loadHeroSignedUrls(images: AdminHeroImageRow[]) {
-    const urls: Record<string, string> = {};
-    for (const img of images) {
-      try {
-        const url = await createSignedUrl("hero-images", img.storage_path);
-        urls[img.id] = url;
-      } catch {
-        // skip
-      }
-    }
-    setHeroSignedUrls(urls);
   }
 
   async function loadCatalogImages(folderId: string) {
@@ -324,28 +803,6 @@ export function AdminShopDetailPage() {
     }
   }
 
-  async function handleSetDefaultHero(folderId: string, heroImageId: string) {
-    if (!session) return;
-    try {
-      const payload: AdminSetDefaultHeroRequest = {
-        default_hero_image_id: heroImageId,
-      };
-      await adminFetch(
-        session,
-        `/admin/shops/${shopId}/folders/${folderId}/default-hero`,
-        {
-          method: "PATCH",
-          body: JSON.stringify(payload),
-        }
-      );
-      // Refresh folders to show updated default
-      await loadShopData();
-      setStatusText("Default hero image updated.");
-    } catch (err) {
-      setStatusText(`Failed: ${err instanceof Error ? err.message : "Unknown error"}`);
-    }
-  }
-
   async function handleToggleSuspend() {
     if (!session || !shopId || !shop) return;
 
@@ -538,28 +995,6 @@ export function AdminShopDetailPage() {
               {creatingFolder ? "Creating..." : "Create Folder"}
             </button>
           </form>
-
-          <div className="stack">
-            <p className="tiny muted">Folders</p>
-            {folders.length === 0 ? (
-              <div className="empty-box">No folders found.</div>
-            ) : (
-              <ul className="hero-list">
-                {folders.map((folder) => (
-                  <li key={folder.id}>
-                    <div className="row">
-                      <span>{folder.name}</span>
-                      {folder.default_hero_image_id ? (
-                        <span style={{ color: "#15803d", fontWeight: 700 }}>Default set ✓</span>
-                      ) : (
-                        <span className="muted">No default set</span>
-                      )}
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
         </section>
 
         <section className="card stack">
@@ -605,49 +1040,8 @@ export function AdminShopDetailPage() {
                 <ul className="hero-list">
                   {heroImages.map((row) => (
                     <li key={row.id}>
-                      <div className="row">
-                        {heroSignedUrls[row.id] ? (
-                          <img
-                            src={heroSignedUrls[row.id]}
-                            alt={row.original_filename || "Hero image"}
-                            style={{
-                              width: 80,
-                              height: 80,
-                              objectFit: "cover",
-                              borderRadius: 12,
-                            }}
-                          />
-                        ) : (
-                          <div
-                            className="empty-box"
-                            style={{
-                              width: 80,
-                              height: 80,
-                              padding: 0,
-                              display: "grid",
-                              placeItems: "center",
-                              flex: "0 0 80px",
-                            }}
-                          >
-                            Preview
-                          </div>
-                        )}
-                        <div className="stack grow">
-                          <span>{row.original_filename || row.id}</span>
-                          <code>{row.storage_path}</code>
-                        </div>
-                        {row.id === selectedFolder?.default_hero_image_id ? (
-                          <span style={{ color: "#15803d", fontWeight: 700 }}>✓ Default</span>
-                        ) : (
-                          <button
-                            className="btn btn-light"
-                            type="button"
-                            onClick={() => void handleSetDefaultHero(selectedFolderId, row.id)}
-                          >
-                            Set as Default
-                          </button>
-                        )}
-                      </div>
+                      <span>{row.original_filename || row.id}</span>
+                      <code>{row.storage_path}</code>
                     </li>
                   ))}
                 </ul>
@@ -701,3 +1095,91 @@ export function AdminShopDetailPage() {
     </main>
   );
 }
+
+=== D:\AiVastraBackend 2.3 Codex\adminPanel\src\App.tsx ===
+import { AppRouter } from "./router";
+
+export default function App() {
+  return <AppRouter />;
+}
+
+=== D:\AiVastraBackend 2.3 Codex\adminPanel\src\main.tsx ===
+import React from "react";
+import ReactDOM from "react-dom/client";
+import { BrowserRouter } from "react-router-dom";
+
+import App from "./App";
+import { AdminAuthProvider } from "./lib/auth";
+import "./styles.css";
+
+ReactDOM.createRoot(document.getElementById("root")!).render(
+  <React.StrictMode>
+    <BrowserRouter>
+      <AdminAuthProvider>
+        <App />
+      </AdminAuthProvider>
+    </BrowserRouter>
+  </React.StrictMode>
+);
+
+=== D:\AiVastraBackend 2.3 Codex\adminPanel\src\router.tsx ===
+import { Navigate, Route, Routes } from "react-router-dom";
+
+import { useAdminAuth } from "./lib/auth";
+import { AdminDashboardPage } from "./pages/AdminDashboardPage";
+import { AdminLoginPage } from "./pages/AdminLoginPage";
+import { AdminShopDetailPage } from "./pages/AdminShopDetailPage";
+
+function RequireAdminAuth({ children }: { children: React.ReactNode }) {
+  const { isAuthenticated } = useAdminAuth();
+  if (!isAuthenticated) {
+    return <Navigate to="/login" replace />;
+  }
+  return <>{children}</>;
+}
+
+function LoginRoute() {
+  const { isAuthenticated } = useAdminAuth();
+  if (isAuthenticated) {
+    return <Navigate to="/" replace />;
+  }
+  return <AdminLoginPage />;
+}
+
+export function AppRouter() {
+  return (
+    <Routes>
+      <Route path="/login" element={<LoginRoute />} />
+
+      <Route
+        path="/"
+        element={
+          <RequireAdminAuth>
+            <AdminDashboardPage />
+          </RequireAdminAuth>
+        }
+      />
+
+      <Route
+        path="/shops/:shopId"
+        element={
+          <RequireAdminAuth>
+            <AdminShopDetailPage />
+          </RequireAdminAuth>
+        }
+      />
+
+      <Route path="*" element={<Navigate to="/" replace />} />
+    </Routes>
+  );
+}
+
+=== D:\AiVastraBackend 2.3 Codex\adminPanel\vite.config.ts ===
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+// https://vite.dev/config/
+export default defineConfig({
+  plugins: [react()],
+})
+

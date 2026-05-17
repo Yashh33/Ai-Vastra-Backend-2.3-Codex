@@ -25,26 +25,26 @@ def _extract_signed_url(signed_payload: object) -> Optional[str]:
 
 
 def _create_hero_image_signed_url(supabase, storage_path: str) -> Optional[str]:
-    cleaned_path = storage_path.strip()
-    if not cleaned_path:
-        return None
-
     try:
+        cleaned_path = storage_path.strip()
+        if not cleaned_path:
+            return None
+
         signed = supabase.storage.from_("hero-images").create_signed_url(
             cleaned_path,
             3600,
         )
+
+        signed_url = _extract_signed_url(signed)
+        if not signed_url:
+            return None
+
+        if signed_url.startswith("/"):
+            signed_url = f"{get_settings().SUPABASE_URL}{signed_url}"
+
+        return signed_url
     except Exception:
         return None
-
-    signed_url = _extract_signed_url(signed)
-    if not signed_url:
-        return None
-
-    if signed_url.startswith("/"):
-        signed_url = f"{get_settings().SUPABASE_URL}{signed_url}"
-
-    return signed_url
 
 
 @router.get("")

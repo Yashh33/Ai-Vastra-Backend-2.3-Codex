@@ -27,11 +27,16 @@ export type AdminCreateShopResponse = {
   balance_after: number;
 };
 
+export type AdminSetDefaultHeroRequest = {
+  default_hero_image_id: string | null;
+};
+
 export type AdminFolderRow = {
   id: string;
   shop_id: string;
   name: string;
   prompt_template: string;
+  default_hero_image_id?: string | null;
   is_active: boolean;
   created_at: string;
   updated_at: string;
@@ -47,6 +52,7 @@ export type AdminHeroImageRow = {
   file_size_bytes: number | null;
   width: number | null;
   height: number | null;
+  signed_url?: string | null;
   created_at: string;
 };
 
