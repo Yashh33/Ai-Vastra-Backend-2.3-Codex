@@ -514,10 +514,10 @@ export function AdminShopDetailPage() {
         </section>
 
         <section className="card stack">
-          <h2>Create Folder</h2>
+          <h2>Create Garment Type</h2>
           <form className="stack" onSubmit={handleCreateFolder}>
             <label className="field">
-              <span>Folder Name</span>
+              <span>Garment Type Name</span>
               <input
                 value={newFolderName}
                 onChange={(event) => setNewFolderName(event.target.value)}
@@ -535,12 +535,12 @@ export function AdminShopDetailPage() {
               />
             </label>
             <button className="btn btn-dark" type="submit" disabled={creatingFolder || !newFolderName.trim()}>
-              {creatingFolder ? "Creating..." : "Create Folder"}
+              {creatingFolder ? "Creating..." : "Create Garment Type"}
             </button>
           </form>
 
           <div className="stack">
-            <p className="tiny muted">Folders</p>
+            <p className="tiny muted">Garment Types</p>
             {folders.length === 0 ? (
               <div className="empty-box">No folders found.</div>
             ) : (
