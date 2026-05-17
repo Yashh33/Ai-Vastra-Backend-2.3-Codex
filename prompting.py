@@ -5,19 +5,39 @@ def _clean_text(value: str | None) -> str:
 
 
 BASE_GARMENT_FABRIC_PROMPT = """
-Hard constraints:
-- Preserve the same person/model, face, body shape, pose, expression, camera angle, framing, composition, background, surroundings, and overall scene.
-- Preserve garment type, silhouette, seams, folds, and construction details from the hero image.
-- Treat each fabric image as a material reference (texture, weave, print, color behavior), not a pasted overlay.
-- Maintain realistic drape, stitching behavior, lighting, and shadows.
-- Do not alter non-garment areas.
-- Do not add or remove accessories, objects, or people.
-- Avoid artifacts, duplicated body parts, warped garment edges, or unrealistic folds.
+Realism rules:
+- Imagine this garment was originally sewn and tailored from
+  the exact cloth shown in the fabric swatch image. Your output
+  should look like a real fashion photograph of a person wearing
+  a garment made from that cloth — not a texture overlay or
+  digital edit.
+- Use the fabric swatch as a material reference: study its color,
+  weave structure, pattern (checks, stripes, plain, etc.), sheen,
+  and texture depth. Reconstruct how this material would drape,
+  fold, and catch light when sewn into a fitted garment.
+- Pattern scale is critical: fine patterns like checks,
+  herringbone, stripes, and small prints must appear at real
+  garment scale — small and tight as seen on actual tailored
+  cloth at normal viewing distance. Never enlarge or zoom the
+  pattern. A check that appears 1cm on the swatch should appear
+  proportionally tiny on the garment.
+- The fabric wraps around the body naturally: pattern lines
+  follow the garment's seams, folds, and contours. Patterns
+  do not stay flat or perfectly grid-aligned across the whole
+  garment.
+- Preserve from the hero image without any change: the person,
+  face, body, pose, expression, camera angle, framing,
+  composition, background, scene, garment silhouette, cut,
+  lapels, buttons, collar, seams, and all construction details.
+- Only the cloth material changes. Every other pixel stays
+  the same.
+- Do not alter anything outside the target garment area.
+- No texture pasting, no overlay effects, no Photoshop-style
+  blending. Pure photorealistic synthesis.
+- No artifacts, warped edges, duplicate body parts, or
+  unrealistic folds.
 
-Output requirements:
-- Return exactly one photorealistic image.
-- Maintain visual realism and garment construction consistency.
-- Preserve the original hero image aspect ratio.
+Output: one photorealistic studio fashion photograph.
 """.strip()
 
 
@@ -43,7 +63,7 @@ You are given 2 images in this exact order:
 1) Hero image
 2) Fabric image 1
 
-Generate a photorealistic visualization of how the selected garment in the hero image would look if tailored from Fabric image 1.
+Recreate the hero image as a photorealistic fashion photograph where the {target} garment has been sewn and tailored from the cloth material shown in Fabric image 1. The result must look like the person was always wearing a garment made from that specific cloth — not a digital edit.
 Selected garment target: {target}.
 """.strip()
 
@@ -59,7 +79,7 @@ You are given multiple images in this exact order:
 1) Hero image
 2..N) Fabric images in the same order listed below
 
-Generate one photorealistic composite visualization where each garment target appears naturally tailored from its assigned fabric image.
+Recreate the hero image as a photorealistic fashion photograph where each garment has been sewn and tailored from its assigned cloth material. Each result must look like the person was always wearing garments made from those specific cloths — not a digital edit.
 Fabric-to-garment mapping:
 {chr(10).join(mapping_lines)}
 
