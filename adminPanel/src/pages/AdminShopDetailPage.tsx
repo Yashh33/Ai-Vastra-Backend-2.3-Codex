@@ -346,6 +346,27 @@ export function AdminShopDetailPage() {
     }
   }
 
+  async function handleDeleteFolder(folderId: string, folderName: string) {
+    if (!session) return;
+    const confirmed = window.confirm(
+      `Delete garment type "${folderName}"? This cannot be undone.`
+    );
+    if (!confirmed) return;
+    try {
+      await adminFetch(
+        session,
+        `/admin/shops/${shopId}/folders/${folderId}`,
+        { method: "DELETE" }
+      );
+      setStatusText(`Deleted "${folderName}".`);
+      await loadShopData();
+    } catch (err) {
+      setStatusText(
+        `Failed to delete: ${err instanceof Error ? err.message : "Unknown error"}`
+      );
+    }
+  }
+
   async function handleToggleSuspend() {
     if (!session || !shopId || !shop) return;
 
@@ -546,15 +567,40 @@ export function AdminShopDetailPage() {
             ) : (
               <ul className="hero-list">
                 {folders.map((folder) => (
-                  <li key={folder.id}>
-                    <div className="row">
-                      <span>{folder.name}</span>
+                  <li
+                    key={folder.id}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: "8px",
+                      padding: "4px 0",
+                    }}
+                  >
+                    <span>
+                      {folder.name}{" "}
                       {folder.default_hero_image_id ? (
-                        <span style={{ color: "#15803d", fontWeight: 700 }}>Default set ✓</span>
+                        <span style={{ color: "green", fontWeight: 600 }}>Default set ✓</span>
                       ) : (
-                        <span className="muted">No default set</span>
+                        <span style={{ color: "#888" }}>No default set</span>
                       )}
-                    </div>
+                    </span>
+                    <button
+                      onClick={() => handleDeleteFolder(folder.id, folder.name)}
+                      style={{
+                        background: "#991B1B",
+                        color: "white",
+                        border: "none",
+                        borderRadius: "6px",
+                        padding: "3px 10px",
+                        fontSize: "12px",
+                        fontWeight: 600,
+                        cursor: "pointer",
+                        flexShrink: 0,
+                      }}
+                    >
+                      Delete
+                    </button>
                   </li>
                 ))}
               </ul>

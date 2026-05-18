@@ -902,6 +902,26 @@ def create_shop_folder(shop_id: str, body: AdminCreateFolderRequest):
     return rows[0]
 
 
+@router.delete("/shops/{shop_id}/folders/{folder_id}")
+async def delete_folder(
+    shop_id: str,
+    folder_id: str,
+    _: None = Depends(verify_admin_secret),
+):
+    supabase = get_supabase_admin_client()
+
+    result = (
+        supabase.table("hero_folders")
+        .delete()
+        .eq("id", folder_id)
+        .eq("shop_id", shop_id)
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Folder not found")
+    return {"deleted": folder_id}
+
+
 @router.patch("/shops/{shop_id}/folders/{folder_id}/default-hero")
 def update_shop_folder_default_hero(
     shop_id: str,
