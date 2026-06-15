@@ -144,3 +144,59 @@ def build_generation_prompt(
         parts.append(folder_prompt_clean)
 
     return "\n\n".join(parts).strip()
+
+
+def build_tryon_prompt(folder_name: str | None = None) -> str:
+    folder_str = f" {folder_name.strip()}" if folder_name and folder_name.strip() else ""
+
+    return f"""Image 1: Customer photograph — use for the \
+person's identity, face, body shape, body proportions, \
+skin tone, and pose.
+Image 2: Garment visualization — a professionally \
+tailored{folder_str} garment in a specific fabric. Use \
+for the complete garment appearance including fabric \
+color, texture, pattern, lapel style, buttons, collar, \
+and all construction details.
+
+Generate a new photograph of the person from Image 1 \
+wearing the exact garment shown in Image 2.
+
+The garment must appear exactly as shown in Image 2 — \
+preserve the fabric pattern, color, texture, lapel shape, \
+button placement, and all construction details precisely. \
+The person's face, body proportions, and skin tone from \
+Image 1 must be preserved exactly.
+
+The result must look like a natural photograph of the \
+customer wearing a garment tailored specifically for them — \
+not a composite or digital edit.
+
+Output: one photorealistic photograph.""".strip()
+
+
+def build_tryon_quick_prompt(folder_name: str | None = None) -> str:
+    folder_str = f" {folder_name.strip()}" if folder_name and folder_name.strip() else ""
+
+    return f"""Image 1: Hero garment photograph — use for \
+garment cut, silhouette, lapel style, button placement, \
+collar, seams, and all construction details.
+Image 2: Fabric swatch — use for color, weave structure, \
+pattern, sheen, and texture.
+Image 3: Customer photograph — use for the person's \
+identity, face, body shape, body proportions, skin tone, \
+and pose.
+
+Generate a new photograph of the customer from Image 3 \
+wearing a{folder_str} garment with the cut and construction \
+of Image 1, tailored from the cloth shown in Image 2.
+
+The garment construction details (lapels, buttons, collar, \
+seams) must match Image 1 exactly. The fabric material \
+(color, pattern, texture) must come from Image 2. The \
+person (face, body, proportions, skin tone) must come \
+from Image 3.
+
+The result must look like a natural photograph of the \
+customer wearing a garment tailored specifically for them.
+
+Output: one photorealistic photograph.""".strip()

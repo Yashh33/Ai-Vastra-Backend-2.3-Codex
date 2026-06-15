@@ -1,0 +1,4078 @@
+﻿=== D:\AiVastraBackend 2.3 Codex\admin_api.py ===
+import re
+from datetime import datetime, timezone
+from typing import Any, Optional
+from uuid import uuid4
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from pydantic import BaseModel, Field
+
+from admin_deps import verify_admin_secret
+from supabase_client import get_supabase_admin_client
+
+router = APIRouter(prefix="/admin", tags=["Admin"], dependencies=[Depends(verify_admin_secret)])
+
+
+class AdminCreateShopRequest(BaseModel):
+    shop_name: str = Field(..., min_length=1, max_length=120)
+    email: str
+    password: str = Field(..., min_length=6, max_length=128)
+    opening_credits: int = Field(default=0, ge=0, le=1_000_000)
+    carousel_mode_default: bool = False
+
+
+class AdminUpdateShopRequest(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    header_display_text: Optional[str] = Field(default=None, max_length=120)
+    carousel_mode_default: Optional[bool] = None
+
+
+class AdminResetPasswordRequest(BaseModel):
+    password: str = Field(..., min_length=6, max_length=128)
+
+
+class AdminSuspendShopRequest(BaseModel):
+    suspended: bool = True
+
+
+class AdminCreateFolderRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    prompt_template: str = ""
+
+
+class AdminUpdateDefaultHeroRequest(BaseModel):
+    default_hero_image_id: Optional[str] = Field(...)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _clean_text(value: str, field_name: str) -> str:
+    cleaned = (value or "").strip()
+    if not cleaned:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{field_name} cannot be blank",
+        )
+    return cleaned
+
+
+def _clean_email(value: str) -> str:
+    cleaned = (value or "").strip().lower()
+    if not cleaned or "@" not in cleaned:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Valid email is required",
+        )
+    return cleaned
+
+
+def _extract_user_id(payload: Any) -> Optional[str]:
+    if payload is None:
+        return None
+
+    if isinstance(payload, dict):
+        direct = payload.get("id")
+        if direct:
+            return str(direct)
+
+        for key in ("user", "data"):
+            nested = _extract_user_id(payload.get(key))
+            if nested:
+                return nested
+
+        return None
+
+    model_dump = getattr(payload, "model_dump", None)
+    if callable(model_dump):
+        try:
+            nested = _extract_user_id(model_dump())
+            if nested:
+                return nested
+        except Exception:
+            pass
+
+    direct_id = getattr(payload, "id", None)
+    if direct_id:
+        return str(direct_id)
+
+    nested_user = _extract_user_id(getattr(payload, "user", None))
+    if nested_user:
+        return nested_user
+
+    nested_data = _extract_user_id(getattr(payload, "data", None))
+    if nested_data:
+        return nested_data
+
+    return None
+
+
+def _get_shop_mapping_for_auth_user(supabase, auth_user_id: str) -> Optional[dict[str, Any]]:
+    result = (
+        supabase.table("shop_users")
+        .select("shop_id, role")
+        .eq("auth_user_id", auth_user_id)
+        .limit(1)
+        .execute()
+    )
+
+    rows = getattr(result, "data", None) or []
+    return rows[0] if rows else None
+
+
+def _insert_shop(
+    *,
+    supabase,
+    shop_name: str,
+    carousel_mode_default: bool,
+) -> str:
+    payload = {
+        "name": shop_name,
+        "carousel_mode_default": carousel_mode_default,
+        "is_suspended": False,
+    }
+
+    try:
+        inserted = supabase.table("shops").insert(payload).execute()
+    except Exception as exc:
+        message = str(exc).lower()
+        if "is_suspended" in message:
+            payload.pop("is_suspended", None)
+            inserted = supabase.table("shops").insert(payload).execute()
+        else:
+            raise
+
+    rows = getattr(inserted, "data", None) or []
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create shop record",
+        )
+
+    return str(rows[0]["id"])
+
+
+def _update_shop_with_fallback(supabase, shop_id: str, payload: dict[str, Any]) -> Any:
+    try:
+        return (
+            supabase.table("shops")
+            .update(payload)
+            .eq("id", shop_id)
+            .execute()
+        )
+    except Exception as exc:
+        message = str(exc).lower()
+        if "is_suspended" in message and "is_suspended" in payload:
+            retry_payload = dict(payload)
+            retry_payload.pop("is_suspended", None)
+            return (
+                supabase.table("shops")
+                .update(retry_payload)
+                .eq("id", shop_id)
+                .execute()
+            )
+        raise
+
+
+def _ensure_shop_for_auth_user(
+    *,
+    supabase,
+    auth_user_id: str,
+    shop_name: str,
+    carousel_mode_default: bool,
+) -> tuple[str, str]:
+    mapping = _get_shop_mapping_for_auth_user(supabase, auth_user_id)
+    if mapping:
+        return str(mapping["shop_id"]), str(mapping.get("role") or "owner")
+
+    shop_id = _insert_shop(
+        supabase=supabase,
+        shop_name=shop_name,
+        carousel_mode_default=carousel_mode_default,
+    )
+
+    (
+        supabase.table("shop_users")
+        .insert(
+            {
+                "shop_id": shop_id,
+                "auth_user_id": auth_user_id,
+                "role": "owner",
+            }
+        )
+        .execute()
+    )
+
+    return shop_id, "owner"
+
+
+def _get_shop_balance(supabase, shop_id: str) -> int:
+    result = (
+        supabase.table("credit_ledger")
+        .select("balance_after")
+        .eq("shop_id", shop_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        return 0
+
+    return int(rows[0].get("balance_after") or 0)
+
+
+def _append_credit_ledger(supabase, shop_id: str, delta: int, reason: str) -> dict[str, int]:
+    balance_before = _get_shop_balance(supabase, shop_id)
+    balance_after = balance_before + delta
+
+    (
+        supabase.table("credit_ledger")
+        .insert(
+            {
+                "shop_id": shop_id,
+                "delta": delta,
+                "reason": reason,
+                "balance_after": balance_after,
+            }
+        )
+        .execute()
+    )
+
+    return {"balance_before": balance_before, "balance_after": balance_after}
+
+
+def _guess_extension(filename: Optional[str], content_type: Optional[str]) -> str:
+    if filename and "." in filename:
+        ext = filename.rsplit(".", 1)[1].strip().lower()
+        if re.fullmatch(r"[a-z0-9]{1,12}", ext):
+            return ext
+
+    if content_type and "/" in content_type:
+        ext = content_type.split("/", 1)[1].strip().lower()
+        ext = ext.replace("jpeg", "jpg")
+        ext = re.sub(r"[^a-z0-9]", "", ext)
+        if ext:
+            return ext[:12]
+
+    return "jpg"
+
+
+def _upload_bytes_to_bucket(*, supabase, bucket: str, path: str, data: bytes, content_type: str) -> None:
+    options = {
+        "content-type": content_type,
+        "upsert": "true",
+    }
+
+    try:
+        supabase.storage.from_(bucket).upload(path, data, options)
+    except Exception:
+        try:
+            supabase.storage.from_(bucket).update(path, data, options)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to upload file to {bucket}",
+            ) from exc
+
+
+def _collect_column_values(
+    *,
+    supabase,
+    table: str,
+    column: str,
+    shop_id: str,
+) -> list[str]:
+    result = (
+        supabase.table(table)
+        .select(column)
+        .eq("shop_id", shop_id)
+        .limit(5000)
+        .execute()
+    )
+
+    rows = getattr(result, "data", None) or []
+    values: list[str] = []
+    for row in rows:
+        value = str(row.get(column) or "").strip()
+        if value:
+            values.append(value)
+
+    return values
+
+
+def _remove_storage_paths(*, supabase, bucket: str, paths: list[str]) -> list[str]:
+    cleaned = [path.strip() for path in paths if path and path.strip()]
+    if not cleaned:
+        return []
+
+    warnings: list[str] = []
+    chunk_size = 100
+
+    for index in range(0, len(cleaned), chunk_size):
+        chunk = cleaned[index : index + chunk_size]
+        try:
+            supabase.storage.from_(bucket).remove(chunk)
+        except Exception as exc:
+            warnings.append(f"{bucket} cleanup failed for {len(chunk)} object(s): {exc}")
+
+    return warnings
+
+
+def _get_folder_start_sort_order(*, supabase, shop_id: str, folder_id: str) -> int:
+    result = (
+        supabase.table("catalog_images")
+        .select("sort_order")
+        .eq("shop_id", shop_id)
+        .eq("folder_id", folder_id)
+        .order("sort_order", desc=True)
+        .limit(1)
+        .execute()
+    )
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        return 0
+    return int(rows[0].get("sort_order") or 0) + 1
+
+
+def _delete_generation_fabrics_if_present(*, supabase, shop_id: str) -> None:
+    try:
+        supabase.table("generation_fabrics").delete().eq("shop_id", shop_id).execute()
+    except Exception as exc:
+        message = str(exc).lower()
+        if "generation_fabrics" in message and "does not exist" in message:
+            return
+        if "relation" in message and "generation_fabrics" in message:
+            return
+        raise
+
+
+@router.get("/session")
+def admin_session_ping():
+    return {"ok": True}
+
+
+@router.get("/shops")
+def list_shops(
+    search: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    supabase = get_supabase_admin_client()
+
+    query = supabase.table("shops").select("*").order("created_at", desc=True)
+
+    if search and search.strip():
+        query = query.ilike("name", f"%{search.strip()}%")
+
+    query = query.range(offset, offset + limit - 1)
+
+    try:
+        result = query.execute()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch shops",
+        ) from exc
+
+    shops = getattr(result, "data", None) or []
+
+    shop_ids = [str(row.get("id") or "") for row in shops if row.get("id")]
+    owners_by_shop: dict[str, str] = {}
+
+    if shop_ids:
+        try:
+            owner_result = (
+                supabase.table("shop_users")
+                .select("shop_id, auth_user_id, created_at")
+                .in_("shop_id", shop_ids)
+                .order("created_at", desc=False)
+                .execute()
+            )
+            owner_rows = getattr(owner_result, "data", None) or []
+            for row in owner_rows:
+                target_shop_id = str(row.get("shop_id") or "")
+                auth_user_id = str(row.get("auth_user_id") or "")
+                if target_shop_id and auth_user_id and target_shop_id not in owners_by_shop:
+                    owners_by_shop[target_shop_id] = auth_user_id
+        except Exception:
+            owners_by_shop = {}
+
+    enriched = []
+    for shop in shops:
+        target_shop_id = str(shop.get("id") or "")
+        balance = _get_shop_balance(supabase, target_shop_id) if target_shop_id else 0
+        enriched.append(
+            {
+                **shop,
+                "is_suspended": bool(shop.get("is_suspended", False)),
+                "owner_auth_user_id": owners_by_shop.get(target_shop_id),
+                "credits_balance": balance,
+            }
+        )
+
+    return enriched
+
+
+@router.get("/shops/{shop_id}")
+def get_shop(shop_id: str):
+    supabase = get_supabase_admin_client()
+
+    result = (
+        supabase.table("shops")
+        .select("*")
+        .eq("id", shop_id)
+        .limit(1)
+        .execute()
+    )
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Shop not found",
+        )
+
+    shop = rows[0]
+    shop["is_suspended"] = bool(shop.get("is_suspended", False))
+    shop["credits_balance"] = _get_shop_balance(supabase, shop_id)
+
+    mapping_result = (
+        supabase.table("shop_users")
+        .select("auth_user_id")
+        .eq("shop_id", shop_id)
+        .order("created_at", desc=False)
+        .limit(1)
+        .execute()
+    )
+    mapping_rows = getattr(mapping_result, "data", None) or []
+    shop["owner_auth_user_id"] = (
+        str(mapping_rows[0].get("auth_user_id")) if mapping_rows else None
+    )
+
+    return shop
+
+
+@router.post("/shops")
+def create_shop_with_login(body: AdminCreateShopRequest):
+    supabase = get_supabase_admin_client()
+
+    shop_name = _clean_text(body.shop_name, "shop_name")
+    email = _clean_email(body.email)
+
+    try:
+        created_user = supabase.auth.admin.create_user(
+            {
+                "email": email,
+                "password": body.password,
+                "email_confirm": True,
+                "user_metadata": {
+                    "shop_name": shop_name,
+                },
+            }
+        )
+    except Exception as exc:
+        message = str(exc).lower()
+        if "already" in message and "registered" in message:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Email is already registered",
+            ) from exc
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create auth user",
+        ) from exc
+
+    auth_user_id = _extract_user_id(created_user)
+    if not auth_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Auth user created but id was not returned",
+        )
+
+    try:
+        mapping = _get_shop_mapping_for_auth_user(supabase, auth_user_id)
+        if mapping:
+            shop_id = str(mapping["shop_id"])
+            role = str(mapping.get("role") or "owner")
+        else:
+            shop_id, role = _ensure_shop_for_auth_user(
+                supabase=supabase,
+                auth_user_id=auth_user_id,
+                shop_name=shop_name,
+                carousel_mode_default=body.carousel_mode_default,
+            )
+
+        _update_shop_with_fallback(
+            supabase,
+            shop_id,
+            {
+                "name": shop_name,
+                "carousel_mode_default": body.carousel_mode_default,
+                "is_suspended": False,
+                "updated_at": _utc_now_iso(),
+            },
+        )
+
+        balance_before = _get_shop_balance(supabase, shop_id)
+        balance_after = balance_before
+
+        if body.opening_credits > 0:
+            balances = _append_credit_ledger(
+                supabase,
+                shop_id=shop_id,
+                delta=body.opening_credits,
+                reason="admin_opening_credits",
+            )
+            balance_before = balances["balance_before"]
+            balance_after = balances["balance_after"]
+
+        return {
+            "shop_id": shop_id,
+            "shop_name": shop_name,
+            "auth_user_id": auth_user_id,
+            "email": email,
+            "role": role,
+            "opening_credits": body.opening_credits,
+            "balance_before": balance_before,
+            "balance_after": balance_after,
+        }
+    except Exception:
+        try:
+            supabase.auth.admin.delete_user(auth_user_id)
+        except Exception:
+            pass
+        raise
+
+
+@router.patch("/shops/{shop_id}")
+def update_shop(shop_id: str, body: AdminUpdateShopRequest):
+    supabase = get_supabase_admin_client()
+
+    update_data = body.model_dump(exclude_unset=True)
+    if not update_data:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide at least one field to update",
+        )
+
+    if "name" in update_data and update_data["name"] is not None:
+        update_data["name"] = _clean_text(update_data["name"], "name")
+    if "header_display_text" in update_data and update_data["header_display_text"] is not None:
+        update_data["header_display_text"] = _clean_text(
+            update_data["header_display_text"], "header_display_text"
+        )
+
+    update_data["updated_at"] = _utc_now_iso()
+
+    try:
+        result = _update_shop_with_fallback(supabase, shop_id, update_data)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update shop",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Shop not found",
+        )
+
+    return rows[0]
+
+
+@router.post("/shops/{shop_id}/suspend")
+def suspend_shop(shop_id: str, body: AdminSuspendShopRequest):
+    supabase = get_supabase_admin_client()
+
+    try:
+        result = (
+            supabase.table("shops")
+            .update(
+                {
+                    "is_suspended": bool(body.suspended),
+                    "updated_at": _utc_now_iso(),
+                }
+            )
+            .eq("id", shop_id)
+            .execute()
+        )
+    except Exception as exc:
+        message = str(exc).lower()
+        if "is_suspended" in message:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="shops.is_suspended column is missing. Run migration first.",
+            ) from exc
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update shop suspend status",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Shop not found",
+        )
+
+    return {
+        "shop_id": shop_id,
+        "is_suspended": bool(rows[0].get("is_suspended", body.suspended)),
+    }
+
+
+@router.delete("/shops/{shop_id}")
+def delete_shop(shop_id: str):
+    supabase = get_supabase_admin_client()
+
+    shop_result = (
+        supabase.table("shops")
+        .select("id, name, logo_path")
+        .eq("id", shop_id)
+        .limit(1)
+        .execute()
+    )
+    shop_rows = getattr(shop_result, "data", None) or []
+    if not shop_rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Shop not found",
+        )
+
+    shop = shop_rows[0]
+
+    mapping_result = (
+        supabase.table("shop_users")
+        .select("auth_user_id")
+        .eq("shop_id", shop_id)
+        .execute()
+    )
+    mapping_rows = getattr(mapping_result, "data", None) or []
+    auth_user_ids = [str(row.get("auth_user_id") or "") for row in mapping_rows if row.get("auth_user_id")]
+
+    hero_paths = _collect_column_values(
+        supabase=supabase,
+        table="hero_images",
+        column="storage_path",
+        shop_id=shop_id,
+    )
+    fabric_paths = _collect_column_values(
+        supabase=supabase,
+        table="fabric_images",
+        column="storage_path",
+        shop_id=shop_id,
+    )
+    output_paths = _collect_column_values(
+        supabase=supabase,
+        table="generations",
+        column="output_path",
+        shop_id=shop_id,
+    )
+    catalog_paths = _collect_column_values(
+        supabase=supabase,
+        table="catalog_images",
+        column="storage_path",
+        shop_id=shop_id,
+    )
+    logo_path = str(shop.get("logo_path") or "").strip()
+
+    try:
+        _delete_generation_fabrics_if_present(supabase=supabase, shop_id=shop_id)
+        supabase.table("credit_ledger").delete().eq("shop_id", shop_id).execute()
+        supabase.table("generations").delete().eq("shop_id", shop_id).execute()
+        supabase.table("catalog_images").delete().eq("shop_id", shop_id).execute()
+        supabase.table("hero_images").delete().eq("shop_id", shop_id).execute()
+        supabase.table("fabric_images").delete().eq("shop_id", shop_id).execute()
+        supabase.table("hero_folders").delete().eq("shop_id", shop_id).execute()
+        supabase.table("shop_users").delete().eq("shop_id", shop_id).execute()
+        supabase.table("shops").delete().eq("id", shop_id).execute()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete shop data: {exc}",
+        ) from exc
+
+    warnings: list[str] = []
+    warnings.extend(_remove_storage_paths(supabase=supabase, bucket="hero-images", paths=hero_paths))
+    warnings.extend(_remove_storage_paths(supabase=supabase, bucket="fabric-images", paths=fabric_paths))
+    warnings.extend(_remove_storage_paths(supabase=supabase, bucket="generated-outputs", paths=output_paths))
+    warnings.extend(_remove_storage_paths(supabase=supabase, bucket="catalog-images", paths=catalog_paths))
+    if logo_path:
+        warnings.extend(_remove_storage_paths(supabase=supabase, bucket="shop-logos", paths=[logo_path]))
+
+    deleted_auth_user_ids: list[str] = []
+    skipped_auth_user_ids: list[str] = []
+
+    for auth_user_id in auth_user_ids:
+        try:
+            remaining = (
+                supabase.table("shop_users")
+                .select("id")
+                .eq("auth_user_id", auth_user_id)
+                .limit(1)
+                .execute()
+            )
+            remaining_rows = getattr(remaining, "data", None) or []
+            if remaining_rows:
+                skipped_auth_user_ids.append(auth_user_id)
+                continue
+
+            supabase.auth.admin.delete_user(auth_user_id)
+            deleted_auth_user_ids.append(auth_user_id)
+        except Exception as exc:
+            skipped_auth_user_ids.append(auth_user_id)
+            warnings.append(f"Failed to delete auth user {auth_user_id}: {exc}")
+
+    response = {
+        "deleted": True,
+        "shop_id": shop_id,
+        "shop_name": str(shop.get("name") or ""),
+        "deleted_auth_user_ids": deleted_auth_user_ids,
+        "skipped_auth_user_ids": skipped_auth_user_ids,
+    }
+    if warnings:
+        response["warnings"] = warnings
+
+    return response
+
+
+@router.post("/shops/{shop_id}/reset-password")
+def reset_shop_password(shop_id: str, body: AdminResetPasswordRequest):
+    supabase = get_supabase_admin_client()
+
+    mapping_result = (
+        supabase.table("shop_users")
+        .select("auth_user_id, created_at")
+        .eq("shop_id", shop_id)
+        .order("created_at", desc=False)
+        .limit(1)
+        .execute()
+    )
+
+    rows = getattr(mapping_result, "data", None) or []
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Shop login mapping not found",
+        )
+
+    auth_user_id = str(rows[0].get("auth_user_id") or "")
+    if not auth_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Invalid auth_user_id mapping",
+        )
+
+    try:
+        supabase.auth.admin.update_user_by_id(
+            auth_user_id,
+            {
+                "password": body.password,
+                "email_confirm": True,
+            },
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to reset password",
+        ) from exc
+
+    return {
+        "shop_id": shop_id,
+        "auth_user_id": auth_user_id,
+        "password_reset": True,
+    }
+
+
+@router.post("/shops/{shop_id}/logo")
+async def upload_shop_logo(shop_id: str, file: UploadFile = File(...)):
+    supabase = get_supabase_admin_client()
+
+    content_type = (file.content_type or "").strip().lower()
+    if not content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only image files are allowed for logo",
+        )
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded logo file is empty",
+        )
+
+    ext = _guess_extension(file.filename, content_type)
+    logo_path = f"{shop_id}/{int(datetime.now().timestamp())}-{uuid4().hex[:8]}.{ext}"
+
+    _upload_bytes_to_bucket(
+        supabase=supabase,
+        bucket="shop-logos",
+        path=logo_path,
+        data=file_bytes,
+        content_type=content_type,
+    )
+
+    try:
+        updated = (
+            supabase.table("shops")
+            .update({"logo_path": logo_path, "updated_at": _utc_now_iso()})
+            .eq("id", shop_id)
+            .execute()
+        )
+    except Exception as exc:
+        message = str(exc).lower()
+        if "logo_path" in message:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="shops.logo_path column is missing. Run the migration first.",
+            ) from exc
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update shop logo path",
+        ) from exc
+
+    rows = getattr(updated, "data", None) or []
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Shop not found",
+        )
+
+    return {
+        "shop_id": shop_id,
+        "logo_path": logo_path,
+    }
+
+
+@router.get("/shops/{shop_id}/folders")
+def list_shop_folders(shop_id: str):
+    supabase = get_supabase_admin_client()
+
+    result = (
+        supabase.table("hero_folders")
+        .select("*")
+        .eq("shop_id", shop_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+
+    return getattr(result, "data", None) or []
+
+
+@router.post("/shops/{shop_id}/folders")
+def create_shop_folder(shop_id: str, body: AdminCreateFolderRequest):
+    supabase = get_supabase_admin_client()
+
+    payload = {
+        "shop_id": shop_id,
+        "name": _clean_text(body.name, "name"),
+        "prompt_template": (body.prompt_template or "").strip(),
+    }
+
+    try:
+        result = supabase.table("hero_folders").insert(payload).execute()
+    except Exception as exc:
+        message = str(exc)
+        if "hero_folders_shop_id_name_key" in message:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A folder with this name already exists for this shop",
+            ) from exc
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create folder",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Folder created but no response was returned",
+        )
+
+    return rows[0]
+
+
+@router.delete("/shops/{shop_id}/folders/{folder_id}")
+async def delete_folder(
+    shop_id: str,
+    folder_id: str,
+    _: None = Depends(verify_admin_secret),
+):
+    supabase = get_supabase_admin_client()
+
+    result = (
+        supabase.table("hero_folders")
+        .delete()
+        .eq("id", folder_id)
+        .eq("shop_id", shop_id)
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Folder not found")
+    return {"deleted": folder_id}
+
+
+@router.patch("/shops/{shop_id}/folders/{folder_id}/default-hero")
+def update_shop_folder_default_hero(
+    shop_id: str,
+    folder_id: str,
+    body: AdminUpdateDefaultHeroRequest,
+):
+    supabase = get_supabase_admin_client()
+
+    default_hero_image_id = body.default_hero_image_id
+    if default_hero_image_id is not None:
+        default_hero_image_id = default_hero_image_id.strip()
+        if not default_hero_image_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="default_hero_image_id must be a UUID string or null",
+            )
+
+        image_check = (
+            supabase.table("hero_images")
+            .select("id")
+            .eq("id", default_hero_image_id)
+            .eq("shop_id", shop_id)
+            .limit(1)
+            .execute()
+        )
+        image_rows = getattr(image_check, "data", None) or []
+        if not image_rows:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Hero image not found for this shop",
+            )
+
+    try:
+        result = (
+            supabase.table("hero_folders")
+            .update(
+                {
+                    "default_hero_image_id": default_hero_image_id,
+                    "updated_at": _utc_now_iso(),
+                }
+            )
+            .eq("id", folder_id)
+            .eq("shop_id", shop_id)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update default hero image",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Folder not found for this shop",
+        )
+
+    return rows[0]
+
+
+@router.get("/shops/{shop_id}/hero-images")
+def list_shop_hero_images(
+    shop_id: str,
+    folder_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    supabase = get_supabase_admin_client()
+
+    query = (
+        supabase.table("hero_images")
+        .select("*")
+        .eq("shop_id", shop_id)
+        .order("created_at", desc=True)
+    )
+
+    if folder_id and folder_id.strip():
+        query = query.eq("folder_id", folder_id.strip())
+
+    query = query.range(offset, offset + limit - 1)
+
+    result = query.execute()
+    return getattr(result, "data", None) or []
+
+
+@router.post("/shops/{shop_id}/hero-images/upload")
+async def upload_shop_hero_image(
+    shop_id: str,
+    folder_id: str = Form(...),
+    file: UploadFile = File(...),
+):
+    supabase = get_supabase_admin_client()
+
+    normalized_folder_id = _clean_text(folder_id, "folder_id")
+    content_type = (file.content_type or "").strip().lower() or "image/jpeg"
+
+    if not content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only image files are allowed",
+        )
+
+    folder_check = (
+        supabase.table("hero_folders")
+        .select("id")
+        .eq("id", normalized_folder_id)
+        .eq("shop_id", shop_id)
+        .limit(1)
+        .execute()
+    )
+    folder_rows = getattr(folder_check, "data", None) or []
+    if not folder_rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Folder not found for this shop",
+        )
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded image file is empty",
+        )
+
+    ext = _guess_extension(file.filename, content_type)
+    filename = f"{int(datetime.now().timestamp())}-{uuid4().hex[:8]}.{ext}"
+    storage_path = f"{shop_id}/{normalized_folder_id}/{filename}"
+
+    _upload_bytes_to_bucket(
+        supabase=supabase,
+        bucket="hero-images",
+        path=storage_path,
+        data=data,
+        content_type=content_type,
+    )
+
+    metadata_payload = {
+        "shop_id": shop_id,
+        "folder_id": normalized_folder_id,
+        "storage_path": storage_path,
+        "original_filename": file.filename,
+        "mime_type": content_type,
+        "file_size_bytes": len(data),
+        "width": None,
+        "height": None,
+    }
+
+    result = supabase.table("hero_images").insert(metadata_payload).execute()
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Hero image metadata created but no response returned",
+        )
+
+    return rows[0]
+
+
+@router.get("/shops/{shop_id}/catalog-images")
+def list_shop_catalog_images(
+    shop_id: str,
+    folder_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    supabase = get_supabase_admin_client()
+
+    query = (
+        supabase.table("catalog_images")
+        .select("*")
+        .eq("shop_id", shop_id)
+        .order("sort_order", desc=False)
+        .order("created_at", desc=False)
+    )
+
+    if folder_id and folder_id.strip():
+        query = query.eq("folder_id", folder_id.strip())
+
+    query = query.range(offset, offset + limit - 1)
+
+    result = query.execute()
+    return getattr(result, "data", None) or []
+
+
+@router.post("/shops/{shop_id}/catalog-images/upload-bulk")
+async def upload_shop_catalog_images_bulk(
+    shop_id: str,
+    folder_id: str = Form(...),
+    files: list[UploadFile] = File(...),
+):
+    supabase = get_supabase_admin_client()
+
+    normalized_folder_id = _clean_text(folder_id, "folder_id")
+
+    folder_check = (
+        supabase.table("hero_folders")
+        .select("id")
+        .eq("id", normalized_folder_id)
+        .eq("shop_id", shop_id)
+        .limit(1)
+        .execute()
+    )
+    folder_rows = getattr(folder_check, "data", None) or []
+    if not folder_rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Folder not found for this shop",
+        )
+
+    active_files = [file for file in files if file and (file.filename or "").strip()]
+    if not active_files:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one image file is required",
+        )
+
+    start_sort_order = _get_folder_start_sort_order(
+        supabase=supabase,
+        shop_id=shop_id,
+        folder_id=normalized_folder_id,
+    )
+
+    inserted_rows: list[dict[str, Any]] = []
+    sort_order = start_sort_order
+
+    for file in active_files:
+        content_type = (file.content_type or "").strip().lower() or "image/jpeg"
+        if not content_type.startswith("image/"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Only image files are allowed ({file.filename})",
+            )
+
+        data = await file.read()
+        if not data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Uploaded image file is empty ({file.filename})",
+            )
+
+        ext = _guess_extension(file.filename, content_type)
+        filename = f"{int(datetime.now().timestamp())}-{uuid4().hex[:8]}.{ext}"
+        storage_path = f"{shop_id}/{normalized_folder_id}/{filename}"
+
+        _upload_bytes_to_bucket(
+            supabase=supabase,
+            bucket="catalog-images",
+            path=storage_path,
+            data=data,
+            content_type=content_type,
+        )
+
+        metadata_payload = {
+            "shop_id": shop_id,
+            "folder_id": normalized_folder_id,
+            "storage_path": storage_path,
+            "original_filename": file.filename,
+            "mime_type": content_type,
+            "file_size_bytes": len(data),
+            "width": None,
+            "height": None,
+            "sort_order": sort_order,
+            "is_active": True,
+        }
+
+        result = supabase.table("catalog_images").insert(metadata_payload).execute()
+        rows = getattr(result, "data", None) or []
+        if not rows:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Catalog image metadata created but no response returned ({file.filename})",
+            )
+
+        inserted_rows.append(rows[0])
+        sort_order += 1
+
+    return {
+        "shop_id": shop_id,
+        "folder_id": normalized_folder_id,
+        "uploaded_count": len(inserted_rows),
+        "items": inserted_rows,
+    }
+
+
+=== D:\AiVastraBackend 2.3 Codex\admin_deps.py ===
+from fastapi import Header, HTTPException, status
+
+from config import get_settings
+
+
+def verify_admin_secret(x_admin_secret: str | None = Header(default=None)) -> None:
+    settings = get_settings()
+    configured = (settings.ADMIN_PANEL_SECRET or "").strip()
+
+    if not configured:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Admin panel secret is not configured on backend",
+        )
+
+    provided = (x_admin_secret or "").strip()
+    if not provided or provided != configured:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid admin secret",
+        )
+
+=== D:\AiVastraBackend 2.3 Codex\auth_deps.py ===
+from typing import Optional
+
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
+
+from supabase_client import get_supabase_admin_client
+
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+class CurrentShopContext(BaseModel):
+    auth_user_id: str
+    email: Optional[str] = None
+    shop_id: str
+    role: str
+
+
+def get_bearer_token(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+) -> str:
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing bearer token",
+        )
+
+    if credentials.scheme.lower() != "bearer" or not credentials.credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authorization header",
+        )
+
+    return credentials.credentials
+
+
+def get_current_shop_context(
+    token: str = Depends(get_bearer_token),
+) -> CurrentShopContext:
+    supabase = get_supabase_admin_client()
+
+    try:
+        auth_response = supabase.auth.get_user(token)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired access token",
+        ) from exc
+
+    user = getattr(auth_response, "user", None)
+    if user is None and isinstance(auth_response, dict):
+        user = auth_response.get("user")
+
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unable to verify user from token",
+        )
+
+    if isinstance(user, dict):
+        auth_user_id = str(user.get("id") or "")
+        email = user.get("email")
+    else:
+        auth_user_id = str(getattr(user, "id", "") or "")
+        email = getattr(user, "email", None)
+
+    if not auth_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token user id missing",
+        )
+
+    try:
+        result = (
+            supabase.table("shop_users")
+            .select("shop_id, role")
+            .eq("auth_user_id", auth_user_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to resolve shop mapping",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User is not linked to any shop",
+        )
+
+    row = rows[0]
+    shop_id = str(row["shop_id"])
+
+    # Optional shop suspension gate (requires shops.is_suspended column).
+    try:
+        shop_result = (
+            supabase.table("shops")
+            .select("is_suspended")
+            .eq("id", shop_id)
+            .limit(1)
+            .execute()
+        )
+        shop_rows = getattr(shop_result, "data", None) or []
+        if shop_rows and bool(shop_rows[0].get("is_suspended", False)):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Shop access is suspended",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        # Silently skip suspension check on timeout/error
+        # User gets through, worst case a suspended shop
+        # temporarily gets access - acceptable tradeoff
+        pass
+
+    return CurrentShopContext(
+        auth_user_id=auth_user_id,
+        email=email,
+        shop_id=shop_id,
+        role=str(row["role"]),
+    )
+
+=== D:\AiVastraBackend 2.3 Codex\config.py ===
+from functools import lru_cache
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    APP_ENV: str = "development"
+
+    SUPABASE_URL: str
+    SUPABASE_SERVICE_ROLE_KEY: str
+
+    GEMINI_API_KEY: str
+    GEMINI_IMAGE_MODEL_ID: str = "gemini-3-pro-image-preview"
+
+    CREDITS_PER_GENERATION: int = Field(default=1, gt=0)
+    WORKER_POLL_INTERVAL_SECONDS: float = Field(default=3, gt=0)
+
+    # Used by /admin endpoints. Keep this long and private.
+    ADMIN_PANEL_SECRET: str = Field(default="")
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+
+=== D:\AiVastraBackend 2.3 Codex\folders_api.py ===
+from datetime import datetime, timezone
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
+
+from auth_deps import CurrentShopContext, get_current_shop_context
+from supabase_client import get_supabase_admin_client
+
+router = APIRouter(prefix="/folders", tags=["Folders"])
+
+
+class FolderCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    prompt_template: str = ""
+
+
+class FolderUpdateRequest(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    prompt_template: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_folder_name(name: str) -> str:
+    normalized = name.strip()
+    if not normalized:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Folder name cannot be blank",
+        )
+    return normalized
+
+
+@router.post("")
+def create_folder(
+    body: FolderCreateRequest,
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    supabase = get_supabase_admin_client()
+
+    payload = {
+        "shop_id": current.shop_id,
+        "name": _normalize_folder_name(body.name),
+        "prompt_template": body.prompt_template or "",
+    }
+
+    try:
+        result = (
+            supabase.table("hero_folders")
+            .insert(payload)
+            .execute()
+        )
+    except Exception as exc:
+        if "hero_folders_shop_id_name_key" in str(exc):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A folder with this name already exists in your shop",
+            ) from exc
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create folder",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        # Fallback fetch (in case insert returns no representation)
+        fetch = (
+            supabase.table("hero_folders")
+            .select("*")
+            .eq("shop_id", current.shop_id)
+            .eq("name", payload["name"])
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(fetch, "data", None) or []
+
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Folder created but could not fetch response",
+        )
+
+    return rows[0]
+
+
+@router.get("")
+def list_folders(
+    include_inactive: bool = Query(default=True),
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    supabase = get_supabase_admin_client()
+
+    query = (
+        supabase.table("hero_folders")
+        .select("*")
+        .eq("shop_id", current.shop_id)
+        .order("created_at", desc=True)
+    )
+
+    if not include_inactive:
+        query = query.eq("is_active", True)
+
+    try:
+        result = query.execute()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch folders",
+        ) from exc
+
+    return getattr(result, "data", None) or []
+
+
+@router.patch("/{folder_id}")
+def update_folder(
+    folder_id: str,
+    body: FolderUpdateRequest,
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    supabase = get_supabase_admin_client()
+
+    update_data = body.model_dump(exclude_unset=True)
+
+    if not update_data:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide at least one field to update",
+        )
+
+    if "name" in update_data and update_data["name"] is not None:
+        update_data["name"] = _normalize_folder_name(update_data["name"])
+
+    update_data["updated_at"] = _utc_now_iso()
+
+    # Confirm folder belongs to this shop
+    existing = (
+        supabase.table("hero_folders")
+        .select("id")
+        .eq("id", folder_id)
+        .eq("shop_id", current.shop_id)
+        .limit(1)
+        .execute()
+    )
+    if not (getattr(existing, "data", None) or []):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Folder not found",
+        )
+
+    try:
+        result = (
+            supabase.table("hero_folders")
+            .update(update_data)
+            .eq("id", folder_id)
+            .eq("shop_id", current.shop_id)
+            .execute()
+        )
+    except Exception as exc:
+        if "hero_folders_shop_id_name_key" in str(exc):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A folder with this name already exists in your shop",
+            ) from exc
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update folder",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        fetch = (
+            supabase.table("hero_folders")
+            .select("*")
+            .eq("id", folder_id)
+            .eq("shop_id", current.shop_id)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(fetch, "data", None) or []
+
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Folder updated but could not fetch response",
+        )
+
+    return rows[0]
+
+
+@router.delete("/{folder_id}")
+def delete_folder(
+    folder_id: str,
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    supabase = get_supabase_admin_client()
+
+    # Confirm folder belongs to this shop
+    existing = (
+        supabase.table("hero_folders")
+        .select("id, name")
+        .eq("id", folder_id)
+        .eq("shop_id", current.shop_id)
+        .limit(1)
+        .execute()
+    )
+    rows = getattr(existing, "data", None) or []
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Folder not found",
+        )
+
+    folder = rows[0]
+
+    try:
+        (
+            supabase.table("hero_folders")
+            .delete()
+            .eq("id", folder_id)
+            .eq("shop_id", current.shop_id)
+            .execute()
+        )
+    except Exception as exc:
+        # This may happen later if generations reference the folder (on delete restrict)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Folder could not be deleted (it may be referenced by other records)",
+        ) from exc
+
+    return {
+        "deleted": True,
+        "id": folder["id"],
+        "name": folder["name"],
+    }
+
+=== D:\AiVastraBackend 2.3 Codex\garment_types_api.py ===
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, status
+
+from auth_deps import CurrentShopContext, get_current_shop_context
+from config import get_settings
+from supabase_client import get_supabase_admin_client
+
+router = APIRouter(prefix="/garment-types", tags=["Garment Types"])
+
+
+def _extract_signed_url(signed_payload: object) -> Optional[str]:
+    if isinstance(signed_payload, dict):
+        data = signed_payload.get("data")
+        nested = data if isinstance(data, dict) else {}
+        return (
+            signed_payload.get("signedURL")
+            or signed_payload.get("signedUrl")
+            or signed_payload.get("signed_url")
+            or nested.get("signedURL")
+            or nested.get("signedUrl")
+            or nested.get("signed_url")
+        )
+    return None
+
+
+def _create_hero_image_signed_url(supabase, storage_path: str) -> Optional[str]:
+    try:
+        cleaned_path = storage_path.strip()
+        if not cleaned_path:
+            return None
+
+        signed = supabase.storage.from_("hero-images").create_signed_url(
+            cleaned_path,
+            3600,
+        )
+
+        signed_url = _extract_signed_url(signed)
+        if not signed_url:
+            return None
+
+        if signed_url.startswith("/"):
+            signed_url = f"{get_settings().SUPABASE_URL}{signed_url}"
+
+        return signed_url
+    except Exception:
+        return None
+
+
+@router.get("")
+def list_garment_types(
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    supabase = get_supabase_admin_client()
+
+    try:
+        folder_result = (
+            supabase.table("hero_folders")
+            .select("id, name, prompt_template, default_hero_image_id")
+            .eq("shop_id", current.shop_id)
+            .eq("is_active", True)
+            .order("name", desc=False)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch garment types",
+        ) from exc
+
+    folders = getattr(folder_result, "data", None) or []
+    items = []
+
+    for folder in folders:
+        default_hero_image_id = folder.get("default_hero_image_id")
+        hero_image_signed_url = None
+
+        if default_hero_image_id:
+            try:
+                image_result = (
+                    supabase.table("hero_images")
+                    .select("id, storage_path")
+                    .eq("id", default_hero_image_id)
+                    .eq("shop_id", current.shop_id)
+                    .limit(1)
+                    .execute()
+                )
+                image_rows = getattr(image_result, "data", None) or []
+                if image_rows:
+                    storage_path = str(image_rows[0].get("storage_path") or "")
+                    hero_image_signed_url = _create_hero_image_signed_url(
+                        supabase,
+                        storage_path,
+                    )
+            except Exception:
+                hero_image_signed_url = None
+
+        items.append(
+            {
+                "id": folder.get("id"),
+                "name": folder.get("name"),
+                "prompt_template": folder.get("prompt_template"),
+                "default_hero_image_id": default_hero_image_id or None,
+                "hero_image_signed_url": hero_image_signed_url,
+            }
+        )
+
+    return items
+
+=== D:\AiVastraBackend 2.3 Codex\generations_api.py ===
+import io
+from typing import Any, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
+
+from auth_deps import CurrentShopContext, get_current_shop_context
+from config import get_settings
+from prompting import build_generation_prompt
+from supabase_client import get_supabase_admin_client
+
+router = APIRouter(prefix="/generations", tags=["Generations"])
+
+_ALLOWED_STATUSES = {"queued", "processing", "done", "failed"}
+_ALLOWED_APPLY_TO = {"shirt", "pant", "suit_full_body", "suit_upper", "koti"}
+
+
+class GenerationCreateFabricItem(BaseModel):
+    fabric_image_id: str = Field(..., min_length=1)
+    apply_to: str = Field(..., min_length=1)
+    fabric_code: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    fabric_color: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    fabric_scale: Optional[str] = Field(
+        default=None,
+        description="Pattern scale hint: 'fine', 'medium', or 'bold'",
+    )
+
+
+class GenerationCreateRequest(BaseModel):
+    hero_image_id: str = Field(..., min_length=1)
+    # Backward-compatible single-fabric field (older clients).
+    fabric_image_id: Optional[str] = Field(default=None, min_length=1)
+    fabrics: list[GenerationCreateFabricItem] = Field(default_factory=list)
+
+
+class GenerationMatchColorEdit(BaseModel):
+    selected_hex: str = Field(..., min_length=4, max_length=9)
+    hue_shift_degrees: float = Field(default=0, ge=-180, le=180)
+    saturation_delta_percent: float = Field(default=0, ge=-100, le=100)
+    lightness_delta_percent: float = Field(default=0, ge=-100, le=100)
+
+
+class GenerationMatchColorRequest(BaseModel):
+    edits: list[GenerationMatchColorEdit] = Field(default_factory=list)
+    # Backward-compatible single-edit fields (older clients).
+    selected_hex: Optional[str] = Field(default=None, min_length=4, max_length=9)
+    hue_shift_degrees: float = Field(default=0, ge=-180, le=180)
+    saturation_delta_percent: float = Field(default=0, ge=-100, le=100)
+    lightness_delta_percent: float = Field(default=0, ge=-100, le=100)
+
+
+def _clean_id(value: str, field_name: str) -> str:
+    cleaned = value.strip()
+    if not cleaned:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{field_name} cannot be blank",
+        )
+    return cleaned
+
+
+
+def _clean_optional_text(value: Optional[str], max_length: int = 120) -> Optional[str]:
+    if value is None:
+        return None
+
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+
+    return cleaned[:max_length]
+
+
+def _format_apply_to_label(value: str) -> str:
+    mapping = {
+        "shirt": "Shirt",
+        "pant": "Pant",
+        "suit_full_body": "Suit-Full Body",
+        "suit_upper": "Suit-Upper",
+        "koti": "Koti",
+    }
+    key = (value or "").strip().lower()
+    return mapping.get(key, value or "Garment")
+
+
+def _build_fabric_summary_label(fabrics: list[dict[str, Any]]) -> Optional[str]:
+    if not fabrics:
+        return None
+
+    parts: list[str] = []
+    ordered = sorted(fabrics, key=lambda item: int(item.get("sort_order") or 0))
+
+    for item in ordered:
+        apply_to_label = _format_apply_to_label(str(item.get("apply_to") or ""))
+        fabric_code = _clean_optional_text(item.get("fabric_code"))
+
+        if fabric_code:
+            parts.append(f"{apply_to_label}: {fabric_code}")
+        elif apply_to_label:
+            parts.append(apply_to_label)
+
+    if not parts:
+        return None
+
+    return " | ".join(parts)
+
+
+def _attach_generation_fabric_metadata(
+    *,
+    supabase,
+    shop_id: str,
+    generation_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not generation_rows:
+        return generation_rows
+
+    generation_ids = [str(row.get("id") or "").strip() for row in generation_rows]
+    generation_ids = [value for value in generation_ids if value]
+    if not generation_ids:
+        return generation_rows
+
+    try:
+        result = (
+            supabase.table("generation_fabrics")
+            .select("generation_id, apply_to, sort_order, fabric_code, fabric_color")
+            .eq("shop_id", shop_id)
+            .in_("generation_id", generation_ids)
+            .order("sort_order", desc=False)
+            .execute()
+        )
+        fabric_rows = getattr(result, "data", None) or []
+    except Exception as exc:
+        # Backward-compatible fallback if DB columns are not migrated yet.
+        message = str(exc).lower()
+        if "fabric_code" in message or "fabric_color" in message:
+            try:
+                fallback_result = (
+                    supabase.table("generation_fabrics")
+                    .select("generation_id, apply_to, sort_order")
+                    .eq("shop_id", shop_id)
+                    .in_("generation_id", generation_ids)
+                    .order("sort_order", desc=False)
+                    .execute()
+                )
+                fallback_rows = getattr(fallback_result, "data", None) or []
+                fabric_rows = [
+                    {
+                        **row,
+                        "fabric_code": None,
+                        "fabric_color": None,
+                    }
+                    for row in fallback_rows
+                ]
+            except Exception:
+                return generation_rows
+        else:
+            return generation_rows
+
+    by_generation: dict[str, list[dict[str, Any]]] = {}
+    for item in fabric_rows:
+        generation_id = str(item.get("generation_id") or "").strip()
+        if not generation_id:
+            continue
+        by_generation.setdefault(generation_id, []).append(item)
+
+    enriched: list[dict[str, Any]] = []
+    for row in generation_rows:
+        generation_id = str(row.get("id") or "").strip()
+        fabrics = by_generation.get(generation_id, [])
+
+        next_row = dict(row)
+        if fabrics:
+            next_row["generation_fabrics"] = fabrics
+            summary = _build_fabric_summary_label(fabrics)
+            if summary:
+                next_row["fabric_summary_label"] = summary
+
+        enriched.append(next_row)
+
+    return enriched
+
+
+def _persist_generation_fabric_metadata(
+    *,
+    supabase,
+    shop_id: str,
+    generation_id: str,
+    normalized_fabrics: list[dict[str, Any]],
+) -> Optional[str]:
+    if not normalized_fabrics:
+        return None
+
+    try:
+        for item in normalized_fabrics:
+            payload = {
+                "fabric_code": _clean_optional_text(item.get("fabric_code")),
+                "fabric_color": _clean_optional_text(item.get("fabric_color")),
+            }
+
+            (
+                supabase.table("generation_fabrics")
+                .update(payload)
+                .eq("generation_id", generation_id)
+                .eq("shop_id", shop_id)
+                .eq("fabric_image_id", item["fabric_image_id"])
+                .eq("apply_to", item["apply_to"])
+                .execute()
+            )
+    except Exception as exc:
+        return f"Generation queued, but fabric metadata could not be saved: {exc}"
+
+    return None
+
+
+def _find_generation_ids_by_fabric_filters(
+    *,
+    supabase,
+    shop_id: str,
+    fabric_code: Optional[str],
+    fabric_color: Optional[str],
+) -> Optional[list[str]]:
+    code_filter = _clean_optional_text(fabric_code)
+    color_filter = _clean_optional_text(fabric_color)
+
+    if not code_filter and not color_filter:
+        return None
+
+    query = (
+        supabase.table("generation_fabrics")
+        .select("generation_id")
+        .eq("shop_id", shop_id)
+    )
+
+    if code_filter:
+        query = query.ilike("fabric_code", f"%{code_filter}%")
+
+    if color_filter:
+        query = query.ilike("fabric_color", f"%{color_filter}%")
+
+    query = query.limit(5000)
+
+    try:
+        result = query.execute()
+    except Exception as exc:
+        message = str(exc).lower()
+        if "fabric_code" in message or "fabric_color" in message:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    "Fabric filter columns are missing in database. "
+                    "Run migration for generation_fabrics.fabric_code/fabric_color."
+                ),
+            ) from exc
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to filter generations by fabric metadata",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    seen: set[str] = set()
+    generation_ids: list[str] = []
+
+    for row in rows:
+        generation_id = str(row.get("generation_id") or "").strip()
+        if not generation_id or generation_id in seen:
+            continue
+
+        seen.add(generation_id)
+        generation_ids.append(generation_id)
+
+    return generation_ids
+
+def _load_folder_prompt_context_for_hero_image(
+    *,
+    supabase,
+    shop_id: str,
+    hero_image_id: str,
+) -> dict:
+    try:
+        hero_result = (
+            supabase.table("hero_images")
+            .select("id, folder_id")
+            .eq("id", hero_image_id)
+            .eq("shop_id", shop_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch hero image metadata",
+        ) from exc
+
+    hero_rows = getattr(hero_result, "data", None) or []
+    if not hero_rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Hero image not found for this shop",
+        )
+
+    folder_id = str(hero_rows[0]["folder_id"])
+
+    try:
+        folder_result = (
+            supabase.table("hero_folders")
+            .select("id, name, prompt_template")
+            .eq("id", folder_id)
+            .eq("shop_id", shop_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch folder prompt template",
+        ) from exc
+
+    folder_rows = getattr(folder_result, "data", None) or []
+    if not folder_rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Folder not found for the selected hero image",
+        )
+
+    return folder_rows[0]
+
+
+def _normalize_generation_fabrics(body: GenerationCreateRequest) -> list[dict[str, Any]]:
+    raw_fabrics = list(body.fabrics or [])
+    is_legacy_single = False
+
+    if not raw_fabrics and body.fabric_image_id:
+        # Backward-compatible path: treat single legacy fabric as full-body garment material.
+        is_legacy_single = True
+        raw_fabrics = [
+            GenerationCreateFabricItem(
+                fabric_image_id=body.fabric_image_id,
+                apply_to="suit_full_body",
+                fabric_code=None,
+                fabric_color=None,
+            )
+        ]
+
+    if not raw_fabrics:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one fabric is required",
+        )
+
+    if len(raw_fabrics) > 3:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At most 3 fabrics are allowed per generation",
+        )
+
+    normalized: list[dict[str, Any]] = []
+    seen_apply_to: set[str] = set()
+
+    for item in raw_fabrics:
+        fabric_image_id = _clean_id(item.fabric_image_id, "fabric_image_id")
+        apply_to = (item.apply_to or "").strip().lower()
+        if apply_to not in _ALLOWED_APPLY_TO:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Invalid apply_to value. Allowed values: "
+                    "shirt, pant, suit_full_body, suit_upper, koti"
+                ),
+            )
+
+        if apply_to in seen_apply_to:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Duplicate apply_to value: {apply_to}",
+            )
+        seen_apply_to.add(apply_to)
+
+        fabric_code = _clean_optional_text(item.fabric_code)
+        if not fabric_code and not is_legacy_single:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="fabric_code is required for each fabric",
+            )
+
+        normalized.append(
+            {
+                "fabric_image_id": fabric_image_id,
+                "apply_to": apply_to,
+                "fabric_code": fabric_code,
+                "fabric_color": _clean_optional_text(item.fabric_color),
+                "fabric_scale": _clean_optional_text(item.fabric_scale),
+            }
+        )
+
+    if len(normalized) > 1 and any(item["apply_to"] == "suit_full_body" for item in normalized):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="suit_full_body cannot be combined with other apply_to values",
+        )
+
+    return normalized
+
+
+def _normalize_hex_color(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw.startswith("#"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="selected_hex must be a hex color (e.g. #AABBCC)",
+        )
+
+    hex_part = raw[1:]
+    if len(hex_part) == 3:
+        if not all(ch in "0123456789abcdefABCDEF" for ch in hex_part):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="selected_hex is invalid",
+            )
+        return "#" + "".join(ch * 2 for ch in hex_part).upper()
+
+    if len(hex_part) == 6 and all(ch in "0123456789abcdefABCDEF" for ch in hex_part):
+        return f"#{hex_part.upper()}"
+
+    if len(hex_part) == 8 and all(ch in "0123456789abcdefABCDEF" for ch in hex_part):
+        # Accept #AARRGGBB and drop alpha for matching.
+        return f"#{hex_part[2:].upper()}"
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="selected_hex is invalid",
+    )
+
+
+def _hex_to_rgb_tuple(hex_color: str) -> tuple[int, int, int]:
+    normalized = _normalize_hex_color(hex_color)
+    value = normalized[1:]
+    return (
+        int(value[0:2], 16),
+        int(value[2:4], 16),
+        int(value[4:6], 16),
+    )
+
+
+def _normalize_match_color_edits(body: GenerationMatchColorRequest) -> list[dict]:
+    raw_edits = list(body.edits or [])
+
+    if not raw_edits and body.selected_hex:
+        raw_edits = [
+            GenerationMatchColorEdit(
+                selected_hex=body.selected_hex,
+                hue_shift_degrees=body.hue_shift_degrees,
+                saturation_delta_percent=body.saturation_delta_percent,
+                lightness_delta_percent=body.lightness_delta_percent,
+            )
+        ]
+
+    if not raw_edits:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No match-color edits provided",
+        )
+
+    if len(raw_edits) > 24:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Too many match-color edits in one request",
+        )
+
+    normalized: list[dict] = []
+    for item in raw_edits:
+        selected_hex = _normalize_hex_color(item.selected_hex)
+        hue_shift_degrees = float(item.hue_shift_degrees)
+        saturation_delta_percent = float(item.saturation_delta_percent)
+        lightness_delta_percent = float(item.lightness_delta_percent)
+
+        is_noop = (
+            abs(hue_shift_degrees) < 1e-6
+            and abs(saturation_delta_percent) < 1e-6
+            and abs(lightness_delta_percent) < 1e-6
+        )
+        if is_noop:
+            continue
+
+        normalized.append(
+            {
+                "selected_hex": selected_hex,
+                "hue_shift_degrees": hue_shift_degrees,
+                "saturation_delta_percent": saturation_delta_percent,
+                "lightness_delta_percent": lightness_delta_percent,
+            }
+        )
+
+    if not normalized:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="All match-color edits were empty (no changes)",
+        )
+
+    return normalized
+
+
+def _import_match_color_dependencies():
+    try:
+        import numpy as np  # type: ignore
+        from PIL import Image  # type: ignore
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Match Color backend dependencies are missing. "
+                "Install pillow and numpy in the backend environment."
+            ),
+        ) from exc
+
+    return np, Image
+
+
+def _rgb_to_hsl_numpy(rgb, np):
+    # rgb shape: (..., 3), float32 in [0, 1]
+    r = rgb[..., 0]
+    g = rgb[..., 1]
+    b = rgb[..., 2]
+
+    max_c = np.maximum(np.maximum(r, g), b)
+    min_c = np.minimum(np.minimum(r, g), b)
+    delta = max_c - min_c
+
+    l = (max_c + min_c) / 2.0
+    s = np.zeros_like(l)
+    h = np.zeros_like(l)
+
+    non_gray = delta > 1e-8
+    denom = 1.0 - np.abs(2.0 * l - 1.0)
+    valid_sat = non_gray & (denom > 1e-8)
+    s[valid_sat] = delta[valid_sat] / denom[valid_sat]
+
+    r_is_max = non_gray & (max_c == r)
+    g_is_max = non_gray & (max_c == g)
+    b_is_max = non_gray & (max_c == b)
+
+    h[r_is_max] = np.mod(((g[r_is_max] - b[r_is_max]) / delta[r_is_max]), 6.0)
+    h[g_is_max] = ((b[g_is_max] - r[g_is_max]) / delta[g_is_max]) + 2.0
+    h[b_is_max] = ((r[b_is_max] - g[b_is_max]) / delta[b_is_max]) + 4.0
+    h = np.mod(h / 6.0, 1.0)
+
+    return h, np.clip(s, 0.0, 1.0), np.clip(l, 0.0, 1.0)
+
+
+def _hsl_to_rgb_numpy(h, s, l, np):
+    s = np.clip(s, 0.0, 1.0)
+    l = np.clip(l, 0.0, 1.0)
+    h = np.mod(h, 1.0)
+
+    c = (1.0 - np.abs(2.0 * l - 1.0)) * s
+    h6 = h * 6.0
+    x = c * (1.0 - np.abs(np.mod(h6, 2.0) - 1.0))
+    m = l - c / 2.0
+
+    zeros = np.zeros_like(h)
+
+    r1 = np.select(
+        [
+            (h6 >= 0) & (h6 < 1),
+            (h6 >= 1) & (h6 < 2),
+            (h6 >= 2) & (h6 < 3),
+            (h6 >= 3) & (h6 < 4),
+            (h6 >= 4) & (h6 < 5),
+            (h6 >= 5) & (h6 < 6),
+        ],
+        [c, x, zeros, zeros, x, c],
+        default=zeros,
+    )
+    g1 = np.select(
+        [
+            (h6 >= 0) & (h6 < 1),
+            (h6 >= 1) & (h6 < 2),
+            (h6 >= 2) & (h6 < 3),
+            (h6 >= 3) & (h6 < 4),
+            (h6 >= 4) & (h6 < 5),
+            (h6 >= 5) & (h6 < 6),
+        ],
+        [x, c, c, x, zeros, zeros],
+        default=zeros,
+    )
+    b1 = np.select(
+        [
+            (h6 >= 0) & (h6 < 1),
+            (h6 >= 1) & (h6 < 2),
+            (h6 >= 2) & (h6 < 3),
+            (h6 >= 3) & (h6 < 4),
+            (h6 >= 4) & (h6 < 5),
+            (h6 >= 5) & (h6 < 6),
+        ],
+        [zeros, zeros, x, c, c, x],
+        default=zeros,
+    )
+
+    r = np.clip(r1 + m, 0.0, 1.0)
+    g = np.clip(g1 + m, 0.0, 1.0)
+    b = np.clip(b1 + m, 0.0, 1.0)
+
+    return np.stack([r, g, b], axis=-1)
+
+
+def _smoothstep_numpy(edge0, edge1, x, np):
+    denom = max(edge1 - edge0, 1e-8)
+    t = np.clip((x - edge0) / denom, 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _detect_output_format(output_path: str) -> tuple[str, str]:
+    path = (output_path or "").strip().lower()
+    if path.endswith(".jpg") or path.endswith(".jpeg"):
+        return "JPEG", "image/jpeg"
+    if path.endswith(".webp"):
+        return "WEBP", "image/webp"
+    return "PNG", "image/png"
+
+
+def _apply_match_color_full_res(
+    image_bytes: bytes,
+    *,
+    output_path: str,
+    edits: list[dict],
+) -> tuple[bytes, str]:
+    np, Image = _import_match_color_dependencies()
+
+    image = Image.open(io.BytesIO(image_bytes))
+    image.load()
+
+    has_alpha = "A" in image.getbands()
+    rgba = image.convert("RGBA")
+
+    rgba_array = np.asarray(rgba).astype(np.float32)
+    rgb = rgba_array[..., :3] / 255.0
+    alpha = rgba_array[..., 3:4]
+
+    hue_tol = 18.0 / 360.0
+    sat_tol = 0.28
+    light_tol = 0.28
+    feather = 0.08
+
+    rgb_work = rgb
+
+    for edit in edits:
+        selected_hex = str(edit["selected_hex"])
+        hue_shift_degrees = float(edit["hue_shift_degrees"])
+        saturation_delta_percent = float(edit["saturation_delta_percent"])
+        lightness_delta_percent = float(edit["lightness_delta_percent"])
+
+        target_rgb = np.array([_hex_to_rgb_tuple(selected_hex)], dtype=np.float32) / 255.0
+        target_h, target_s, target_l = _rgb_to_hsl_numpy(target_rgb, np)
+        target_h = float(target_h.reshape(-1)[0])
+        target_s = float(target_s.reshape(-1)[0])
+        target_l = float(target_l.reshape(-1)[0])
+
+        h, s, l = _rgb_to_hsl_numpy(rgb_work, np)
+
+        hue_diff = np.abs(((h - target_h + 0.5) % 1.0) - 0.5)
+        sat_diff = np.abs(s - target_s)
+        light_diff = np.abs(l - target_l)
+
+        h_mask = 1.0 - _smoothstep_numpy(hue_tol, hue_tol + feather, hue_diff, np)
+        s_mask = 1.0 - _smoothstep_numpy(sat_tol, sat_tol + feather, sat_diff, np)
+        l_mask = 1.0 - _smoothstep_numpy(light_tol, light_tol + feather, light_diff, np)
+        mask = np.clip(h_mask * s_mask * l_mask, 0.0, 1.0)
+
+        hue_shift = hue_shift_degrees / 360.0
+        sat_delta = saturation_delta_percent / 100.0
+        light_delta = lightness_delta_percent / 100.0
+
+        h2 = np.mod(h + hue_shift * mask, 1.0)
+        s2 = np.clip(s + sat_delta * mask, 0.0, 1.0)
+        l2 = np.clip(l + light_delta * mask, 0.0, 1.0)
+
+        rgb_shifted = _hsl_to_rgb_numpy(h2, s2, l2, np)
+        mask_3 = mask[..., None]
+        rgb_work = np.clip(rgb_work * (1.0 - mask_3) + rgb_shifted * mask_3, 0.0, 1.0)
+
+    out_rgba = np.concatenate([rgb_work * 255.0, alpha], axis=-1).astype(np.uint8)
+    out_image_rgba = Image.fromarray(out_rgba, mode="RGBA")
+
+    save_format, mime_type = _detect_output_format(output_path)
+
+    if save_format == "JPEG":
+        out_image = out_image_rgba.convert("RGB")
+    elif save_format == "WEBP" and not has_alpha:
+        out_image = out_image_rgba.convert("RGB")
+    else:
+        out_image = out_image_rgba
+
+    buf = io.BytesIO()
+    save_kwargs = {}
+    if save_format in {"JPEG", "WEBP"}:
+        save_kwargs["quality"] = 95
+    out_image.save(buf, format=save_format, **save_kwargs)
+
+    return buf.getvalue(), mime_type
+
+
+@router.post("")
+def create_generation(
+    body: GenerationCreateRequest,
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    supabase = get_supabase_admin_client()
+    settings = get_settings()
+
+    hero_image_id = _clean_id(body.hero_image_id, "hero_image_id")
+    normalized_fabrics = _normalize_generation_fabrics(body)
+    primary_fabric_image_id = normalized_fabrics[0]["fabric_image_id"]
+
+    # Build prompt before charging credits so prompt lookup failures do not debit the user.
+    folder_context = _load_folder_prompt_context_for_hero_image(
+        supabase=supabase,
+        shop_id=current.shop_id,
+        hero_image_id=hero_image_id,
+    )
+    fabric_scale = None
+    if normalized_fabrics:
+        fabric_scale = normalized_fabrics[0].get("fabric_scale")
+
+    prompt_used = build_generation_prompt(
+        folder_name=folder_context.get("name"),
+        folder_prompt_template=folder_context.get("prompt_template"),
+        fabric_assignments=normalized_fabrics,
+        fabric_scale=fabric_scale,
+    )
+
+    try:
+        result = (
+            supabase.rpc(
+                "create_generation_with_credit_debit_v2",
+                {
+                    "p_shop_id": current.shop_id,
+                    "p_hero_image_id": hero_image_id,
+                    "p_fabrics": normalized_fabrics,
+                    "p_credits_cost": settings.CREDITS_PER_GENERATION,
+                },
+            )
+            .execute()
+        )
+    except Exception as exc:
+        message = str(exc).lower()
+
+        if "insufficient credits" in message:
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail="Insufficient credits",
+            ) from exc
+
+        if "hero image not found" in message:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Hero image not found for this shop",
+            ) from exc
+
+        if "fabric image not found" in message:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Fabric image not found for this shop",
+            ) from exc
+
+        if "one or more fabric images not found" in message:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="One or more fabric images not found for this shop",
+            ) from exc
+
+        if (
+            "invalid apply_to value" in message
+            or "duplicate apply_to value" in message
+            or "suit_full_body cannot be combined" in message
+            or "count must be between 1 and 3" in message
+            or "must include fabric_image_id and apply_to" in message
+            or "fabric_code is required" in message
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create generation",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Generation created but no response returned",
+        )
+
+    row = rows[0]
+    generation_id = row["generation_id"]
+
+    prompt_saved = True
+    prompt_save_warning = None
+
+    # Best-effort save: avoid failing the request after credits were already debited.
+    try:
+        (
+            supabase.table("generations")
+            .update(
+                {
+                    "prompt_used": prompt_used,
+                    # Keep legacy column populated for backward compatibility.
+                    "fabric_image_id": primary_fabric_image_id,
+                }
+            )
+            .eq("id", generation_id)
+            .eq("shop_id", current.shop_id)
+            .execute()
+        )
+    except Exception as exc:
+        prompt_saved = False
+        prompt_save_warning = f"Generation queued, but prompt could not be saved: {exc}"
+
+    fabric_metadata_warning = _persist_generation_fabric_metadata(
+        supabase=supabase,
+        shop_id=current.shop_id,
+        generation_id=generation_id,
+        normalized_fabrics=normalized_fabrics,
+    )
+
+    response = {
+        "id": generation_id,
+        "status": row["status"],
+        "credits_used": row["credits_used"],
+        "balance_before": row["balance_before"],
+        "balance_after": row["balance_after"],
+        "prompt_saved": prompt_saved,
+    }
+
+    warnings: list[str] = []
+    if prompt_save_warning:
+        warnings.append(prompt_save_warning)
+    if fabric_metadata_warning:
+        warnings.append(fabric_metadata_warning)
+
+    if warnings:
+        response["warning"] = " | ".join(warnings)
+
+    return response
+
+
+@router.get("")
+def list_generations(
+    status_filter: Optional[str] = Query(default=None, alias="status"),
+    folder_id: Optional[str] = Query(default=None),
+    fabric_code: Optional[str] = Query(default=None),
+    fabric_color: Optional[str] = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    supabase = get_supabase_admin_client()
+
+    if status_filter is not None:
+        status_filter = status_filter.strip().lower()
+        if status_filter not in _ALLOWED_STATUSES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid status filter",
+            )
+
+    filtered_generation_ids = _find_generation_ids_by_fabric_filters(
+        supabase=supabase,
+        shop_id=current.shop_id,
+        fabric_code=fabric_code,
+        fabric_color=fabric_color,
+    )
+
+    query = (
+        supabase.table("generations")
+        .select("*")
+        .eq("shop_id", current.shop_id)
+        .order("created_at", desc=True)
+    )
+
+    if status_filter:
+        query = query.eq("status", status_filter)
+
+    if folder_id and folder_id.strip():
+        query = query.eq("folder_id", folder_id.strip())
+
+    if filtered_generation_ids is not None:
+        if not filtered_generation_ids:
+            return []
+        query = query.in_("id", filtered_generation_ids)
+
+    query = query.range(offset, offset + limit - 1)
+
+    try:
+        result = query.execute()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch generations",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    return _attach_generation_fabric_metadata(
+        supabase=supabase,
+        shop_id=current.shop_id,
+        generation_rows=rows,
+    )
+
+
+@router.get("/{generation_id}")
+def get_generation(
+    generation_id: str,
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    supabase = get_supabase_admin_client()
+
+    generation_id = _clean_id(generation_id, "generation_id")
+
+    try:
+        result = (
+            supabase.table("generations")
+            .select("*")
+            .eq("id", generation_id)
+            .eq("shop_id", current.shop_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch generation",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Generation not found",
+        )
+
+    enriched = _attach_generation_fabric_metadata(
+        supabase=supabase,
+        shop_id=current.shop_id,
+        generation_rows=rows,
+    )
+    return enriched[0]
+
+
+@router.get("/{generation_id}/download-url")
+def get_generation_download_url(
+    generation_id: str,
+    expires_in_seconds: int = Query(default=300, ge=60, le=3600),
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    supabase = get_supabase_admin_client()
+    settings = get_settings()
+
+    generation_id = _clean_id(generation_id, "generation_id")
+
+    try:
+        result = (
+            supabase.table("generations")
+            .select("id, status, output_path")
+            .eq("id", generation_id)
+            .eq("shop_id", current.shop_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch generation",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Generation not found",
+        )
+
+    row = rows[0]
+    generation_status = str(row.get("status") or "")
+    output_path = row.get("output_path")
+
+    if generation_status != "done" or not output_path:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Generation output is not ready yet",
+        )
+
+    try:
+        signed = (
+            supabase.storage.from_("generated-outputs")
+            .create_signed_url(output_path, expires_in_seconds)
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create signed download URL",
+        ) from exc
+
+    signed_url = None
+    if isinstance(signed, dict):
+        signed_url = (
+            signed.get("signedURL")
+            or signed.get("signedUrl")
+            or signed.get("signed_url")
+            or signed.get("data", {}).get("signedURL")
+        )
+
+    if not signed_url:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Storage signed URL response was empty",
+        )
+
+    if signed_url.startswith("/"):
+        signed_url = f"{settings.SUPABASE_URL}{signed_url}"
+
+    return {
+        "generation_id": row["id"],
+        "download_url": signed_url,
+        "expires_in_seconds": expires_in_seconds,
+    }
+
+
+@router.post("/{generation_id}/match-color")
+def match_color_on_generation_output(
+    generation_id: str,
+    body: GenerationMatchColorRequest,
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    supabase = get_supabase_admin_client()
+
+    generation_id = _clean_id(generation_id, "generation_id")
+    normalized_edits = _normalize_match_color_edits(body)
+
+    try:
+        result = (
+            supabase.table("generations")
+            .select("id, status, output_path")
+            .eq("id", generation_id)
+            .eq("shop_id", current.shop_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch generation",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Generation not found",
+        )
+
+    row = rows[0]
+    generation_status = str(row.get("status") or "")
+    output_path = str(row.get("output_path") or "").strip()
+
+    if generation_status != "done" or not output_path:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Generation output is not ready yet",
+        )
+
+    try:
+        original_bytes = supabase.storage.from_("generated-outputs").download(output_path)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to download generation output from storage",
+        ) from exc
+
+    try:
+        edited_bytes, edited_mime_type = _apply_match_color_full_res(
+            original_bytes,
+            output_path=output_path,
+            edits=normalized_edits,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to apply Match Color: {exc}",
+        ) from exc
+
+    storage_bucket = supabase.storage.from_("generated-outputs")
+    upload_options = {
+        "content-type": edited_mime_type,
+        "upsert": "true",
+    }
+
+    try:
+        storage_bucket.upload(output_path, edited_bytes, upload_options)
+    except Exception:
+        try:
+            # Some supabase-py versions expose update() for overwriting existing objects.
+            storage_bucket.update(output_path, edited_bytes, upload_options)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to overwrite generation output in storage",
+            ) from exc
+
+    return {
+        "generation_id": generation_id,
+        "output_path": output_path,
+        "edited": True,
+        "applied_edits": len(normalized_edits),
+    }
+
+
+@router.delete("/{generation_id}")
+def delete_generation_output(
+    generation_id: str,
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    supabase = get_supabase_admin_client()
+    generation_id = _clean_id(generation_id, "generation_id")
+
+    try:
+        result = (
+            supabase.table("generations")
+            .select("id, status, output_path")
+            .eq("id", generation_id)
+            .eq("shop_id", current.shop_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch generation",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Generation not found",
+        )
+
+    row = rows[0]
+    generation_status = str(row.get("status") or "").strip().lower()
+    output_path = str(row.get("output_path") or "").strip()
+
+    # V1: delete is only for saved outputs.
+    if generation_status != "done" or not output_path:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only completed outputs can be deleted",
+        )
+
+    try:
+        (
+            supabase.table("generations")
+            .delete()
+            .eq("id", generation_id)
+            .eq("shop_id", current.shop_id)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete generation",
+        ) from exc
+
+    storage_warning = None
+    try:
+        supabase.storage.from_("generated-outputs").remove([output_path])
+    except Exception as exc:
+        # Keep delete successful even if storage cleanup fails.
+        storage_warning = f"Generation deleted, but storage cleanup failed: {exc}"
+
+    response = {
+        "deleted": True,
+        "generation_id": generation_id,
+        "output_path": output_path,
+    }
+    if storage_warning:
+        response["warning"] = storage_warning
+
+    return response
+
+
+=== D:\AiVastraBackend 2.3 Codex\images_api.py ===
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
+
+from auth_deps import CurrentShopContext, get_current_shop_context
+from config import get_settings
+from supabase_client import get_supabase_admin_client
+
+router = APIRouter(tags=["Images"])
+
+
+class HeroImageCreateRequest(BaseModel):
+    folder_id: str
+    storage_path: str = Field(..., min_length=1, max_length=500)
+    original_filename: Optional[str] = Field(default=None, max_length=255)
+    mime_type: Optional[str] = Field(default=None, max_length=100)
+    file_size_bytes: Optional[int] = Field(default=None, ge=0)
+    width: Optional[int] = Field(default=None, gt=0)
+    height: Optional[int] = Field(default=None, gt=0)
+
+
+class FabricImageCreateRequest(BaseModel):
+    storage_path: str = Field(..., min_length=1, max_length=500)
+    original_filename: Optional[str] = Field(default=None, max_length=255)
+    mime_type: Optional[str] = Field(default=None, max_length=100)
+    file_size_bytes: Optional[int] = Field(default=None, ge=0)
+    width: Optional[int] = Field(default=None, gt=0)
+    height: Optional[int] = Field(default=None, gt=0)
+
+
+class CatalogImageCreateRequest(BaseModel):
+    folder_id: str
+    storage_path: str = Field(..., min_length=1, max_length=500)
+    original_filename: Optional[str] = Field(default=None, max_length=255)
+    mime_type: Optional[str] = Field(default=None, max_length=100)
+    file_size_bytes: Optional[int] = Field(default=None, ge=0)
+    width: Optional[int] = Field(default=None, gt=0)
+    height: Optional[int] = Field(default=None, gt=0)
+    sort_order: int = Field(default=0, ge=0)
+    is_active: bool = True
+
+
+def _clean_required_text(value: str, field_name: str) -> str:
+    cleaned = value.strip()
+    if not cleaned:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{field_name} cannot be blank",
+        )
+    return cleaned
+
+
+def _clean_optional_text(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    return cleaned if cleaned else None
+
+
+def _base_image_payload_dict(
+    storage_path: str,
+    original_filename: Optional[str],
+    mime_type: Optional[str],
+    file_size_bytes: Optional[int],
+    width: Optional[int],
+    height: Optional[int],
+) -> dict:
+    return {
+        "storage_path": _clean_required_text(storage_path, "storage_path"),
+        "original_filename": _clean_optional_text(original_filename),
+        "mime_type": _clean_optional_text(mime_type),
+        "file_size_bytes": file_size_bytes,
+        "width": width,
+        "height": height,
+    }
+
+
+def _extract_signed_url(signed_payload: object) -> Optional[str]:
+    if isinstance(signed_payload, dict):
+        return (
+            signed_payload.get("signedURL")
+            or signed_payload.get("signedUrl")
+            or signed_payload.get("signed_url")
+            or signed_payload.get("data", {}).get("signedURL")
+        )
+    return None
+
+
+@router.post("/hero-images")
+def create_hero_image_metadata(
+    body: HeroImageCreateRequest,
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    supabase = get_supabase_admin_client()
+
+    folder_id = _clean_required_text(body.folder_id, "folder_id")
+
+    # Validate folder belongs to current shop
+    try:
+        folder_check = (
+            supabase.table("hero_folders")
+            .select("id")
+            .eq("id", folder_id)
+            .eq("shop_id", current.shop_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to validate folder",
+        ) from exc
+
+    folder_rows = getattr(folder_check, "data", None) or []
+    if not folder_rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Folder not found",
+        )
+
+    payload = {
+        "shop_id": current.shop_id,
+        "folder_id": folder_id,
+        **_base_image_payload_dict(
+            storage_path=body.storage_path,
+            original_filename=body.original_filename,
+            mime_type=body.mime_type,
+            file_size_bytes=body.file_size_bytes,
+            width=body.width,
+            height=body.height,
+        ),
+    }
+
+    try:
+        result = supabase.table("hero_images").insert(payload).execute()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create hero image metadata",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        fetch = (
+            supabase.table("hero_images")
+            .select("*")
+            .eq("shop_id", current.shop_id)
+            .eq("folder_id", folder_id)
+            .eq("storage_path", payload["storage_path"])
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(fetch, "data", None) or []
+
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Hero image metadata created but could not fetch response",
+        )
+
+    return rows[0]
+
+
+@router.post("/catalog-images")
+def create_catalog_image_metadata(
+    body: CatalogImageCreateRequest,
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    supabase = get_supabase_admin_client()
+
+    folder_id = _clean_required_text(body.folder_id, "folder_id")
+
+    try:
+        folder_check = (
+            supabase.table("hero_folders")
+            .select("id")
+            .eq("id", folder_id)
+            .eq("shop_id", current.shop_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to validate folder",
+        ) from exc
+
+    folder_rows = getattr(folder_check, "data", None) or []
+    if not folder_rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Folder not found",
+        )
+
+    payload = {
+        "shop_id": current.shop_id,
+        "folder_id": folder_id,
+        "sort_order": body.sort_order,
+        "is_active": bool(body.is_active),
+        **_base_image_payload_dict(
+            storage_path=body.storage_path,
+            original_filename=body.original_filename,
+            mime_type=body.mime_type,
+            file_size_bytes=body.file_size_bytes,
+            width=body.width,
+            height=body.height,
+        ),
+    }
+
+    try:
+        result = supabase.table("catalog_images").insert(payload).execute()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create catalog image metadata",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        fetch = (
+            supabase.table("catalog_images")
+            .select("*")
+            .eq("shop_id", current.shop_id)
+            .eq("folder_id", folder_id)
+            .eq("storage_path", payload["storage_path"])
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(fetch, "data", None) or []
+
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Catalog image metadata created but could not fetch response",
+        )
+
+    return rows[0]
+
+
+@router.get("/hero-images")
+def list_hero_image_metadata(
+    folder_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    supabase = get_supabase_admin_client()
+
+    query = (
+        supabase.table("hero_images")
+        .select("*")
+        .eq("shop_id", current.shop_id)
+        .order("created_at", desc=True)
+    )
+
+    if folder_id:
+        query = query.eq("folder_id", folder_id.strip())
+
+    query = query.range(offset, offset + limit - 1)
+
+    try:
+        result = query.execute()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch hero image metadata",
+        ) from exc
+
+    return getattr(result, "data", None) or []
+
+
+@router.get("/catalog-images")
+def list_catalog_image_metadata(
+    folder_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    supabase = get_supabase_admin_client()
+
+    query = (
+        supabase.table("catalog_images")
+        .select("*")
+        .eq("shop_id", current.shop_id)
+        .eq("is_active", True)
+        .order("sort_order", desc=False)
+        .order("created_at", desc=False)
+    )
+
+    if folder_id:
+        query = query.eq("folder_id", folder_id.strip())
+
+    query = query.range(offset, offset + limit - 1)
+
+    try:
+        result = query.execute()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch catalog image metadata",
+        ) from exc
+
+    return getattr(result, "data", None) or []
+
+
+@router.get("/catalog-images/{catalog_image_id}/download-url")
+def get_catalog_image_download_url(
+    catalog_image_id: str,
+    expires_in_seconds: int = Query(default=300, ge=60, le=3600),
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    supabase = get_supabase_admin_client()
+    settings = get_settings()
+
+    image_id = _clean_required_text(catalog_image_id, "catalog_image_id")
+
+    try:
+        result = (
+            supabase.table("catalog_images")
+            .select("id, storage_path, is_active")
+            .eq("id", image_id)
+            .eq("shop_id", current.shop_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch catalog image",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Catalog image not found",
+        )
+
+    row = rows[0]
+    storage_path = str(row.get("storage_path") or "").strip()
+    if not storage_path:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Catalog image storage path is missing",
+        )
+
+    if row.get("is_active") is False:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Catalog image is inactive",
+        )
+
+    try:
+        signed = (
+            supabase.storage.from_("catalog-images")
+            .create_signed_url(storage_path, expires_in_seconds)
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create signed download URL",
+        ) from exc
+
+    signed_url = _extract_signed_url(signed)
+    if not signed_url:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Storage signed URL response was empty",
+        )
+
+    if signed_url.startswith("/"):
+        signed_url = f"{settings.SUPABASE_URL}{signed_url}"
+
+    return {
+        "catalog_image_id": row["id"],
+        "download_url": signed_url,
+        "expires_in_seconds": expires_in_seconds,
+    }
+
+
+@router.post("/fabric-images")
+def create_fabric_image_metadata(
+    body: FabricImageCreateRequest,
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    supabase = get_supabase_admin_client()
+
+    payload = {
+        "shop_id": current.shop_id,
+        **_base_image_payload_dict(
+            storage_path=body.storage_path,
+            original_filename=body.original_filename,
+            mime_type=body.mime_type,
+            file_size_bytes=body.file_size_bytes,
+            width=body.width,
+            height=body.height,
+        ),
+    }
+
+    try:
+        result = supabase.table("fabric_images").insert(payload).execute()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create fabric image metadata",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        fetch = (
+            supabase.table("fabric_images")
+            .select("*")
+            .eq("shop_id", current.shop_id)
+            .eq("storage_path", payload["storage_path"])
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(fetch, "data", None) or []
+
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Fabric image metadata created but could not fetch response",
+        )
+
+    return rows[0]
+
+
+@router.get("/fabric-images")
+def list_fabric_image_metadata(
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    supabase = get_supabase_admin_client()
+
+    query = (
+        supabase.table("fabric_images")
+        .select("*")
+        .eq("shop_id", current.shop_id)
+        .order("created_at", desc=True)
+        .range(offset, offset + limit - 1)
+    )
+
+    try:
+        result = query.execute()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch fabric image metadata",
+        ) from exc
+
+    return getattr(result, "data", None) or []
+
+=== D:\AiVastraBackend 2.3 Codex\main.py ===
+from fastapi import Depends, FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from admin_api import router as admin_router
+from auth_deps import CurrentShopContext, get_current_shop_context
+from config import get_settings
+from folders_api import router as folders_router
+from garment_types_api import router as garment_types_router
+from generations_api import router as generations_router
+from images_api import router as images_router
+
+app = FastAPI(title="Ai Vastra Backend")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://192.168.1.9:5173",
+        "http://192.168.1.7:5173",
+        "https://ai-vastra-reactjs-demo-2-2-codex.onrender.com",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+app.include_router(folders_router)
+app.include_router(garment_types_router)
+app.include_router(images_router)
+app.include_router(generations_router)
+app.include_router(admin_router)
+
+
+@app.get("/health")
+def health():
+    settings = get_settings()
+
+    return {
+        "status": "ok",
+        "app_env": settings.APP_ENV,
+        "credits_per_generation": settings.CREDITS_PER_GENERATION,
+        "supabase_configured": bool(
+            settings.SUPABASE_URL and settings.SUPABASE_SERVICE_ROLE_KEY
+        ),
+        "gemini_api_configured": bool(settings.GEMINI_API_KEY),
+        "gemini_image_model_id": settings.GEMINI_IMAGE_MODEL_ID,
+    }
+
+
+@app.get("/me")
+def me(current: CurrentShopContext = Depends(get_current_shop_context)):
+    return {
+        "auth_user_id": current.auth_user_id,
+        "email": current.email,
+        "shop_id": current.shop_id,
+        "role": current.role,
+    }
+
+=== D:\AiVastraBackend 2.3 Codex\prompting.py ===
+def _clean_text(value: str | None) -> str:
+    if value is None:
+        return ""
+    return value.strip()
+
+
+FABRIC_SCALE_HINTS = {
+    "fine": (
+        "Fabric scale reference: The pattern in the tiled fabric "
+        "image is shown at the density it should appear on the "
+        "finished garment. Match this pattern density precisely â€” "
+        "checks approximately 4-6mm wide, roughly 15-20 horizontal "
+        "repetitions visible across the jacket front."
+    ),
+    "medium": (
+        "Fabric scale reference: The pattern in the tiled fabric "
+        "image is shown at the density it should appear on the "
+        "finished garment. Match this pattern density precisely â€” "
+        "checks approximately 10-15mm wide, roughly 8-10 horizontal "
+        "repetitions visible across the jacket front."
+    ),
+    "bold": (
+        "Fabric scale reference: The pattern in the tiled fabric "
+        "image is shown at the density it should appear on the "
+        "finished garment. Match this pattern density precisely â€” "
+        "checks approximately 25-35mm wide, roughly 4-5 horizontal "
+        "repetitions visible across the jacket front."
+    ),
+}
+
+
+def _format_apply_to_label(value: str) -> str:
+    mapping = {
+        "shirt": "SHIRT",
+        "pant": "PANT",
+        "suit_full_body": "SUIT FULL BODY",
+        "suit_upper": "SUIT UPPER",
+        "koti": "KOTI",
+    }
+    return mapping.get(value, value.upper())
+
+
+def _build_task_intro(
+    fabric_assignments: list[dict[str, str]],
+    folder_name: str | None = None,
+    fabric_scale: str | None = None,
+) -> str:
+    folder_str = f" {folder_name.strip()}" if folder_name and folder_name.strip() else ""
+
+    if len(fabric_assignments) <= 1:
+        target = _format_apply_to_label(
+            fabric_assignments[0].get("apply_to")
+            if fabric_assignments
+            else "suit_full_body"
+        )
+        scale_line = (
+            f"\n{FABRIC_SCALE_HINTS[fabric_scale]}"
+            if fabric_scale and fabric_scale in FABRIC_SCALE_HINTS
+            else ""
+        )
+        return f"""Image 1: hero photograph â€” use for pose, identity, scene, \
+lighting, and garment cut.
+Image 2: fabric material reference â€” use for color, weave, \
+sheen, and texture quality.{scale_line}
+
+Generate a new photograph of the same person, in the same pose \
+and scene, wearing a{folder_str} {target} garment tailored from \
+the cloth shown in the fabric image.""".strip()
+
+    mapping_lines = [
+        f"- Fabric image {idx} -> "
+        f"{_format_apply_to_label(a.get('apply_to', 'unknown'))}"
+        for idx, a in enumerate(fabric_assignments, start=1)
+    ]
+    scale_line = (
+        f"\n{FABRIC_SCALE_HINTS[fabric_scale]}"
+        if fabric_scale and fabric_scale in FABRIC_SCALE_HINTS
+        else ""
+    )
+    return f"""Image 1: hero photograph â€” use for pose, identity, scene, \
+lighting, and garment cut.
+Images 2..N: fabric material references â€” each assigned to a \
+garment target below.{scale_line}
+
+Generate a new photograph of the same person, in the same pose \
+and scene, wearing garments tailored from their assigned cloth.
+Fabric-to-garment mapping:
+{chr(10).join(mapping_lines)}""".strip()
+
+
+BASE_GARMENT_FABRIC_PROMPT = """
+The cloth from the fabric image has been cut and sewn into \
+the garment by a skilled tailor. Reconstruct how this cloth \
+would look as a finished, worn garment:
+
+- Study the fabric's color, weave structure, pattern repeat, \
+sheen, and texture depth from the reference image.
+- Reproduce how this material drapes, folds, and catches \
+studio light when worn â€” including natural creasing at the \
+elbows, chest, and waist.
+- Pattern lines follow the garment's seams and contours; \
+they are not flat or perfectly grid-aligned across the \
+whole surface.
+- Garment silhouette, cut, lapels, buttons, collar, \
+and construction details remain exactly as in the hero image.
+- Person, face, body, pose, expression, camera angle, \
+framing, background, and scene remain exactly as in \
+the hero image.
+
+Output: one photorealistic studio fashion photograph.
+""".strip()
+
+
+def build_generation_prompt(
+    folder_name: str | None,
+    folder_prompt_template: str | None,
+    fabric_assignments: list[dict[str, str]] | None = None,
+    fabric_scale: str | None = None,
+) -> str:
+    folder_name_clean = _clean_text(folder_name)
+    folder_prompt_clean = _clean_text(folder_prompt_template)
+
+    normalized_assignments: list[dict[str, str]] = []
+    for item in fabric_assignments or []:
+        apply_to = _clean_text(item.get("apply_to"))
+        if not apply_to:
+            continue
+        normalized_assignments.append({"apply_to": apply_to})
+
+    if not normalized_assignments:
+        normalized_assignments = [{"apply_to": "suit_full_body"}]
+
+    parts = [
+        _build_task_intro(
+            normalized_assignments,
+            folder_name=folder_name_clean,
+            fabric_scale=fabric_scale,
+        ),
+        BASE_GARMENT_FABRIC_PROMPT,
+    ]
+
+    if folder_prompt_clean:
+        parts.append("Category-specific instructions:")
+        parts.append(folder_prompt_clean)
+
+    return "\n\n".join(parts).strip()
+
+=== D:\AiVastraBackend 2.3 Codex\supabase_client.py ===
+from functools import lru_cache
+
+from supabase import create_client
+
+from config import get_settings
+
+
+@lru_cache
+def get_supabase_admin_client():
+    settings = get_settings()
+    return create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
+
+=== D:\AiVastraBackend 2.3 Codex\worker.py ===
+import base64
+import time
+import traceback
+from datetime import datetime, timezone
+from typing import Any, Optional, Tuple
+
+from google import genai
+from google.genai import types
+
+from config import get_settings
+from supabase_client import get_supabase_admin_client
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def short_error_message(exc: Exception, limit: int = 1500) -> str:
+    message = str(exc).strip() or exc.__class__.__name__
+    return message[:limit]
+
+
+def guess_output_extension(mime_type: str) -> str:
+    mime = (mime_type or "").lower()
+    if "png" in mime:
+        return "png"
+    if "jpeg" in mime or "jpg" in mime:
+        return "jpg"
+    if "webp" in mime:
+        return "webp"
+    return "png"
+
+
+def claim_next_job(supabase) -> Optional[dict]:
+    result = supabase.rpc("claim_next_generation_job", {}).execute()
+    rows = getattr(result, "data", None) or []
+    return rows[0] if rows else None
+
+
+def fetch_generation_assets(supabase, job: dict) -> dict:
+    generation_id = str(job["id"])
+    shop_id = str(job["shop_id"])
+    hero_image_id = str(job["hero_image_id"])
+    legacy_fabric_image_id = str(job["fabric_image_id"]) if job.get("fabric_image_id") else ""
+
+    gen_result = (
+        supabase.table("generations")
+        .select("id, shop_id, hero_image_id, fabric_image_id, prompt_used")
+        .eq("id", generation_id)
+        .eq("shop_id", shop_id)
+        .limit(1)
+        .execute()
+    )
+    gen_rows = getattr(gen_result, "data", None) or []
+    if not gen_rows:
+        raise RuntimeError("Generation row not found after claim")
+    generation = gen_rows[0]
+
+    hero_result = (
+        supabase.table("hero_images")
+        .select("id, shop_id, folder_id, storage_path, mime_type")
+        .eq("id", hero_image_id)
+        .eq("shop_id", shop_id)
+        .limit(1)
+        .execute()
+    )
+    hero_rows = getattr(hero_result, "data", None) or []
+    if not hero_rows:
+        raise RuntimeError("Hero image metadata missing")
+    hero = hero_rows[0]
+
+    mapping_result = (
+        supabase.table("generation_fabrics")
+        .select("fabric_image_id, apply_to, sort_order")
+        .eq("generation_id", generation_id)
+        .eq("shop_id", shop_id)
+        .order("sort_order", desc=False)
+        .execute()
+    )
+    mapping_rows = getattr(mapping_result, "data", None) or []
+
+    mapped_fabrics: list[dict] = []
+
+    if mapping_rows:
+        for row in mapping_rows:
+            fabric_image_id = str(row.get("fabric_image_id") or "").strip()
+            if not fabric_image_id:
+                raise RuntimeError("generation_fabrics row missing fabric_image_id")
+
+            fabric_result = (
+                supabase.table("fabric_images")
+                .select("id, shop_id, storage_path, mime_type")
+                .eq("id", fabric_image_id)
+                .eq("shop_id", shop_id)
+                .limit(1)
+                .execute()
+            )
+            fabric_rows = getattr(fabric_result, "data", None) or []
+            if not fabric_rows:
+                raise RuntimeError(
+                    f"Fabric image metadata missing for fabric_image_id={fabric_image_id}"
+                )
+
+            fabric = fabric_rows[0]
+            mapped_fabrics.append(
+                {
+                    "id": str(fabric["id"]),
+                    "storage_path": str(fabric["storage_path"]),
+                    "mime_type": str(fabric.get("mime_type") or "image/jpeg"),
+                    "apply_to": str(row.get("apply_to") or ""),
+                    "sort_order": int(row.get("sort_order") or 0),
+                }
+            )
+    else:
+        # Backward-compatible fallback for legacy single-fabric generations.
+        if not legacy_fabric_image_id:
+            raise RuntimeError("Fabric image metadata missing")
+
+        fabric_result = (
+            supabase.table("fabric_images")
+            .select("id, shop_id, storage_path, mime_type")
+            .eq("id", legacy_fabric_image_id)
+            .eq("shop_id", shop_id)
+            .limit(1)
+            .execute()
+        )
+        fabric_rows = getattr(fabric_result, "data", None) or []
+        if not fabric_rows:
+            raise RuntimeError("Fabric image metadata missing")
+
+        fabric = fabric_rows[0]
+        mapped_fabrics.append(
+            {
+                "id": str(fabric["id"]),
+                "storage_path": str(fabric["storage_path"]),
+                "mime_type": str(fabric.get("mime_type") or "image/jpeg"),
+                "apply_to": "suit_full_body",
+                "sort_order": 1,
+            }
+        )
+
+    prompt_used = generation.get("prompt_used")
+    if not prompt_used:
+        raise RuntimeError("prompt_used is empty; create generation again after Step 21")
+
+    return {
+        "generation": generation,
+        "hero": hero,
+        "fabrics": mapped_fabrics,
+        "prompt_used": str(prompt_used),
+    }
+
+
+def download_storage_bytes(supabase, bucket: str, path: str) -> bytes:
+    if not path or not path.strip():
+        raise RuntimeError(f"Invalid storage path for bucket={bucket}")
+    return supabase.storage.from_(bucket).download(path.strip())
+
+
+def _iter_response_parts(response: Any):
+    parts = getattr(response, "parts", None)
+    if parts:
+        for part in parts:
+            yield part
+
+    candidates = getattr(response, "candidates", None) or []
+    for candidate in candidates:
+        content = getattr(candidate, "content", None)
+        candidate_parts = getattr(content, "parts", None) or []
+        for part in candidate_parts:
+            yield part
+
+
+def extract_first_image_from_gemini_response(response: Any) -> Tuple[bytes, str]:
+    for part in _iter_response_parts(response):
+        inline_data = getattr(part, "inline_data", None)
+        if not inline_data:
+            continue
+
+        data = getattr(inline_data, "data", None)
+        mime_type = getattr(inline_data, "mime_type", None) or "image/png"
+
+        if not data:
+            continue
+
+        if isinstance(data, bytes):
+            return data, mime_type
+
+        if isinstance(data, str):
+            # Defensive: SDKs sometimes return base64 text
+            return base64.b64decode(data), mime_type
+
+    raise RuntimeError("No image output found in Gemini response")
+
+
+def call_gemini_image_generation(
+    client: genai.Client,
+    model_id: str,
+    prompt: str,
+    hero_image_bytes: bytes,
+    hero_mime_type: str,
+    fabric_inputs: list[dict[str, Any]],
+) -> Tuple[bytes, str, Optional[str]]:
+    contents: list[Any] = [
+        prompt,
+        types.Part.from_bytes(
+            data=hero_image_bytes,
+            mime_type=hero_mime_type or "image/jpeg",
+        ),
+    ]
+
+    for fabric_input in fabric_inputs:
+        contents.append(
+            types.Part.from_bytes(
+                data=fabric_input["bytes"],
+                mime_type=str(fabric_input.get("mime_type") or "image/jpeg"),
+            )
+        )
+
+    response = client.models.generate_content(
+        model=model_id,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            response_modalities=["IMAGE"],
+            image_config=types.ImageConfig(
+            aspect_ratio="3:4",
+            image_size="2K",
+            ),
+        ),
+    )
+
+    image_bytes, output_mime_type = extract_first_image_from_gemini_response(response)
+
+    # Keep existing DB column name `nano_request_id` for now (schema already created).
+    external_request_id = (
+        getattr(response, "response_id", None)
+        or getattr(response, "id", None)
+        or None
+    )
+
+    return image_bytes, output_mime_type, external_request_id
+
+
+def mark_generation_done(
+    supabase,
+    *,
+    generation_id: str,
+    shop_id: str,
+    output_path: str,
+    external_request_id: Optional[str],
+) -> None:
+    payload = {
+        "status": "done",
+        "output_path": output_path,
+        "completed_at": utc_now_iso(),
+        "error": None,
+    }
+    if external_request_id:
+        payload["nano_request_id"] = external_request_id
+
+    (
+        supabase.table("generations")
+        .update(payload)
+        .eq("id", generation_id)
+        .eq("shop_id", shop_id)
+        .eq("status", "processing")
+        .execute()
+    )
+
+
+# def mark_generation_failed(
+#     supabase,
+#     *,
+#     generation_id: str,
+#     shop_id: str,
+#     error_message: str,
+# ) -> None:
+#     (
+#         supabase.table("generations")
+#         .update(
+#             {
+#                 "status": "failed",
+#                 "error": error_message,
+#                 "completed_at": utc_now_iso(),
+#             }
+#         )
+#         .eq("id", generation_id)
+#         .eq("shop_id", shop_id)
+#         .eq("status", "processing")
+#         .execute()
+#     )
+
+def mark_generation_failed_with_refund(
+    supabase,
+    *,
+    generation_id: str,
+    shop_id: str,
+    error_message: str,
+) -> dict:
+    result = (
+        supabase.rpc(
+            "mark_generation_failed_with_refund",
+            {
+                "p_generation_id": generation_id,
+                "p_shop_id": shop_id,
+                "p_error": error_message,
+            },
+        )
+        .execute()
+    )
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise RuntimeError("Failed to mark generation as failed with refund")
+
+    return rows[0]
+
+
+
+def process_one_job(supabase, gemini_client: genai.Client, settings) -> bool:
+    job = claim_next_job(supabase)
+    if not job:
+        return False
+
+    generation_id = str(job["id"])
+    shop_id = str(job["shop_id"])
+    print(f"[worker] claimed generation={generation_id} shop={shop_id}")
+
+    try:
+        assets = fetch_generation_assets(supabase, job)
+
+        hero = assets["hero"]
+        fabrics = assets["fabrics"]
+        prompt_used = assets["prompt_used"]
+
+        hero_path = str(hero["storage_path"])
+        hero_mime = str(hero.get("mime_type") or "image/jpeg")
+
+        print(f"[worker] downloading hero image: {hero_path}")
+        hero_bytes = download_storage_bytes(supabase, "hero-images", hero_path)
+
+        fabric_inputs: list[dict[str, Any]] = []
+        for idx, fabric in enumerate(fabrics, start=1):
+            fabric_path = str(fabric["storage_path"])
+            fabric_mime = str(fabric.get("mime_type") or "image/jpeg")
+            apply_to = str(fabric.get("apply_to") or "unknown")
+
+            print(
+                "[worker] downloading fabric image "
+                f"{idx}/{len(fabrics)} apply_to={apply_to}: {fabric_path}"
+            )
+            fabric_bytes = download_storage_bytes(supabase, "fabric-images", fabric_path)
+            fabric_inputs.append(
+                {
+                    "bytes": fabric_bytes,
+                    "mime_type": fabric_mime,
+                    "apply_to": apply_to,
+                }
+            )
+
+        print(f"[worker] calling Gemini model: {settings.GEMINI_IMAGE_MODEL_ID}")
+        output_bytes, output_mime, external_request_id = call_gemini_image_generation(
+            gemini_client,
+            settings.GEMINI_IMAGE_MODEL_ID,
+            prompt_used,
+            hero_bytes,
+            hero_mime,
+            fabric_inputs,
+        )
+
+        ext = guess_output_extension(output_mime)
+        output_path = f"{shop_id}/{generation_id}/output.{ext}"
+
+        print(f"[worker] uploading generated output: {output_path}")
+        supabase.storage.from_("generated-outputs").upload(
+            output_path,
+            output_bytes,
+            {
+                "content-type": output_mime,
+                "upsert": "false",
+            },
+        )
+
+        mark_generation_done(
+            supabase,
+            generation_id=generation_id,
+            shop_id=shop_id,
+            output_path=output_path,
+            external_request_id=external_request_id,
+        )
+
+        print(f"[worker] generation done: {generation_id}")
+        return True
+
+    except Exception as exc:
+        error_message = short_error_message(exc)
+        print(f"[worker] generation failed: {generation_id} :: {error_message}")
+        traceback.print_exc()
+
+        # try:
+        #     mark_generation_failed(
+        #         supabase,
+        #         generation_id=generation_id,
+        #         shop_id=shop_id,
+        #         error_message=error_message,
+        #     )
+        try:
+            refund_info = mark_generation_failed_with_refund(
+                supabase,
+                generation_id=generation_id,
+                shop_id=shop_id,
+                error_message=error_message,
+            )
+            print(
+                "[worker] marked failed "
+                f"generation={generation_id} refunded={refund_info.get('refunded')} "
+                f"refund_amount={refund_info.get('refund_amount')} "
+                f"balance_after={refund_info.get('balance_after')}"
+            )
+
+        except Exception as mark_exc:
+            print(f"[worker] failed to mark generation as failed: {mark_exc}")
+            traceback.print_exc()
+
+        return True  # A job was claimed/handled, even if failed.
+
+
+def main() -> None:
+    settings = get_settings()
+    supabase = get_supabase_admin_client()
+
+    if not settings.GEMINI_API_KEY or settings.GEMINI_API_KEY == "PENDING_NANO_KEY":
+        raise RuntimeError("Set a real GEMINI_API_KEY in backend/.env before running worker")
+
+    gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+
+    print("[worker] started")
+    print(f"[worker] poll interval: {settings.WORKER_POLL_INTERVAL_SECONDS}s")
+    print(f"[worker] model: {settings.GEMINI_IMAGE_MODEL_ID}")
+
+    while True:
+        try:
+            handled = process_one_job(supabase, gemini_client, settings)
+            if not handled:
+                time.sleep(settings.WORKER_POLL_INTERVAL_SECONDS)
+        except Exception as exc:
+            print(f"[worker] loop error: {short_error_message(exc)}")
+            traceback.print_exc()
+            # Prevent transient network/service errors from crashing the worker process.
+            time.sleep(max(5, settings.WORKER_POLL_INTERVAL_SECONDS))
+
+
+if __name__ == "__main__":
+    main()
+

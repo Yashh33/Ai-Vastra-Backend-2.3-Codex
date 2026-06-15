@@ -8,6 +8,7 @@ from folders_api import router as folders_router
 from garment_types_api import router as garment_types_router
 from generations_api import router as generations_router
 from images_api import router as images_router
+from tryon_api import router as tryon_router
 
 app = FastAPI(title="Ai Vastra Backend")
 
@@ -32,6 +33,7 @@ app.include_router(folders_router)
 app.include_router(garment_types_router)
 app.include_router(images_router)
 app.include_router(generations_router)
+app.include_router(tryon_router)
 app.include_router(admin_router)
 
 
