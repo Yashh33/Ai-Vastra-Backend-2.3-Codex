@@ -23,6 +23,10 @@ class TryOnRequest(BaseModel):
         default="image/jpeg",
         min_length=1
     )
+    consent_confirmed: bool = Field(
+        default=False,
+        description="Must be true — confirms tailor obtained customer consent before photo was taken"
+    )
 
 
 class TryOnQuickRequest(BaseModel):
@@ -32,6 +36,10 @@ class TryOnQuickRequest(BaseModel):
     customer_photo_mime: str = Field(
         default="image/jpeg",
         min_length=1
+    )
+    consent_confirmed: bool = Field(
+        default=False,
+        description="Must be true — confirms tailor obtained customer consent before photo was taken"
     )
 
 
@@ -112,6 +120,20 @@ def tryon(
     """
     supabase = get_supabase_admin_client()
 
+    if not body.consent_confirmed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Customer consent must be confirmed before processing a try-on request",
+        )
+    try:
+        supabase.table("customer_consent_logs").insert({
+            "shop_id": current.shop_id,
+            "purpose": "virtual_tryon",
+            "confirmed_by_staff": True,
+        }).execute()
+    except Exception:
+        pass
+
     # Fetch the generation and verify it belongs to this shop
     gen_result = (
         supabase.table("generations")
@@ -185,6 +207,21 @@ def tryon_quick(
     Returns composite image as base64. Nothing is stored.
     """
     supabase = get_supabase_admin_client()
+
+    if not body.consent_confirmed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Customer consent must be confirmed before processing a try-on request",
+        )
+    try:
+        supabase.table("customer_consent_logs").insert({
+            "shop_id": current.shop_id,
+            "purpose": "virtual_tryon",
+            "confirmed_by_staff": True,
+        }).execute()
+    except Exception:
+        pass
+
     shop_id = current.shop_id
 
     # Fetch folder -> default hero image
