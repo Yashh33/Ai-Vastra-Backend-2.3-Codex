@@ -168,8 +168,10 @@ The person's face, body proportions, and skin tone from \
 Image 1 must be preserved exactly.
 
 The result must look like a natural photograph of the \
-customer wearing a garment tailored specifically for them — \
-not a composite or digital edit.
+customer wearing a garment tailored specifically for them.
+
+Do not change or replace the background — use the exact background from Image 1 (the customer photograph).
+Do not beautify, retouch, or alter the person's appearance — keep their face, skin tone, features, and expression exactly as they appear in Image 1.
 
 Output: one photorealistic photograph.""".strip()
 
@@ -198,5 +200,8 @@ from Image 3.
 
 The result must look like a natural photograph of the \
 customer wearing a garment tailored specifically for them.
+
+Do not change or replace the background — use the exact background from Image 1 (the customer photograph).
+Do not beautify, retouch, or alter the person's appearance — keep their face, skin tone, features, and expression exactly as they appear in Image 1.
 
 Output: one photorealistic photograph.""".strip()
