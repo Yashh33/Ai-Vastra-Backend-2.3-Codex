@@ -1,4 +1,5 @@
 import base64
+import io
 import time
 import traceback
 from datetime import datetime, timezone
@@ -8,7 +9,11 @@ from google import genai
 from google.genai import types
 
 from config import get_settings
+from generations_api import derive_thumb_path
 from supabase_client import get_supabase_admin_client
+
+_MAX_INPUT_IMAGE_DIMENSION = 1536
+_THUMB_MAX_WIDTH = 400
 
 
 def utc_now_iso() -> str:
@@ -29,6 +34,50 @@ def guess_output_extension(mime_type: str) -> str:
     if "webp" in mime:
         return "webp"
     return "png"
+
+
+def build_thumbnail_jpeg_bytes(image_bytes: bytes) -> bytes:
+    from PIL import Image
+
+    image = Image.open(io.BytesIO(image_bytes))
+    image.load()
+    rgb_image = image.convert("RGB")
+
+    if rgb_image.width > _THUMB_MAX_WIDTH:
+        new_height = max(1, round(rgb_image.height * (_THUMB_MAX_WIDTH / rgb_image.width)))
+        rgb_image = rgb_image.resize((_THUMB_MAX_WIDTH, new_height), Image.Resampling.LANCZOS)
+
+    buf = io.BytesIO()
+    rgb_image.save(buf, format="JPEG", quality=70)
+    return buf.getvalue()
+
+
+def downscale_image_if_needed(image_bytes: bytes, mime_type: str) -> Tuple[bytes, str]:
+    try:
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(image_bytes))
+        image.load()
+        width, height = image.size
+
+        if max(width, height) <= _MAX_INPUT_IMAGE_DIMENSION:
+            return image_bytes, mime_type
+
+        if width >= height:
+            new_width = _MAX_INPUT_IMAGE_DIMENSION
+            new_height = max(1, round(height * (_MAX_INPUT_IMAGE_DIMENSION / width)))
+        else:
+            new_height = _MAX_INPUT_IMAGE_DIMENSION
+            new_width = max(1, round(width * (_MAX_INPUT_IMAGE_DIMENSION / height)))
+
+        resized = image.convert("RGB").resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+        buf = io.BytesIO()
+        resized.save(buf, format="JPEG", quality=90)
+        return buf.getvalue(), "image/jpeg"
+    except Exception as exc:
+        print(f"[worker] WARNING: image downscale failed, using original bytes: {exc}")
+        return image_bytes, mime_type
 
 
 def claim_next_job(supabase) -> Optional[dict]:
@@ -82,26 +131,30 @@ def fetch_generation_assets(supabase, job: dict) -> dict:
     mapped_fabrics: list[dict] = []
 
     if mapping_rows:
+        fabric_image_ids = [
+            str(row.get("fabric_image_id") or "").strip() for row in mapping_rows
+        ]
+        if any(not fabric_image_id for fabric_image_id in fabric_image_ids):
+            raise RuntimeError("generation_fabrics row missing fabric_image_id")
+
+        fabrics_result = (
+            supabase.table("fabric_images")
+            .select("id, shop_id, storage_path, mime_type")
+            .in_("id", fabric_image_ids)
+            .eq("shop_id", shop_id)
+            .execute()
+        )
+        fabric_rows = getattr(fabrics_result, "data", None) or []
+        fabrics_by_id = {str(row["id"]): row for row in fabric_rows}
+
         for row in mapping_rows:
             fabric_image_id = str(row.get("fabric_image_id") or "").strip()
-            if not fabric_image_id:
-                raise RuntimeError("generation_fabrics row missing fabric_image_id")
-
-            fabric_result = (
-                supabase.table("fabric_images")
-                .select("id, shop_id, storage_path, mime_type")
-                .eq("id", fabric_image_id)
-                .eq("shop_id", shop_id)
-                .limit(1)
-                .execute()
-            )
-            fabric_rows = getattr(fabric_result, "data", None) or []
-            if not fabric_rows:
+            fabric = fabrics_by_id.get(fabric_image_id)
+            if not fabric:
                 raise RuntimeError(
                     f"Fabric image metadata missing for fabric_image_id={fabric_image_id}"
                 )
 
-            fabric = fabric_rows[0]
             mapped_fabrics.append(
                 {
                     "id": str(fabric["id"]),
@@ -338,6 +391,7 @@ def process_one_job(supabase, gemini_client: genai.Client, settings) -> bool:
 
         print(f"[worker] downloading hero image: {hero_path}")
         hero_bytes = download_storage_bytes(supabase, "hero-images", hero_path)
+        hero_bytes, hero_mime = downscale_image_if_needed(hero_bytes, hero_mime)
 
         fabric_inputs: list[dict[str, Any]] = []
         for idx, fabric in enumerate(fabrics, start=1):
@@ -350,6 +404,7 @@ def process_one_job(supabase, gemini_client: genai.Client, settings) -> bool:
                 f"{idx}/{len(fabrics)} apply_to={apply_to}: {fabric_path}"
             )
             fabric_bytes = download_storage_bytes(supabase, "fabric-images", fabric_path)
+            fabric_bytes, fabric_mime = downscale_image_if_needed(fabric_bytes, fabric_mime)
             fabric_inputs.append(
                 {
                     "bytes": fabric_bytes,
@@ -369,7 +424,7 @@ def process_one_job(supabase, gemini_client: genai.Client, settings) -> bool:
         )
 
         ext = guess_output_extension(output_mime)
-        output_path = f"{shop_id}/{generation_id}/output.{ext}"
+        output_path = f"{shop_id}/{generation_id}/output_v{int(time.time())}.{ext}"
 
         print(f"[worker] uploading generated output: {output_path}")
         supabase.storage.from_("generated-outputs").upload(
@@ -377,9 +432,24 @@ def process_one_job(supabase, gemini_client: genai.Client, settings) -> bool:
             output_bytes,
             {
                 "content-type": output_mime,
-                "upsert": "false",
+                "upsert": "true",
             },
         )
+
+        thumb_path = derive_thumb_path(output_path)
+        try:
+            thumb_bytes = build_thumbnail_jpeg_bytes(output_bytes)
+            supabase.storage.from_("generated-outputs").upload(
+                thumb_path,
+                thumb_bytes,
+                {
+                    "content-type": "image/jpeg",
+                    "upsert": "true",
+                },
+            )
+            print(f"[worker] uploaded thumbnail: {thumb_path}")
+        except Exception as exc:
+            print(f"[worker] WARNING: failed to generate/upload thumbnail for {output_path}: {exc}")
 
         mark_generation_done(
             supabase,

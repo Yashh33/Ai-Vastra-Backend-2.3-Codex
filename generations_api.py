@@ -1,4 +1,5 @@
 import io
+import time
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -13,6 +14,136 @@ router = APIRouter(prefix="/generations", tags=["Generations"])
 
 _ALLOWED_STATUSES = {"queued", "processing", "done", "failed"}
 _ALLOWED_APPLY_TO = {"shirt", "pant", "suit_full_body", "suit_upper", "koti"}
+
+
+def derive_thumb_path(output_path: str) -> str:
+    """Derive the thumbnail storage path for an output path.
+
+    "shop/gen/output.png" -> "shop/gen/thumb.jpg"
+    "shop/gen/output_v1720000000.webp" -> "shop/gen/thumb_v1720000000.jpg"
+    """
+    path = output_path or ""
+    if "/" in path:
+        directory, filename = path.rsplit("/", 1)
+    else:
+        directory, filename = "", path
+
+    name = filename.rsplit(".", 1)[0] if "." in filename else filename
+
+    if name.startswith("output"):
+        name = "thumb" + name[len("output"):]
+    else:
+        name = f"thumb_{name}"
+
+    thumb_filename = f"{name}.jpg"
+    return f"{directory}/{thumb_filename}" if directory else thumb_filename
+
+
+# Inline sanity checks for derive_thumb_path (see VERIFY step in task):
+assert derive_thumb_path("shop/gen/output.png") == "shop/gen/thumb.jpg"
+assert derive_thumb_path("shop/gen/output_v123.webp") == "shop/gen/thumb_v123.jpg"
+assert derive_thumb_path("output.png") == "thumb.jpg"
+
+
+def _guess_extension_from_mime(mime_type: str) -> str:
+    mime = (mime_type or "").lower()
+    if "png" in mime:
+        return "png"
+    if "jpeg" in mime or "jpg" in mime:
+        return "jpg"
+    if "webp" in mime:
+        return "webp"
+    return "png"
+
+
+def _extract_signed_url(payload: object) -> Optional[str]:
+    if isinstance(payload, dict):
+        nested = payload.get("data")
+        nested = nested if isinstance(nested, dict) else {}
+        return (
+            payload.get("signedURL")
+            or payload.get("signedUrl")
+            or payload.get("signed_url")
+            or nested.get("signedURL")
+            or nested.get("signedUrl")
+            or nested.get("signed_url")
+        )
+    return None
+
+
+def _build_signed_url_map(signed_items: object, settings) -> dict[str, str]:
+    result: dict[str, str] = {}
+    if not isinstance(signed_items, list):
+        return result
+
+    for item in signed_items:
+        if not isinstance(item, dict) or item.get("error"):
+            continue
+
+        path = item.get("path") or item.get("Path")
+        signed_url = _extract_signed_url(item)
+        if not path or not signed_url:
+            continue
+
+        if signed_url.startswith("/"):
+            signed_url = f"{settings.SUPABASE_URL}{signed_url}"
+
+        result[path] = signed_url
+
+    return result
+
+
+def _attach_download_and_thumb_urls(
+    supabase, rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    if not rows:
+        return rows
+
+    paths_needed: list[str] = []
+    for row in rows:
+        row_status = str(row.get("status") or "")
+        output_path = str(row.get("output_path") or "").strip()
+        if row_status == "done" and output_path:
+            paths_needed.append(output_path)
+            paths_needed.append(derive_thumb_path(output_path))
+
+    if not paths_needed:
+        for row in rows:
+            row["download_url"] = None
+            row["thumb_url"] = None
+        return rows
+
+    settings = get_settings()
+    unique_paths = sorted(set(paths_needed))
+
+    try:
+        signed_items = (
+            supabase.storage.from_("generated-outputs")
+            .create_signed_urls(unique_paths, 3600)
+        )
+    except Exception as exc:
+        print(f"WARNING: batch signed URL generation failed: {exc}")
+        return rows
+
+    url_by_path = _build_signed_url_map(signed_items, settings)
+
+    for row in rows:
+        row_status = str(row.get("status") or "")
+        output_path = str(row.get("output_path") or "").strip()
+        if row_status == "done" and output_path:
+            download_url = url_by_path.get(output_path)
+            thumb_url = url_by_path.get(derive_thumb_path(output_path)) or download_url
+            row["download_url"] = download_url
+            row["thumb_url"] = thumb_url
+        else:
+            row["download_url"] = None
+            row["thumb_url"] = None
+
+    return rows
+
+
+class GenerationDownloadUrlsRequest(BaseModel):
+    generation_ids: list[str] = Field(default_factory=list)
 
 
 class GenerationCreateFabricItem(BaseModel):
@@ -854,6 +985,7 @@ def list_generations(
     fabric_color: Optional[str] = Query(default=None),
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
+    include_urls: bool = Query(default=False),
     current: CurrentShopContext = Depends(get_current_shop_context),
 ):
     supabase = get_supabase_admin_client()
@@ -905,11 +1037,95 @@ def list_generations(
         ) from exc
 
     rows = getattr(result, "data", None) or []
-    return _attach_generation_fabric_metadata(
+    enriched_rows = _attach_generation_fabric_metadata(
         supabase=supabase,
         shop_id=current.shop_id,
         generation_rows=rows,
     )
+
+    if include_urls:
+        enriched_rows = _attach_download_and_thumb_urls(supabase, enriched_rows)
+
+    return enriched_rows
+
+
+@router.post("/download-urls")
+def get_generation_download_urls_batch(
+    body: GenerationDownloadUrlsRequest,
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    supabase = get_supabase_admin_client()
+    settings = get_settings()
+
+    ids = [str(gid).strip() for gid in body.generation_ids if str(gid).strip()]
+    if not ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="generation_ids is required",
+        )
+    if len(ids) > 100:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At most 100 generation_ids are allowed",
+        )
+
+    try:
+        result = (
+            supabase.table("generations")
+            .select("id, status, output_path")
+            .eq("shop_id", current.shop_id)
+            .in_("id", ids)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch generations",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    done_rows = [
+        row
+        for row in rows
+        if str(row.get("status") or "") == "done"
+        and str(row.get("output_path") or "").strip()
+    ]
+
+    urls: dict[str, dict[str, Optional[str]]] = {}
+
+    if done_rows:
+        paths: list[str] = []
+        for row in done_rows:
+            output_path = str(row["output_path"]).strip()
+            paths.append(output_path)
+            paths.append(derive_thumb_path(output_path))
+
+        unique_paths = sorted(set(paths))
+
+        try:
+            signed_items = (
+                supabase.storage.from_("generated-outputs")
+                .create_signed_urls(unique_paths, 3600)
+            )
+            url_by_path = _build_signed_url_map(signed_items, settings)
+        except Exception as exc:
+            print(f"WARNING: batch signed URL generation failed: {exc}")
+            url_by_path = {}
+
+        for row in done_rows:
+            generation_id = str(row["id"])
+            output_path = str(row["output_path"]).strip()
+            download_url = url_by_path.get(output_path)
+            thumb_url = url_by_path.get(derive_thumb_path(output_path)) or download_url
+            urls[generation_id] = {
+                "download_url": download_url,
+                "thumb_url": thumb_url,
+            }
+
+    return {
+        "urls": urls,
+        "expires_in_seconds": 3600,
+    }
 
 
 @router.get("/{generation_id}")
@@ -1096,26 +1312,74 @@ def match_color_on_generation_output(
         ) from exc
 
     storage_bucket = supabase.storage.from_("generated-outputs")
-    upload_options = {
-        "content-type": edited_mime_type,
-        "upsert": "true",
-    }
+    old_output_path = output_path
+    new_ext = _guess_extension_from_mime(edited_mime_type)
+    new_output_path = f"{current.shop_id}/{generation_id}/output_v{int(time.time())}.{new_ext}"
 
     try:
-        storage_bucket.upload(output_path, edited_bytes, upload_options)
-    except Exception:
+        storage_bucket.upload(
+            new_output_path,
+            edited_bytes,
+            {
+                "content-type": edited_mime_type,
+                "upsert": "false",
+            },
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to upload new generation output to storage",
+        ) from exc
+
+    new_thumb_path = derive_thumb_path(new_output_path)
+    try:
+        np, Image = _import_match_color_dependencies()
+        thumb_image = Image.open(io.BytesIO(edited_bytes))
+        thumb_image.load()
+        thumb_image = thumb_image.convert("RGB")
+        if thumb_image.width > 400:
+            new_height = max(1, round(thumb_image.height * (400 / thumb_image.width)))
+            thumb_image = thumb_image.resize((400, new_height), Image.Resampling.LANCZOS)
+        thumb_buf = io.BytesIO()
+        thumb_image.save(thumb_buf, format="JPEG", quality=70)
+
+        storage_bucket.upload(
+            new_thumb_path,
+            thumb_buf.getvalue(),
+            {
+                "content-type": "image/jpeg",
+                "upsert": "false",
+            },
+        )
+    except Exception as exc:
+        print(f"WARNING: failed to generate/upload thumbnail for {new_output_path}: {exc}")
+
+    try:
+        (
+            supabase.table("generations")
+            .update({"output_path": new_output_path})
+            .eq("id", generation_id)
+            .eq("shop_id", current.shop_id)
+            .execute()
+        )
+    except Exception as exc:
         try:
-            # Some supabase-py versions expose update() for overwriting existing objects.
-            storage_bucket.update(output_path, edited_bytes, upload_options)
-        except Exception as exc:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to overwrite generation output in storage",
-            ) from exc
+            storage_bucket.remove([new_output_path, new_thumb_path])
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update generation output path",
+        ) from exc
+
+    try:
+        storage_bucket.remove([old_output_path, derive_thumb_path(old_output_path)])
+    except Exception:
+        pass
 
     return {
         "generation_id": generation_id,
-        "output_path": output_path,
+        "output_path": new_output_path,
         "edited": True,
         "applied_edits": len(normalized_edits),
     }
