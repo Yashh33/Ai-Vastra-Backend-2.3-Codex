@@ -1,8 +1,21 @@
 import base64
 import io
-from typing import Optional
+import threading
+from typing import Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, status
+import anyio.to_thread
+from cachetools import TTLCache
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Response,
+    UploadFile,
+    status,
+)
 from pydantic import BaseModel, Field
 
 from auth_deps import CurrentShopContext, get_current_shop_context
@@ -14,6 +27,12 @@ from google import genai
 from google.genai import types
 
 router = APIRouter(prefix="/tryon", tags=["TryOn"])
+
+_MAX_INPUT_IMAGE_DIMENSION = 1536
+
+_CONSENT_REJECTED_DETAIL = (
+    "Customer consent must be confirmed before processing a try-on request"
+)
 
 
 class TryOnRequest(BaseModel):
@@ -48,6 +67,28 @@ class TryOnResponse(BaseModel):
     result_mime: str
 
 
+# --- Gemini client singleton -----------------------------------------------
+
+_gemini_client: Optional[genai.Client] = None
+_gemini_client_lock = threading.Lock()
+
+
+def _get_gemini_client() -> genai.Client:
+    global _gemini_client
+    if _gemini_client is None:
+        with _gemini_client_lock:
+            if _gemini_client is None:
+                settings = get_settings()
+                _gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+    return _gemini_client
+
+
+# --- Storage byte cache ------------------------------------------------------
+
+_storage_bytes_cache: TTLCache = TTLCache(maxsize=32, ttl=600)
+_storage_bytes_cache_lock = threading.Lock()
+
+
 def _decode_photo(b64: str) -> bytes:
     try:
         return base64.b64decode(b64)
@@ -59,16 +100,68 @@ def _decode_photo(b64: str) -> bytes:
 
 
 def _fetch_storage_bytes(supabase, bucket: str, path: str) -> bytes:
+    cache_key = (bucket, path)
+
+    with _storage_bytes_cache_lock:
+        cached = _storage_bytes_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     try:
         result = supabase.storage.from_(bucket).download(path)
         if isinstance(result, (bytes, bytearray)):
-            return bytes(result)
-        raise RuntimeError("Unexpected storage response type")
+            data = bytes(result)
+        else:
+            raise RuntimeError("Unexpected storage response type")
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Storage fetch failed: {exc}",
         )
+
+    with _storage_bytes_cache_lock:
+        _storage_bytes_cache[cache_key] = data
+
+    return data
+
+
+def _downscale_image_if_needed(image_bytes: bytes, mime_type: str) -> Tuple[bytes, str]:
+    try:
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(image_bytes))
+        image.load()
+        width, height = image.size
+
+        if max(width, height) <= _MAX_INPUT_IMAGE_DIMENSION:
+            return image_bytes, mime_type
+
+        if width >= height:
+            new_width = _MAX_INPUT_IMAGE_DIMENSION
+            new_height = max(1, round(height * (_MAX_INPUT_IMAGE_DIMENSION / width)))
+        else:
+            new_height = _MAX_INPUT_IMAGE_DIMENSION
+            new_width = max(1, round(width * (_MAX_INPUT_IMAGE_DIMENSION / height)))
+
+        resized = image.convert("RGB").resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+        buf = io.BytesIO()
+        resized.save(buf, format="JPEG", quality=90)
+        return buf.getvalue(), "image/jpeg"
+    except Exception as exc:
+        print(f"[tryon] WARNING: image downscale failed, using original bytes: {exc}")
+        return image_bytes, mime_type
+
+
+def _log_tryon_consent(supabase, shop_id: str) -> None:
+    try:
+        supabase.table("customer_consent_logs").insert({
+            "shop_id": shop_id,
+            "purpose": "virtual_tryon",
+            "confirmed_by_staff": True,
+        }).execute()
+    except Exception:
+        pass
 
 
 def _call_gemini_tryon(
@@ -76,7 +169,7 @@ def _call_gemini_tryon(
     image_parts: list[tuple[bytes, str]],
 ) -> TryOnResponse:
     settings = get_settings()
-    client = genai.Client(api_key=settings.GEMINI_API_KEY)
+    client = _get_gemini_client()
 
     contents_parts: list = [prompt]
     for img_bytes, mime_type in image_parts:
@@ -107,9 +200,170 @@ def _call_gemini_tryon(
     )
 
 
+async def _call_gemini_tryon_async(
+    prompt: str,
+    image_parts: list[tuple[bytes, str]],
+) -> Tuple[bytes, str]:
+    settings = get_settings()
+    client = _get_gemini_client()
+
+    contents_parts: list = [prompt]
+    for img_bytes, mime_type in image_parts:
+        contents_parts.append(
+            types.Part.from_bytes(data=img_bytes, mime_type=mime_type)
+        )
+
+    response = await client.aio.models.generate_content(
+        model=settings.GEMINI_IMAGE_MODEL_ID,
+        contents=contents_parts,
+        config=types.GenerateContentConfig(
+            response_modalities=["IMAGE", "TEXT"],
+        ),
+    )
+
+    for part in response.candidates[0].content.parts:
+        if part.inline_data is not None:
+            return part.inline_data.data, part.inline_data.mime_type or "image/png"
+
+    raise HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail="Gemini did not return an image for try-on",
+    )
+
+
+def _prepare_tryon_assets_sync(
+    supabase, shop_id: str, generation_id: str
+) -> Tuple[bytes, Optional[str]]:
+    """Blocking DB + storage prep phase for /tryon/v2. Runs off the event loop."""
+    gen_result = (
+        supabase.table("generations")
+        .select("id, shop_id, output_path, folder_id, status")
+        .eq("id", generation_id)
+        .eq("shop_id", shop_id)
+        .limit(1)
+        .execute()
+    )
+    gen_rows = getattr(gen_result, "data", None) or []
+    if not gen_rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Generation not found",
+        )
+    gen = gen_rows[0]
+
+    if gen.get("status") != "done" or not gen.get("output_path"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Generation is not ready yet",
+        )
+
+    folder_name: Optional[str] = None
+    folder_id = gen.get("folder_id")
+    if folder_id:
+        folder_result = (
+            supabase.table("hero_folders")
+            .select("name")
+            .eq("id", folder_id)
+            .limit(1)
+            .execute()
+        )
+        folder_rows = getattr(folder_result, "data", None) or []
+        if folder_rows:
+            folder_name = folder_rows[0].get("name")
+
+    garment_bytes = _fetch_storage_bytes(
+        supabase,
+        "generated-outputs",
+        gen["output_path"],
+    )
+
+    return garment_bytes, folder_name
+
+
+def _prepare_tryon_quick_assets_sync(
+    supabase, shop_id: str, folder_id: str, fabric_image_id: str
+) -> Tuple[bytes, str, bytes, str, Optional[str]]:
+    """Blocking DB + storage prep phase for /tryon/quick/v2. Runs off the event loop."""
+    folder_result = (
+        supabase.table("hero_folders")
+        .select("id, name, default_hero_image_id")
+        .eq("id", folder_id)
+        .eq("shop_id", shop_id)
+        .limit(1)
+        .execute()
+    )
+    folder_rows = getattr(folder_result, "data", None) or []
+    if not folder_rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Garment type not found",
+        )
+    folder = folder_rows[0]
+    folder_name = folder.get("name")
+    default_hero_id = folder.get("default_hero_image_id")
+
+    if not default_hero_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No hero image set for this garment type",
+        )
+
+    hero_result = (
+        supabase.table("hero_images")
+        .select("id, storage_path, mime_type")
+        .eq("id", default_hero_id)
+        .eq("shop_id", shop_id)
+        .limit(1)
+        .execute()
+    )
+    hero_rows = getattr(hero_result, "data", None) or []
+    if not hero_rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Hero image not found",
+        )
+    hero = hero_rows[0]
+
+    fabric_result = (
+        supabase.table("fabric_images")
+        .select("id, storage_path, mime_type")
+        .eq("id", fabric_image_id)
+        .eq("shop_id", shop_id)
+        .limit(1)
+        .execute()
+    )
+    fabric_rows = getattr(fabric_result, "data", None) or []
+    if not fabric_rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Fabric image not found",
+        )
+    fabric = fabric_rows[0]
+
+    hero_bytes = _fetch_storage_bytes(
+        supabase,
+        "hero-images",
+        hero["storage_path"],
+    )
+    fabric_bytes = _fetch_storage_bytes(
+        supabase,
+        "fabric-images",
+        fabric["storage_path"],
+    )
+
+    return (
+        hero_bytes,
+        str(hero.get("mime_type") or "image/jpeg"),
+        fabric_bytes,
+        str(fabric.get("mime_type") or "image/jpeg"),
+        folder_name,
+    )
+
+
 @router.post("/", response_model=TryOnResponse)
 def tryon(
     body: TryOnRequest,
+    background_tasks: BackgroundTasks,
     current: CurrentShopContext = Depends(get_current_shop_context),
 ):
     """
@@ -123,16 +377,9 @@ def tryon(
     if not body.consent_confirmed:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Customer consent must be confirmed before processing a try-on request",
+            detail=_CONSENT_REJECTED_DETAIL,
         )
-    try:
-        supabase.table("customer_consent_logs").insert({
-            "shop_id": current.shop_id,
-            "purpose": "virtual_tryon",
-            "confirmed_by_staff": True,
-        }).execute()
-    except Exception:
-        pass
+    background_tasks.add_task(_log_tryon_consent, supabase, current.shop_id)
 
     # Fetch the generation and verify it belongs to this shop
     gen_result = (
@@ -198,6 +445,7 @@ def tryon(
 @router.post("/quick", response_model=TryOnResponse)
 def tryon_quick(
     body: TryOnQuickRequest,
+    background_tasks: BackgroundTasks,
     current: CurrentShopContext = Depends(get_current_shop_context),
 ):
     """
@@ -211,16 +459,9 @@ def tryon_quick(
     if not body.consent_confirmed:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Customer consent must be confirmed before processing a try-on request",
+            detail=_CONSENT_REJECTED_DETAIL,
         )
-    try:
-        supabase.table("customer_consent_logs").insert({
-            "shop_id": current.shop_id,
-            "purpose": "virtual_tryon",
-            "confirmed_by_staff": True,
-        }).execute()
-    except Exception:
-        pass
+    background_tasks.add_task(_log_tryon_consent, supabase, current.shop_id)
 
     shop_id = current.shop_id
 
@@ -310,3 +551,107 @@ def tryon_quick(
             (customer_bytes, body.customer_photo_mime),
         ],
     )
+
+
+@router.post("/v2")
+async def tryon_v2(
+    background_tasks: BackgroundTasks,
+    generation_id: str = Form(...),
+    consent_confirmed: bool = Form(...),
+    customer_photo: UploadFile = File(...),
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    """
+    Async/multipart variant of POST /tryon/. Returns raw binary image bytes
+    instead of a base64 JSON payload.
+    """
+    supabase = get_supabase_admin_client()
+
+    if not consent_confirmed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_CONSENT_REJECTED_DETAIL,
+        )
+    background_tasks.add_task(_log_tryon_consent, supabase, current.shop_id)
+
+    garment_bytes, folder_name = await anyio.to_thread.run_sync(
+        _prepare_tryon_assets_sync,
+        supabase,
+        current.shop_id,
+        generation_id.strip(),
+    )
+
+    customer_bytes = await customer_photo.read()
+    customer_mime = customer_photo.content_type or "image/jpeg"
+
+    customer_bytes, customer_mime = _downscale_image_if_needed(customer_bytes, customer_mime)
+    garment_bytes, garment_mime = _downscale_image_if_needed(garment_bytes, "image/jpeg")
+
+    prompt = build_tryon_prompt(folder_name=folder_name)
+
+    image_bytes, result_mime = await _call_gemini_tryon_async(
+        prompt=prompt,
+        image_parts=[
+            (customer_bytes, customer_mime),
+            (garment_bytes, garment_mime),
+        ],
+    )
+
+    return Response(content=image_bytes, media_type=result_mime)
+
+
+@router.post("/quick/v2")
+async def tryon_quick_v2(
+    background_tasks: BackgroundTasks,
+    fabric_image_id: str = Form(...),
+    folder_id: str = Form(...),
+    consent_confirmed: bool = Form(...),
+    customer_photo: UploadFile = File(...),
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    """
+    Async/multipart variant of POST /tryon/quick. Returns raw binary image
+    bytes instead of a base64 JSON payload.
+    """
+    supabase = get_supabase_admin_client()
+
+    if not consent_confirmed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_CONSENT_REJECTED_DETAIL,
+        )
+    background_tasks.add_task(_log_tryon_consent, supabase, current.shop_id)
+
+    (
+        hero_bytes,
+        hero_mime,
+        fabric_bytes,
+        fabric_mime,
+        folder_name,
+    ) = await anyio.to_thread.run_sync(
+        _prepare_tryon_quick_assets_sync,
+        supabase,
+        current.shop_id,
+        folder_id.strip(),
+        fabric_image_id.strip(),
+    )
+
+    customer_bytes = await customer_photo.read()
+    customer_mime = customer_photo.content_type or "image/jpeg"
+
+    hero_bytes, hero_mime = _downscale_image_if_needed(hero_bytes, hero_mime)
+    fabric_bytes, fabric_mime = _downscale_image_if_needed(fabric_bytes, fabric_mime)
+    customer_bytes, customer_mime = _downscale_image_if_needed(customer_bytes, customer_mime)
+
+    prompt = build_tryon_quick_prompt(folder_name=folder_name)
+
+    image_bytes, result_mime = await _call_gemini_tryon_async(
+        prompt=prompt,
+        image_parts=[
+            (hero_bytes, hero_mime),
+            (fabric_bytes, fabric_mime),
+            (customer_bytes, customer_mime),
+        ],
+    )
+
+    return Response(content=image_bytes, media_type=result_mime)

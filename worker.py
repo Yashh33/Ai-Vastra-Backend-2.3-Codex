@@ -2,6 +2,7 @@ import base64
 import io
 import time
 import traceback
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 
@@ -14,6 +15,7 @@ from supabase_client import get_supabase_admin_client
 
 _MAX_INPUT_IMAGE_DIMENSION = 1536
 _THUMB_MAX_WIDTH = 400
+_MAX_CONCURRENT_JOBS = 3
 
 
 def utc_now_iso() -> str:
@@ -370,14 +372,12 @@ def mark_generation_failed_with_refund(
 
 
 
-def process_one_job(supabase, gemini_client: genai.Client, settings) -> bool:
-    job = claim_next_job(supabase)
-    if not job:
-        return False
-
+def process_job(supabase, gemini_client: genai.Client, settings, job: dict) -> None:
+    """Process an already-claimed job. Fully self-contained: any failure is
+    caught here and routed to mark_generation_failed_with_refund, so this
+    can run safely on a worker thread without taking down the pool."""
     generation_id = str(job["id"])
     shop_id = str(job["shop_id"])
-    print(f"[worker] claimed generation={generation_id} shop={shop_id}")
 
     try:
         assets = fetch_generation_assets(supabase, job)
@@ -460,20 +460,12 @@ def process_one_job(supabase, gemini_client: genai.Client, settings) -> bool:
         )
 
         print(f"[worker] generation done: {generation_id}")
-        return True
 
     except Exception as exc:
         error_message = short_error_message(exc)
         print(f"[worker] generation failed: {generation_id} :: {error_message}")
         traceback.print_exc()
 
-        # try:
-        #     mark_generation_failed(
-        #         supabase,
-        #         generation_id=generation_id,
-        #         shop_id=shop_id,
-        #         error_message=error_message,
-        #     )
         try:
             refund_info = mark_generation_failed_with_refund(
                 supabase,
@@ -492,8 +484,6 @@ def process_one_job(supabase, gemini_client: genai.Client, settings) -> bool:
             print(f"[worker] failed to mark generation as failed: {mark_exc}")
             traceback.print_exc()
 
-        return True  # A job was claimed/handled, even if failed.
-
 
 def main() -> None:
     settings = get_settings()
@@ -507,17 +497,48 @@ def main() -> None:
     print("[worker] started")
     print(f"[worker] poll interval: {settings.WORKER_POLL_INTERVAL_SECONDS}s")
     print(f"[worker] model: {settings.GEMINI_IMAGE_MODEL_ID}")
+    print(f"[worker] max concurrent jobs: {_MAX_CONCURRENT_JOBS}")
 
-    while True:
-        try:
-            handled = process_one_job(supabase, gemini_client, settings)
-            if not handled:
-                time.sleep(settings.WORKER_POLL_INTERVAL_SECONDS)
-        except Exception as exc:
-            print(f"[worker] loop error: {short_error_message(exc)}")
-            traceback.print_exc()
-            # Prevent transient network/service errors from crashing the worker process.
-            time.sleep(max(5, settings.WORKER_POLL_INTERVAL_SECONDS))
+    executor = ThreadPoolExecutor(max_workers=_MAX_CONCURRENT_JOBS)
+    in_flight: set[Future] = set()
+
+    try:
+        while True:
+            try:
+                claimed_any = False
+
+                while len(in_flight) < _MAX_CONCURRENT_JOBS:
+                    job = claim_next_job(supabase)
+                    if not job:
+                        break
+
+                    claimed_any = True
+                    generation_id = str(job["id"])
+                    shop_id = str(job["shop_id"])
+                    print(f"[worker] claimed generation={generation_id} shop={shop_id}")
+
+                    future = executor.submit(process_job, supabase, gemini_client, settings, job)
+                    in_flight.add(future)
+
+                if not claimed_any or len(in_flight) >= _MAX_CONCURRENT_JOBS:
+                    time.sleep(settings.WORKER_POLL_INTERVAL_SECONDS)
+
+                completed = {future for future in in_flight if future.done()}
+                for future in completed:
+                    in_flight.discard(future)
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        print(f"[worker] job future raised: {short_error_message(exc)}")
+                        traceback.print_exc()
+
+            except Exception as exc:
+                print(f"[worker] loop error: {short_error_message(exc)}")
+                traceback.print_exc()
+                # Prevent transient network/service errors from crashing the worker process.
+                time.sleep(max(5, settings.WORKER_POLL_INTERVAL_SECONDS))
+    finally:
+        executor.shutdown(wait=True)
 
 
 if __name__ == "__main__":
