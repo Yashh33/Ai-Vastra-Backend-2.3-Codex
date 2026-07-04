@@ -25,6 +25,10 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    @property
+    def SUPABASE_JWKS_URL(self) -> str:
+        return self.SUPABASE_URL.rstrip("/") + "/auth/v1/.well-known/jwks.json"
+
 
 @lru_cache
 def get_settings() -> Settings:
