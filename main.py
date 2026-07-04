@@ -1,5 +1,6 @@
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 
 from admin_api import router as admin_router
 from auth_deps import CurrentShopContext, get_current_shop_context
@@ -11,6 +12,8 @@ from images_api import router as images_router
 from tryon_api import router as tryon_router
 
 app = FastAPI(title="Ai Vastra Backend")
+
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 app.add_middleware(
     CORSMiddleware,

@@ -875,7 +875,10 @@ def list_generations(
 
     query = (
         supabase.table("generations")
-        .select("*")
+        .select(
+            "id, shop_id, hero_image_id, fabric_image_id, folder_id, status, "
+            "output_path, credits_used, created_at, started_at, completed_at"
+        )
         .eq("shop_id", current.shop_id)
         .order("created_at", desc=True)
     )

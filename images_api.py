@@ -455,3 +455,37 @@ def list_fabric_image_metadata(
         ) from exc
 
     return getattr(result, "data", None) or []
+
+
+@router.get("/fabric-images/{fabric_image_id}")
+def get_fabric_image_metadata(
+    fabric_image_id: str,
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    supabase = get_supabase_admin_client()
+
+    image_id = _clean_required_text(fabric_image_id, "fabric_image_id")
+
+    try:
+        result = (
+            supabase.table("fabric_images")
+            .select("*")
+            .eq("id", image_id)
+            .eq("shop_id", current.shop_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch fabric image metadata",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Fabric image not found",
+        )
+
+    return rows[0]

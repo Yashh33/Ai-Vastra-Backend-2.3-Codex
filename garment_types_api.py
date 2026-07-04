@@ -47,6 +47,48 @@ def _create_hero_image_signed_url(supabase, storage_path: str) -> Optional[str]:
         return None
 
 
+def _create_hero_image_signed_urls_batch(
+    supabase, storage_paths: list[str]
+) -> dict[str, Optional[str]]:
+    """Batch-sign storage paths. Returns path -> signed_url (None on per-item failure)."""
+    result: dict[str, Optional[str]] = {path: None for path in storage_paths}
+    if not storage_paths:
+        return result
+
+    try:
+        signed_items = supabase.storage.from_("hero-images").create_signed_urls(
+            storage_paths,
+            3600,
+        )
+    except Exception:
+        # Fall back to per-path signing so the endpoint never regresses to broken.
+        for path in storage_paths:
+            result[path] = _create_hero_image_signed_url(supabase, path)
+        return result
+
+    if not isinstance(signed_items, list):
+        for path in storage_paths:
+            result[path] = _create_hero_image_signed_url(supabase, path)
+        return result
+
+    settings = get_settings()
+    for item in signed_items:
+        if not isinstance(item, dict) or item.get("error"):
+            continue
+
+        path = item.get("path") or item.get("Path")
+        signed_url = _extract_signed_url(item)
+        if not path or not signed_url:
+            continue
+
+        if signed_url.startswith("/"):
+            signed_url = f"{settings.SUPABASE_URL}{signed_url}"
+
+        result[path] = signed_url
+
+    return result
+
+
 @router.get("")
 def list_garment_types(
     current: CurrentShopContext = Depends(get_current_shop_context),
@@ -69,31 +111,50 @@ def list_garment_types(
         ) from exc
 
     folders = getattr(folder_result, "data", None) or []
-    items = []
 
+    hero_image_ids = sorted(
+        {
+            str(folder.get("default_hero_image_id"))
+            for folder in folders
+            if folder.get("default_hero_image_id")
+        }
+    )
+
+    storage_path_by_hero_image_id: dict[str, str] = {}
+    if hero_image_ids:
+        try:
+            image_result = (
+                supabase.table("hero_images")
+                .select("id, storage_path")
+                .in_("id", hero_image_ids)
+                .eq("shop_id", current.shop_id)
+                .execute()
+            )
+            image_rows = getattr(image_result, "data", None) or []
+            for image_row in image_rows:
+                image_id = str(image_row.get("id") or "")
+                storage_path = str(image_row.get("storage_path") or "")
+                if image_id and storage_path:
+                    storage_path_by_hero_image_id[image_id] = storage_path
+        except Exception:
+            storage_path_by_hero_image_id = {}
+
+    storage_paths = sorted(set(storage_path_by_hero_image_id.values()))
+    signed_url_by_storage_path = _create_hero_image_signed_urls_batch(
+        supabase, storage_paths
+    )
+
+    items = []
     for folder in folders:
         default_hero_image_id = folder.get("default_hero_image_id")
         hero_image_signed_url = None
 
         if default_hero_image_id:
-            try:
-                image_result = (
-                    supabase.table("hero_images")
-                    .select("id, storage_path")
-                    .eq("id", default_hero_image_id)
-                    .eq("shop_id", current.shop_id)
-                    .limit(1)
-                    .execute()
-                )
-                image_rows = getattr(image_result, "data", None) or []
-                if image_rows:
-                    storage_path = str(image_rows[0].get("storage_path") or "")
-                    hero_image_signed_url = _create_hero_image_signed_url(
-                        supabase,
-                        storage_path,
-                    )
-            except Exception:
-                hero_image_signed_url = None
+            storage_path = storage_path_by_hero_image_id.get(
+                str(default_hero_image_id)
+            )
+            if storage_path:
+                hero_image_signed_url = signed_url_by_storage_path.get(storage_path)
 
         items.append(
             {
