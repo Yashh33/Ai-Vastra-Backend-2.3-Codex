@@ -1,3 +1,6 @@
+import threading
+
+from cachetools import TTLCache
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -9,6 +12,7 @@ from folders_api import router as folders_router
 from garment_types_api import router as garment_types_router
 from generations_api import router as generations_router
 from images_api import router as images_router
+from supabase_client import get_supabase_admin_client
 from tryon_api import router as tryon_router
 
 app = FastAPI(title="Ai Vastra Backend")
@@ -56,11 +60,72 @@ def health():
     }
 
 
+_me_shop_summary_cache: TTLCache = TTLCache(maxsize=1000, ttl=60)
+_me_shop_summary_lock = threading.Lock()
+
+
+def _get_shop_summary(shop_id: str) -> dict:
+    with _me_shop_summary_lock:
+        cached = _me_shop_summary_cache.get(shop_id)
+        if cached is not None:
+            return cached
+
+    shop_name = None
+    header_display_text = None
+    credits_balance = 0
+
+    try:
+        supabase = get_supabase_admin_client()
+
+        shop_result = (
+            supabase.table("shops")
+            .select("name, header_display_text")
+            .eq("id", shop_id)
+            .execute()
+        )
+        shop_rows = getattr(shop_result, "data", None) or []
+        if shop_rows:
+            shop_name = shop_rows[0].get("name")
+            header_display_text = shop_rows[0].get("header_display_text")
+
+        ledger_result = (
+            supabase.table("credit_ledger")
+            .select("balance_after")
+            .eq("shop_id", shop_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        ledger_rows = getattr(ledger_result, "data", None) or []
+        if ledger_rows:
+            credits_balance = int(ledger_rows[0].get("balance_after") or 0)
+    except Exception:
+        shop_name = None
+        header_display_text = None
+        credits_balance = 0
+
+    summary = {
+        "shop_name": shop_name,
+        "header_display_text": header_display_text,
+        "credits_balance": credits_balance,
+    }
+
+    with _me_shop_summary_lock:
+        _me_shop_summary_cache[shop_id] = summary
+
+    return summary
+
+
 @app.get("/me")
 def me(current: CurrentShopContext = Depends(get_current_shop_context)):
+    summary = _get_shop_summary(current.shop_id)
+
     return {
         "auth_user_id": current.auth_user_id,
         "email": current.email,
         "shop_id": current.shop_id,
         "role": current.role,
+        "shop_name": summary["shop_name"],
+        "header_display_text": summary["header_display_text"],
+        "credits_balance": summary["credits_balance"],
     }

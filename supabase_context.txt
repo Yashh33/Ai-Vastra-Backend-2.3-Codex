@@ -1,0 +1,157 @@
+| table_name            | column_name           | data_type                | is_nullable | column_default        |
+| --------------------- | --------------------- | ------------------------ | ----------- | --------------------- |
+| catalog_images        | id                    | uuid                     | NO          | gen_random_uuid()     |
+| catalog_images        | shop_id               | uuid                     | NO          | null                  |
+| catalog_images        | folder_id             | uuid                     | NO          | null                  |
+| catalog_images        | storage_path          | text                     | NO          | null                  |
+| catalog_images        | original_filename     | text                     | YES         | null                  |
+| catalog_images        | mime_type             | text                     | YES         | null                  |
+| catalog_images        | file_size_bytes       | bigint                   | YES         | null                  |
+| catalog_images        | width                 | integer                  | YES         | null                  |
+| catalog_images        | height                | integer                  | YES         | null                  |
+| catalog_images        | sort_order            | integer                  | NO          | 0                     |
+| catalog_images        | is_active             | boolean                  | NO          | true                  |
+| catalog_images        | created_at            | timestamp with time zone | NO          | now()                 |
+| catalog_images        | updated_at            | timestamp with time zone | NO          | now()                 |
+| credit_ledger         | id                    | uuid                     | NO          | gen_random_uuid()     |
+| credit_ledger         | shop_id               | uuid                     | NO          | null                  |
+| credit_ledger         | delta                 | integer                  | NO          | null                  |
+| credit_ledger         | reason                | text                     | NO          | null                  |
+| credit_ledger         | generation_id         | uuid                     | YES         | null                  |
+| credit_ledger         | balance_after         | integer                  | NO          | null                  |
+| credit_ledger         | created_at            | timestamp with time zone | NO          | now()                 |
+| customer_consent_logs | id                    | uuid                     | NO          | gen_random_uuid()     |
+| customer_consent_logs | shop_id               | uuid                     | NO          | null                  |
+| customer_consent_logs | consented_at          | timestamp with time zone | NO          | now()                 |
+| customer_consent_logs | purpose               | text                     | NO          | 'virtual_tryon'::text |
+| customer_consent_logs | confirmed_by_staff    | boolean                  | NO          | true                  |
+| fabric_images         | id                    | uuid                     | NO          | gen_random_uuid()     |
+| fabric_images         | shop_id               | uuid                     | NO          | null                  |
+| fabric_images         | storage_path          | text                     | NO          | null                  |
+| fabric_images         | original_filename     | text                     | YES         | null                  |
+| fabric_images         | mime_type             | text                     | YES         | null                  |
+| fabric_images         | file_size_bytes       | bigint                   | YES         | null                  |
+| fabric_images         | width                 | integer                  | YES         | null                  |
+| fabric_images         | height                | integer                  | YES         | null                  |
+| fabric_images         | created_at            | timestamp with time zone | NO          | now()                 |
+| generation_fabrics    | generation_id         | uuid                     | NO          | null                  |
+| generation_fabrics    | shop_id               | uuid                     | NO          | null                  |
+| generation_fabrics    | fabric_image_id       | uuid                     | NO          | null                  |
+| generation_fabrics    | apply_to              | text                     | NO          | null                  |
+| generation_fabrics    | sort_order            | integer                  | NO          | null                  |
+| generation_fabrics    | created_at            | timestamp with time zone | NO          | now()                 |
+| generation_fabrics    | fabric_code           | text                     | YES         | null                  |
+| generation_fabrics    | fabric_color          | text                     | YES         | null                  |
+| generations           | id                    | uuid                     | NO          | gen_random_uuid()     |
+| generations           | shop_id               | uuid                     | NO          | null                  |
+| generations           | hero_image_id         | uuid                     | NO          | null                  |
+| generations           | fabric_image_id       | uuid                     | NO          | null                  |
+| generations           | folder_id             | uuid                     | NO          | null                  |
+| generations           | status                | text                     | NO          | 'queued'::text        |
+| generations           | prompt_used           | text                     | YES         | null                  |
+| generations           | nano_request_id       | text                     | YES         | null                  |
+| generations           | output_path           | text                     | YES         | null                  |
+| generations           | error                 | text                     | YES         | null                  |
+| generations           | credits_used          | integer                  | NO          | 0                     |
+| generations           | created_at            | timestamp with time zone | NO          | now()                 |
+| generations           | started_at            | timestamp with time zone | YES         | null                  |
+| generations           | completed_at          | timestamp with time zone | YES         | null                  |
+| hero_folders          | id                    | uuid                     | NO          | gen_random_uuid()     |
+| hero_folders          | shop_id               | uuid                     | NO          | null                  |
+| hero_folders          | name                  | text                     | NO          | null                  |
+| hero_folders          | prompt_template       | text                     | NO          | ''::text              |
+| hero_folders          | is_active             | boolean                  | NO          | true                  |
+| hero_folders          | created_at            | timestamp with time zone | NO          | now()                 |
+| hero_folders          | updated_at            | timestamp with time zone | NO          | now()                 |
+| hero_folders          | default_hero_image_id | uuid                     | YES         | null                  |
+| hero_images           | id                    | uuid                     | NO          | gen_random_uuid()     |
+| hero_images           | shop_id               | uuid                     | NO          | null                  |
+| hero_images           | folder_id             | uuid                     | NO          | null                  |
+| hero_images           | storage_path          | text                     | NO          | null                  |
+| hero_images           | original_filename     | text                     | YES         | null                  |
+| hero_images           | mime_type             | text                     | YES         | null                  |
+| hero_images           | file_size_bytes       | bigint                   | YES         | null                  |
+| hero_images           | width                 | integer                  | YES         | null                  |
+| hero_images           | height                | integer                  | YES         | null                  |
+| hero_images           | created_at            | timestamp with time zone | NO          | now()                 |
+| shop_users            | id                    | uuid                     | NO          | gen_random_uuid()     |
+| shop_users            | shop_id               | uuid                     | NO          | null                  |
+| shop_users            | auth_user_id          | uuid                     | NO          | null                  |
+| shop_users            | role                  | text                     | NO          | 'owner'::text         |
+| shop_users            | created_at            | timestamp with time zone | NO          | now()                 |
+| shop_users            | updated_at            | timestamp with time zone | NO          | now()                 |
+| shops                 | id                    | uuid                     | NO          | gen_random_uuid()     |
+| shops                 | name                  | text                     | NO          | null                  |
+| shops                 | carousel_mode_default | boolean                  | NO          | false                 |
+| shops                 | created_at            | timestamp with time zone | NO          | now()                 |
+| shops                 | updated_at            | timestamp with time zone | NO          | now()                 |
+| shops                 | logo_path             | text                     | YES         | null                  |
+| shops                 | header_display_text   | text                     | YES         | null                  |
+| shops                 | is_suspended          | boolean                  | NO          | false                 |
+
+
+| schemaname | tablename          | policyname                         | permissive | roles           | cmd    | qual                                                                                           |
+| ---------- | ------------------ | ---------------------------------- | ---------- | --------------- | ------ | ---------------------------------------------------------------------------------------------- |
+| public     | catalog_images     | catalog_images_delete_own_shop     | PERMISSIVE | {authenticated} | DELETE | (shop_id IN ( SELECT su.shop_id
+   FROM shop_users su
+  WHERE (su.auth_user_id = auth.uid()))) |
+| public     | catalog_images     | catalog_images_insert_own_shop     | PERMISSIVE | {authenticated} | INSERT | null                                                                                           |
+| public     | catalog_images     | catalog_images_select_own_shop     | PERMISSIVE | {authenticated} | SELECT | (shop_id IN ( SELECT su.shop_id
+   FROM shop_users su
+  WHERE (su.auth_user_id = auth.uid()))) |
+| public     | catalog_images     | catalog_images_update_own_shop     | PERMISSIVE | {authenticated} | UPDATE | (shop_id IN ( SELECT su.shop_id
+   FROM shop_users su
+  WHERE (su.auth_user_id = auth.uid()))) |
+| public     | credit_ledger      | credit_ledger_select_own_shop      | PERMISSIVE | {authenticated} | SELECT | (shop_id IN ( SELECT su.shop_id
+   FROM shop_users su
+  WHERE (su.auth_user_id = auth.uid()))) |
+| public     | fabric_images      | fabric_images_delete_own_shop      | PERMISSIVE | {authenticated} | DELETE | (shop_id IN ( SELECT su.shop_id
+   FROM shop_users su
+  WHERE (su.auth_user_id = auth.uid()))) |
+| public     | fabric_images      | fabric_images_insert_own_shop      | PERMISSIVE | {authenticated} | INSERT | null                                                                                           |
+| public     | fabric_images      | fabric_images_select_own_shop      | PERMISSIVE | {authenticated} | SELECT | (shop_id IN ( SELECT su.shop_id
+   FROM shop_users su
+  WHERE (su.auth_user_id = auth.uid()))) |
+| public     | fabric_images      | fabric_images_update_own_shop      | PERMISSIVE | {authenticated} | UPDATE | (shop_id IN ( SELECT su.shop_id
+   FROM shop_users su
+  WHERE (su.auth_user_id = auth.uid()))) |
+| public     | generation_fabrics | generation_fabrics_delete_own_shop | PERMISSIVE | {authenticated} | DELETE | (shop_id IN ( SELECT su.shop_id
+   FROM shop_users su
+  WHERE (su.auth_user_id = auth.uid()))) |
+| public     | generation_fabrics | generation_fabrics_insert_own_shop | PERMISSIVE | {authenticated} | INSERT | null                                                                                           |
+| public     | generation_fabrics | generation_fabrics_select_own_shop | PERMISSIVE | {authenticated} | SELECT | (shop_id IN ( SELECT su.shop_id
+   FROM shop_users su
+  WHERE (su.auth_user_id = auth.uid()))) |
+| public     | generation_fabrics | generation_fabrics_update_own_shop | PERMISSIVE | {authenticated} | UPDATE | (shop_id IN ( SELECT su.shop_id
+   FROM shop_users su
+  WHERE (su.auth_user_id = auth.uid()))) |
+| public     | generations        | generations_select_own_shop        | PERMISSIVE | {authenticated} | SELECT | (shop_id IN ( SELECT su.shop_id
+   FROM shop_users su
+  WHERE (su.auth_user_id = auth.uid()))) |
+| public     | hero_folders       | hero_folders_delete_own_shop       | PERMISSIVE | {authenticated} | DELETE | (shop_id IN ( SELECT su.shop_id
+   FROM shop_users su
+  WHERE (su.auth_user_id = auth.uid()))) |
+| public     | hero_folders       | hero_folders_insert_own_shop       | PERMISSIVE | {authenticated} | INSERT | null                                                                                           |
+| public     | hero_folders       | hero_folders_select_own_shop       | PERMISSIVE | {authenticated} | SELECT | (shop_id IN ( SELECT su.shop_id
+   FROM shop_users su
+  WHERE (su.auth_user_id = auth.uid()))) |
+| public     | hero_folders       | hero_folders_update_own_shop       | PERMISSIVE | {authenticated} | UPDATE | (shop_id IN ( SELECT su.shop_id
+   FROM shop_users su
+  WHERE (su.auth_user_id = auth.uid()))) |
+| public     | hero_images        | hero_images_delete_own_shop        | PERMISSIVE | {authenticated} | DELETE | (shop_id IN ( SELECT su.shop_id
+   FROM shop_users su
+  WHERE (su.auth_user_id = auth.uid()))) |
+| public     | hero_images        | hero_images_insert_own_shop        | PERMISSIVE | {authenticated} | INSERT | null                                                                                           |
+| public     | hero_images        | hero_images_select_own_shop        | PERMISSIVE | {authenticated} | SELECT | (shop_id IN ( SELECT su.shop_id
+   FROM shop_users su
+  WHERE (su.auth_user_id = auth.uid()))) |
+| public     | hero_images        | hero_images_update_own_shop        | PERMISSIVE | {authenticated} | UPDATE | (shop_id IN ( SELECT su.shop_id
+   FROM shop_users su
+  WHERE (su.auth_user_id = auth.uid()))) |
+| public     | shop_users         | shop_users_select_self             | PERMISSIVE | {authenticated} | SELECT | (auth_user_id = auth.uid())                                                                    |
+| public     | shops              | shops_select_own_shop              | PERMISSIVE | {authenticated} | SELECT | (id IN ( SELECT su.shop_id
+   FROM shop_users su
+  WHERE (su.auth_user_id = auth.uid())))      |
+| public     | shops              | shops_update_own_shop              | PERMISSIVE | {authenticated} | UPDATE | (id IN ( SELECT su.shop_id
+   FROM shop_users su
+  WHERE (su.auth_user_id = auth.uid())))      |

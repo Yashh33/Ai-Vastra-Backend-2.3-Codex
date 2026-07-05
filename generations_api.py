@@ -93,39 +93,96 @@ def _build_signed_url_map(signed_items: object, settings) -> dict[str, str]:
     return result
 
 
+def _sign_paths_with_fallback(
+    supabase,
+    settings,
+    output_paths: list[str],
+    thumb_paths: list[str],
+    expires_in: int,
+) -> dict[str, str]:
+    """Sign all given paths, tolerating per-item and whole-batch failures.
+
+    Tries one batch create_signed_urls call first. If that call itself
+    raises (e.g. the storage backend errors out because some of the
+    paths - typically legacy thumbnails - don't exist), falls back to
+    signing paths one-by-one so a handful of missing objects can never
+    blank out every row.
+    """
+    unique_paths = sorted(set(output_paths) | set(thumb_paths))
+    if not unique_paths:
+        return {}
+
+    try:
+        signed_items = (
+            supabase.storage.from_("generated-outputs")
+            .create_signed_urls(unique_paths, expires_in)
+        )
+        return _build_signed_url_map(signed_items, settings)
+    except Exception as exc:
+        print(
+            "[include_urls] batch create_signed_urls failed, "
+            f"falling back to per-path signing: {exc}"
+        )
+
+    url_by_path: dict[str, str] = {}
+    seen: set[str] = set()
+    ordered_paths: list[str] = []
+    for path in output_paths + thumb_paths:
+        if path not in seen:
+            seen.add(path)
+            ordered_paths.append(path)
+
+    for path in ordered_paths:
+        try:
+            signed = (
+                supabase.storage.from_("generated-outputs")
+                .create_signed_url(path, expires_in)
+            )
+        except Exception as exc:
+            print(f"[include_urls] failed to sign path {path!r}: {exc}")
+            continue
+
+        signed_url = _extract_signed_url(signed)
+        if not signed_url:
+            continue
+
+        if signed_url.startswith("/"):
+            signed_url = f"{settings.SUPABASE_URL}{signed_url}"
+
+        url_by_path[path] = signed_url
+
+    return url_by_path
+
+
 def _attach_download_and_thumb_urls(
     supabase, rows: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     if not rows:
         return rows
 
-    paths_needed: list[str] = []
+    output_paths: list[str] = []
+    thumb_paths: list[str] = []
     for row in rows:
         row_status = str(row.get("status") or "")
         output_path = str(row.get("output_path") or "").strip()
         if row_status == "done" and output_path:
-            paths_needed.append(output_path)
-            paths_needed.append(derive_thumb_path(output_path))
+            output_paths.append(output_path)
+            thumb_paths.append(derive_thumb_path(output_path))
 
-    if not paths_needed:
+    if not output_paths:
         for row in rows:
             row["download_url"] = None
             row["thumb_url"] = None
         return rows
 
     settings = get_settings()
-    unique_paths = sorted(set(paths_needed))
-
     try:
-        signed_items = (
-            supabase.storage.from_("generated-outputs")
-            .create_signed_urls(unique_paths, 3600)
+        url_by_path = _sign_paths_with_fallback(
+            supabase, settings, output_paths, thumb_paths, 3600
         )
     except Exception as exc:
-        print(f"WARNING: batch signed URL generation failed: {exc}")
-        return rows
-
-    url_by_path = _build_signed_url_map(signed_items, settings)
+        print(f"[include_urls] unexpected failure signing URLs: {exc}")
+        url_by_path = {}
 
     for row in rows:
         row_status = str(row.get("status") or "")
@@ -1094,22 +1151,19 @@ def get_generation_download_urls_batch(
     urls: dict[str, dict[str, Optional[str]]] = {}
 
     if done_rows:
-        paths: list[str] = []
+        output_paths: list[str] = []
+        thumb_paths: list[str] = []
         for row in done_rows:
             output_path = str(row["output_path"]).strip()
-            paths.append(output_path)
-            paths.append(derive_thumb_path(output_path))
-
-        unique_paths = sorted(set(paths))
+            output_paths.append(output_path)
+            thumb_paths.append(derive_thumb_path(output_path))
 
         try:
-            signed_items = (
-                supabase.storage.from_("generated-outputs")
-                .create_signed_urls(unique_paths, 3600)
+            url_by_path = _sign_paths_with_fallback(
+                supabase, settings, output_paths, thumb_paths, 3600
             )
-            url_by_path = _build_signed_url_map(signed_items, settings)
         except Exception as exc:
-            print(f"WARNING: batch signed URL generation failed: {exc}")
+            print(f"[include_urls] unexpected failure signing URLs: {exc}")
             url_by_path = {}
 
         for row in done_rows:
