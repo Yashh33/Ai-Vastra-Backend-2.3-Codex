@@ -536,10 +536,10 @@ def _normalize_generation_fabrics(body: GenerationCreateRequest) -> list[dict[st
             detail="At least one fabric is required",
         )
 
-    if len(raw_fabrics) > 3:
+    if len(raw_fabrics) > 4:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="At most 3 fabrics are allowed per generation",
+            detail="At most 4 fabrics are allowed per generation",
         )
 
     normalized: list[dict[str, Any]] = []

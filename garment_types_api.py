@@ -144,6 +144,36 @@ def list_garment_types(
         supabase, storage_paths
     )
 
+    all_folder_ids = [folder.get("id") for folder in folders if folder.get("id")]
+
+    fabric_slots_by_folder_id: dict[str, list[dict]] = {}
+    if all_folder_ids:
+        try:
+            fabric_slot_result = (
+                supabase.table("garment_fabric_slots")
+                .select("id, label, apply_to, sort_order, folder_id")
+                .eq("shop_id", current.shop_id)
+                .in_("folder_id", all_folder_ids)
+                .order("sort_order", desc=False)
+                .execute()
+            )
+            fabric_slot_rows = getattr(fabric_slot_result, "data", None) or []
+        except Exception:
+            fabric_slot_rows = []
+
+        for slot_row in fabric_slot_rows:
+            folder_id = str(slot_row.get("folder_id") or "")
+            if not folder_id:
+                continue
+            fabric_slots_by_folder_id.setdefault(folder_id, []).append(
+                {
+                    "id": slot_row.get("id"),
+                    "label": slot_row.get("label"),
+                    "apply_to": slot_row.get("apply_to"),
+                    "sort_order": slot_row.get("sort_order"),
+                }
+            )
+
     items = []
     for folder in folders:
         default_hero_image_id = folder.get("default_hero_image_id")
@@ -163,6 +193,9 @@ def list_garment_types(
                 "prompt_template": folder.get("prompt_template"),
                 "default_hero_image_id": default_hero_image_id or None,
                 "hero_image_signed_url": hero_image_signed_url,
+                "fabric_slots": fabric_slots_by_folder_id.get(
+                    str(folder.get("id")), []
+                ),
             }
         )
 
