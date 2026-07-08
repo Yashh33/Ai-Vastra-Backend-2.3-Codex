@@ -43,6 +43,15 @@ class AdminUpdateDefaultHeroRequest(BaseModel):
     default_hero_image_id: Optional[str] = Field(...)
 
 
+_ALLOWED_FABRIC_SLOT_APPLY_TO = {"shirt", "pant", "suit_full_body", "suit_upper", "koti"}
+
+
+class AdminCreateFabricSlotRequest(BaseModel):
+    label: str = Field(..., min_length=1, max_length=80)
+    apply_to: str
+    sort_order: int = Field(default=0, ge=0, le=100)
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -981,6 +990,138 @@ def update_shop_folder_default_hero(
         )
 
     return rows[0]
+
+
+@router.post("/shops/{shop_id}/folders/{folder_id}/fabric-slots")
+def create_folder_fabric_slot(
+    shop_id: str,
+    folder_id: str,
+    body: AdminCreateFabricSlotRequest,
+):
+    supabase = get_supabase_admin_client()
+
+    folder_check = (
+        supabase.table("hero_folders")
+        .select("id")
+        .eq("id", folder_id)
+        .eq("shop_id", shop_id)
+        .limit(1)
+        .execute()
+    )
+    folder_rows = getattr(folder_check, "data", None) or []
+    if not folder_rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Folder not found",
+        )
+
+    apply_to = (body.apply_to or "").strip().lower()
+    if apply_to not in _ALLOWED_FABRIC_SLOT_APPLY_TO:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="apply_to must be one of: shirt, pant, suit_full_body, suit_upper, koti",
+        )
+
+    existing_result = (
+        supabase.table("garment_fabric_slots")
+        .select("apply_to")
+        .eq("folder_id", folder_id)
+        .eq("shop_id", shop_id)
+        .execute()
+    )
+    existing_rows = getattr(existing_result, "data", None) or []
+
+    if len(existing_rows) >= 4:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A garment type can have at most 4 fabric slots",
+        )
+
+    existing_has_suit_full_body = any(
+        row.get("apply_to") == "suit_full_body" for row in existing_rows
+    )
+    if (apply_to == "suit_full_body" and existing_rows) or existing_has_suit_full_body:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="suit_full_body cannot be combined with other fabric slots",
+        )
+
+    payload = {
+        "folder_id": folder_id,
+        "shop_id": shop_id,
+        "label": _clean_text(body.label, "label"),
+        "apply_to": apply_to,
+        "sort_order": body.sort_order,
+    }
+
+    try:
+        result = supabase.table("garment_fabric_slots").insert(payload).execute()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create fabric slot",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create fabric slot",
+        )
+
+    return rows[0]
+
+
+@router.get("/shops/{shop_id}/folders/{folder_id}/fabric-slots")
+def list_folder_fabric_slots(shop_id: str, folder_id: str):
+    supabase = get_supabase_admin_client()
+
+    folder_check = (
+        supabase.table("hero_folders")
+        .select("id")
+        .eq("id", folder_id)
+        .eq("shop_id", shop_id)
+        .limit(1)
+        .execute()
+    )
+    folder_rows = getattr(folder_check, "data", None) or []
+    if not folder_rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Folder not found",
+        )
+
+    result = (
+        supabase.table("garment_fabric_slots")
+        .select("*")
+        .eq("folder_id", folder_id)
+        .eq("shop_id", shop_id)
+        .order("sort_order", desc=False)
+        .order("created_at", desc=False)
+        .execute()
+    )
+
+    return getattr(result, "data", None) or []
+
+
+@router.delete("/shops/{shop_id}/folders/{folder_id}/fabric-slots/{slot_id}")
+def delete_folder_fabric_slot(shop_id: str, folder_id: str, slot_id: str):
+    supabase = get_supabase_admin_client()
+
+    result = (
+        supabase.table("garment_fabric_slots")
+        .delete()
+        .eq("id", slot_id)
+        .eq("shop_id", shop_id)
+        .eq("folder_id", folder_id)
+        .execute()
+    )
+    if not getattr(result, "data", None):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Fabric slot not found",
+        )
+    return {"deleted": True}
 
 
 @router.get("/shops/{shop_id}/hero-images")
