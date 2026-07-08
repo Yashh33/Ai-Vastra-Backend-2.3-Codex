@@ -20,7 +20,11 @@ from pydantic import BaseModel, Field
 
 from auth_deps import CurrentShopContext, get_current_shop_context
 from config import get_settings
-from prompting import build_tryon_prompt, build_tryon_quick_prompt
+from prompting import (
+    build_tryon_multi_quick_prompt,
+    build_tryon_prompt,
+    build_tryon_quick_prompt,
+)
 from supabase_client import get_supabase_admin_client
 
 from google import genai
@@ -360,6 +364,81 @@ def _prepare_tryon_quick_assets_sync(
     )
 
 
+def _prepare_tryon_multi_assets_sync(
+    supabase,
+    shop_id: str,
+    hero_image_id: str,
+    folder_id: str,
+    fabric_image_ids: list[str],
+) -> Tuple[bytes, str, list[Tuple[bytes, str]], Optional[str]]:
+    """Blocking DB + storage prep phase for /tryon/multi/v2. Runs off the event loop."""
+    folder_result = (
+        supabase.table("hero_folders")
+        .select("id, name")
+        .eq("id", folder_id)
+        .eq("shop_id", shop_id)
+        .limit(1)
+        .execute()
+    )
+    folder_rows = getattr(folder_result, "data", None) or []
+    if not folder_rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Garment type not found",
+        )
+    folder_name = folder_rows[0].get("name")
+
+    hero_result = (
+        supabase.table("hero_images")
+        .select("id, storage_path, mime_type")
+        .eq("id", hero_image_id)
+        .eq("shop_id", shop_id)
+        .limit(1)
+        .execute()
+    )
+    hero_rows = getattr(hero_result, "data", None) or []
+    if not hero_rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Hero image not found",
+        )
+    hero = hero_rows[0]
+    hero_bytes = _fetch_storage_bytes(
+        supabase,
+        "hero-images",
+        hero["storage_path"],
+    )
+    hero_mime = str(hero.get("mime_type") or "image/jpeg")
+
+    fabric_assets: list[Tuple[bytes, str]] = []
+    for fabric_image_id in fabric_image_ids:
+        fabric_result = (
+            supabase.table("fabric_images")
+            .select("id, storage_path, mime_type")
+            .eq("id", fabric_image_id)
+            .eq("shop_id", shop_id)
+            .limit(1)
+            .execute()
+        )
+        fabric_rows = getattr(fabric_result, "data", None) or []
+        if not fabric_rows:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Fabric image not found",
+            )
+        fabric = fabric_rows[0]
+        fabric_bytes = _fetch_storage_bytes(
+            supabase,
+            "fabric-images",
+            fabric["storage_path"],
+        )
+        fabric_assets.append(
+            (fabric_bytes, str(fabric.get("mime_type") or "image/jpeg"))
+        )
+
+    return hero_bytes, hero_mime, fabric_assets, folder_name
+
+
 @router.post("/", response_model=TryOnResponse)
 def tryon(
     body: TryOnRequest,
@@ -652,6 +731,98 @@ async def tryon_quick_v2(
             (fabric_bytes, fabric_mime),
             (customer_bytes, customer_mime),
         ],
+    )
+
+    return Response(content=image_bytes, media_type=result_mime)
+
+
+@router.post("/multi/v2")
+async def tryon_multi_v2(
+    background_tasks: BackgroundTasks,
+    hero_image_id: str = Form(...),
+    folder_id: str = Form(...),
+    consent_confirmed: str = Form(...),
+    customer_photo: UploadFile = File(...),
+    fabric_image_id_1: str = Form(...),
+    apply_to_1: str = Form(...),
+    fabric_image_id_2: Optional[str] = Form(default=None),
+    apply_to_2: Optional[str] = Form(default=None),
+    fabric_image_id_3: Optional[str] = Form(default=None),
+    apply_to_3: Optional[str] = Form(default=None),
+    fabric_image_id_4: Optional[str] = Form(default=None),
+    apply_to_4: Optional[str] = Form(default=None),
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    """
+    Async/multipart variant supporting multiple fabric slots (up to 4).
+    Returns raw binary image bytes instead of a base64 JSON payload.
+    """
+    supabase = get_supabase_admin_client()
+
+    if consent_confirmed.strip().lower() != "true":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_CONSENT_REJECTED_DETAIL,
+        )
+    background_tasks.add_task(_log_tryon_consent, supabase, current.shop_id)
+
+    raw_pairs = [
+        (fabric_image_id_1, apply_to_1),
+        (fabric_image_id_2, apply_to_2),
+        (fabric_image_id_3, apply_to_3),
+        (fabric_image_id_4, apply_to_4),
+    ]
+    fabric_pairs = [
+        (fabric_id.strip(), (apply_to or "").strip())
+        for fabric_id, apply_to in raw_pairs
+        if fabric_id and fabric_id.strip()
+    ]
+
+    if not fabric_pairs:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one fabric is required",
+        )
+
+    (
+        hero_bytes,
+        hero_mime,
+        fabric_assets,
+        folder_name,
+    ) = await anyio.to_thread.run_sync(
+        _prepare_tryon_multi_assets_sync,
+        supabase,
+        current.shop_id,
+        hero_image_id.strip(),
+        folder_id.strip(),
+        [fabric_id for fabric_id, _ in fabric_pairs],
+    )
+
+    customer_bytes = await customer_photo.read()
+    customer_mime = customer_photo.content_type or "image/jpeg"
+
+    hero_bytes, hero_mime = _downscale_image_if_needed(hero_bytes, hero_mime)
+    customer_bytes, customer_mime = _downscale_image_if_needed(customer_bytes, customer_mime)
+    fabric_assets = [
+        _downscale_image_if_needed(fabric_bytes, fabric_mime)
+        for fabric_bytes, fabric_mime in fabric_assets
+    ]
+
+    fabric_assignments = [
+        {"apply_to": apply_to, "image_index": idx}
+        for idx, (_, apply_to) in enumerate(fabric_pairs)
+    ]
+
+    prompt = build_tryon_multi_quick_prompt(
+        fabric_assignments=fabric_assignments,
+        folder_name=folder_name,
+    )
+
+    image_parts = [(hero_bytes, hero_mime), *fabric_assets, (customer_bytes, customer_mime)]
+
+    image_bytes, result_mime = await _call_gemini_tryon_async(
+        prompt=prompt,
+        image_parts=image_parts,
     )
 
     return Response(content=image_bytes, media_type=result_mime)

@@ -205,3 +205,33 @@ Do not change or replace the background — use the exact background from Image 
 Do not beautify, retouch, or alter the person's appearance — keep their face, skin tone, features, and expression exactly as they appear in Image 1.
 
 Output: one photorealistic photograph.""".strip()
+
+
+def build_tryon_multi_quick_prompt(fabric_assignments, folder_name):
+    lines = []
+    lines.append("Image 1: Hero garment photograph — use for garment cut, silhouette, lapel style, button placement, collar, seams, and all construction details.")
+
+    for i, assignment in enumerate(fabric_assignments):
+        img_num = i + 2
+        lines.append(f"Image {img_num}: Fabric swatch — use for the {assignment['apply_to'].replace('_', ' ')} portion of the garment. Color, weave structure, pattern, sheen, and texture.")
+
+    customer_img_num = len(fabric_assignments) + 2
+    lines.append(f"Image {customer_img_num}: Customer photograph — use for the person's identity, face, body shape, body proportions, skin tone, and pose.")
+    lines.append("")
+    lines.append(f"Generate a new photograph of the customer from Image {customer_img_num} wearing a {folder_name} garment with the cut and construction of Image 1, tailored from the fabrics shown:")
+
+    for i, assignment in enumerate(fabric_assignments):
+        img_num = i + 2
+        lines.append(f"- Image {img_num} fabric → {assignment['apply_to'].replace('_', ' ')}")
+
+    lines.append("")
+    lines.append("The garment construction details (lapels, buttons, collar, seams) must match Image 1 exactly. Each fabric must be applied only to its designated garment part. The person (face, body, proportions, skin tone) must come from the customer photograph.")
+    lines.append("")
+    lines.append("The result must look like a natural photograph of the customer wearing a garment tailored specifically for them.")
+    lines.append("")
+    lines.append("Do not change or replace the background — use the exact background from the customer photograph.")
+    lines.append("Do not beautify, retouch, or alter the person's appearance — keep their face, skin tone, features, and expression exactly as they appear in the customer photograph.")
+    lines.append("")
+    lines.append("Output: one photorealistic photograph.")
+
+    return "\n".join(lines)
