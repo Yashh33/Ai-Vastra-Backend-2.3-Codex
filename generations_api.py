@@ -564,12 +564,7 @@ def _normalize_generation_fabrics(body: GenerationCreateRequest) -> list[dict[st
             )
         seen_apply_to.add(apply_to)
 
-        fabric_code = _clean_optional_text(item.fabric_code)
-        if not fabric_code and not is_legacy_single:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="fabric_code is required for each fabric",
-            )
+        fabric_code = _clean_optional_text(item.fabric_code) or "unknown"
 
         normalized.append(
             {
