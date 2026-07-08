@@ -6,11 +6,20 @@ import { useAdminAuth } from "../lib/auth";
 import { createSignedUrl } from "../lib/storage";
 import type {
   AdminCatalogImageRow,
+  AdminFabricSlotRow,
   AdminFolderRow,
   AdminHeroImageRow,
   AdminSetDefaultHeroRequest,
   AdminShopRow,
 } from "../lib/types";
+
+const FABRIC_SLOT_APPLY_TO_OPTIONS = [
+  "shirt",
+  "pant",
+  "suit_full_body",
+  "suit_upper",
+  "koti",
+];
 
 export function AdminShopDetailPage() {
   const { shopId = "" } = useParams();
@@ -46,6 +55,13 @@ export function AdminShopDetailPage() {
   const [uploadingHero, setUploadingHero] = useState(false);
   const [catalogFiles, setCatalogFiles] = useState<File[]>([]);
   const [uploadingCatalog, setUploadingCatalog] = useState(false);
+
+  const [fabricSlots, setFabricSlots] = useState<AdminFabricSlotRow[]>([]);
+  const [newSlotLabel, setNewSlotLabel] = useState("");
+  const [newSlotApplyTo, setNewSlotApplyTo] = useState("shirt");
+  const [newSlotSortOrder, setNewSlotSortOrder] = useState(0);
+  const [savingSlot, setSavingSlot] = useState(false);
+  const [deletingSlotId, setDeletingSlotId] = useState<string | null>(null);
 
   const [processingSuspend, setProcessingSuspend] = useState(false);
   const [deletingShop, setDeletingShop] = useState(false);
@@ -142,6 +158,24 @@ export function AdminShopDetailPage() {
     }
   }
 
+  async function loadFabricSlots(folderId: string) {
+    if (!session || !shopId || !folderId) {
+      setFabricSlots([]);
+      return;
+    }
+
+    try {
+      const rows = await adminFetch<AdminFabricSlotRow[]>(
+        session,
+        `/admin/shops/${encodeURIComponent(shopId)}/folders/${encodeURIComponent(folderId)}/fabric-slots`,
+        { method: "GET" }
+      );
+      setFabricSlots(rows);
+    } catch {
+      setFabricSlots([]);
+    }
+  }
+
   useEffect(() => {
     void loadShopData();
   }, [session, shopId]);
@@ -150,9 +184,14 @@ export function AdminShopDetailPage() {
     if (!selectedFolderId) {
       setHeroImages([]);
       setCatalogImages([]);
+      setFabricSlots([]);
       return;
     }
-    void Promise.all([loadHeroImages(selectedFolderId), loadCatalogImages(selectedFolderId)]);
+    void Promise.all([
+      loadHeroImages(selectedFolderId),
+      loadCatalogImages(selectedFolderId),
+      loadFabricSlots(selectedFolderId),
+    ]);
   }, [selectedFolderId, session, shopId]);
 
   async function handleShopUpdate(event: FormEvent<HTMLFormElement>) {
@@ -321,6 +360,58 @@ export function AdminShopDetailPage() {
       setStatusText(`Catalog upload failed: ${err instanceof Error ? err.message : "Unknown error"}`);
     } finally {
       setUploadingCatalog(false);
+    }
+  }
+
+  async function handleCreateFabricSlot(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!session || !shopId || !selectedFolderId || !newSlotLabel.trim()) return;
+
+    setSavingSlot(true);
+    try {
+      await adminFetch<AdminFabricSlotRow>(
+        session,
+        `/admin/shops/${encodeURIComponent(shopId)}/folders/${encodeURIComponent(selectedFolderId)}/fabric-slots`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            label: newSlotLabel.trim(),
+            apply_to: newSlotApplyTo,
+            sort_order: newSlotSortOrder,
+          }),
+        }
+      );
+
+      setNewSlotLabel("");
+      setNewSlotApplyTo("shirt");
+      setNewSlotSortOrder(0);
+      await loadFabricSlots(selectedFolderId);
+      setStatusText("Fabric slot added.");
+    } catch (err) {
+      setStatusText(`Failed to add fabric slot: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      setSavingSlot(false);
+    }
+  }
+
+  async function handleDeleteFabricSlot(slotId: string, label: string) {
+    if (!session || !shopId || !selectedFolderId) return;
+    const confirmed = window.confirm(`Delete fabric slot "${label}"? This cannot be undone.`);
+    if (!confirmed) return;
+
+    setDeletingSlotId(slotId);
+    try {
+      await adminFetch(
+        session,
+        `/admin/shops/${encodeURIComponent(shopId)}/folders/${encodeURIComponent(selectedFolderId)}/fabric-slots/${encodeURIComponent(slotId)}`,
+        { method: "DELETE" }
+      );
+      setStatusText(`Deleted fabric slot "${label}".`);
+      await loadFabricSlots(selectedFolderId);
+    } catch (err) {
+      setStatusText(`Failed to delete fabric slot: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      setDeletingSlotId(null);
     }
   }
 
@@ -701,6 +792,109 @@ export function AdminShopDetailPage() {
             </div>
           ) : null}
         </section>
+
+        {selectedFolderId ? (
+          <section className="card stack">
+            <h2>Fabric slots</h2>
+            <p className="tiny muted">Garment type: {selectedFolder?.name || "-"}</p>
+
+            {fabricSlots.length === 0 ? (
+              <div className="empty-box">No fabric slots found.</div>
+            ) : (
+              <ul className="hero-list">
+                {fabricSlots.map((slot) => (
+                  <li
+                    key={slot.id}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: "8px",
+                      padding: "4px 0",
+                    }}
+                  >
+                    <span>
+                      {slot.sort_order}. {slot.label}{" "}
+                      <span
+                        style={{
+                          background: "#e5e7eb",
+                          color: "#374151",
+                          borderRadius: "6px",
+                          padding: "2px 8px",
+                          fontSize: "12px",
+                          fontWeight: 600,
+                        }}
+                      >
+                        {slot.apply_to}
+                      </span>
+                    </span>
+                    <button
+                      onClick={() => void handleDeleteFabricSlot(slot.id, slot.label)}
+                      disabled={deletingSlotId === slot.id}
+                      style={{
+                        background: "#991B1B",
+                        color: "white",
+                        border: "none",
+                        borderRadius: "6px",
+                        padding: "3px 10px",
+                        fontSize: "12px",
+                        fontWeight: 600,
+                        cursor: "pointer",
+                        flexShrink: 0,
+                      }}
+                    >
+                      {deletingSlotId === slot.id ? "Deleting..." : "Delete"}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+
+            <form className="stack" onSubmit={handleCreateFabricSlot}>
+              <div className="grid-2">
+                <label className="field">
+                  <span>Label</span>
+                  <input
+                    value={newSlotLabel}
+                    onChange={(event) => setNewSlotLabel(event.target.value)}
+                    placeholder="e.g. Shirt fabric"
+                    disabled={savingSlot}
+                  />
+                </label>
+
+                <label className="field">
+                  <span>Apply To</span>
+                  <select
+                    value={newSlotApplyTo}
+                    onChange={(event) => setNewSlotApplyTo(event.target.value)}
+                    disabled={savingSlot}
+                  >
+                    {FABRIC_SLOT_APPLY_TO_OPTIONS.map((option) => (
+                      <option key={option} value={option}>
+                        {option}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="field">
+                  <span>Sort Order</span>
+                  <input
+                    type="number"
+                    min={0}
+                    value={newSlotSortOrder}
+                    onChange={(event) => setNewSlotSortOrder(Number(event.target.value))}
+                    disabled={savingSlot}
+                  />
+                </label>
+              </div>
+
+              <button className="btn btn-dark" type="submit" disabled={savingSlot || !newSlotLabel.trim()}>
+                {savingSlot ? "Adding..." : "Add slot"}
+              </button>
+            </form>
+          </section>
+        ) : null}
 
         <section className="card stack">
           <h2>Upload Catalog Images (Bulk)</h2>

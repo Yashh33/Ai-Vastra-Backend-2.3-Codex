@@ -72,3 +72,13 @@ export type AdminCatalogImageRow = {
   updated_at: string;
 };
 
+export type AdminFabricSlotRow = {
+  id: string;
+  folder_id: string;
+  shop_id: string;
+  label: string;
+  apply_to: string;
+  sort_order: number;
+  created_at?: string;
+};
+
