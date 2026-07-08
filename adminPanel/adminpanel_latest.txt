@@ -1,0 +1,1400 @@
+﻿=== D:\AiVastraBackend 2.3 Codex\adminPanel\src\lib\api.ts ===
+import type { AdminSession } from "./types";
+
+function getErrorMessage(status: number, payload: unknown): string {
+  if (typeof payload === "string" && payload.trim()) return payload;
+
+  if (payload && typeof payload === "object" && "detail" in payload) {
+    const detail = (payload as { detail?: unknown }).detail;
+    if (typeof detail === "string" && detail.trim()) return detail;
+  }
+
+  return `HTTP ${status}`;
+}
+
+export async function adminFetch<T>(
+  session: AdminSession,
+  path: string,
+  init: RequestInit = {}
+): Promise<T> {
+  const headers = new Headers(init.headers ?? {});
+  headers.set("x-admin-secret", session.adminSecret);
+
+  if (init.body && !(init.body instanceof FormData) && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+
+  const response = await fetch(`${session.apiBaseUrl}${path}`, {
+    ...init,
+    headers,
+  });
+
+  const text = await response.text();
+  let payload: unknown = null;
+
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = text;
+    }
+  }
+
+  if (!response.ok) {
+    throw new Error(getErrorMessage(response.status, payload));
+  }
+
+  return payload as T;
+}
+
+export async function verifyAdminSession(session: AdminSession): Promise<void> {
+  await adminFetch<{ ok: boolean }>(session, "/admin/session", { method: "GET" });
+}
+
+=== D:\AiVastraBackend 2.3 Codex\adminPanel\src\lib\auth.tsx ===
+import {
+  createContext,
+  useContext,
+  useMemo,
+  useState,
+  type ReactNode,
+} from "react";
+
+import { verifyAdminSession } from "./api";
+import {
+  normalizeApiBaseUrl,
+  readSessionFromStorage,
+  writeSessionToStorage,
+} from "./storage";
+import type { AdminSession } from "./types";
+
+type AdminAuthContextValue = {
+  session: AdminSession | null;
+  isAuthenticated: boolean;
+  signIn: (payload: { apiBaseUrl: string; adminSecret: string }) => Promise<void>;
+  signOut: () => void;
+};
+
+const AdminAuthContext = createContext<AdminAuthContextValue | undefined>(undefined);
+
+export function AdminAuthProvider({ children }: { children: ReactNode }) {
+  const [session, setSession] = useState<AdminSession | null>(() => readSessionFromStorage());
+
+  const value = useMemo<AdminAuthContextValue>(
+    () => ({
+      session,
+      isAuthenticated: !!session,
+      signIn: async ({ apiBaseUrl, adminSecret }) => {
+        const normalized: AdminSession = {
+          apiBaseUrl: normalizeApiBaseUrl(apiBaseUrl),
+          adminSecret: adminSecret.trim(),
+        };
+
+        if (!normalized.apiBaseUrl || !normalized.adminSecret) {
+          throw new Error("Backend URL and admin secret are required");
+        }
+
+        await verifyAdminSession(normalized);
+        setSession(normalized);
+        writeSessionToStorage(normalized);
+      },
+      signOut: () => {
+        setSession(null);
+        writeSessionToStorage(null);
+      },
+    }),
+    [session]
+  );
+
+  return <AdminAuthContext.Provider value={value}>{children}</AdminAuthContext.Provider>;
+}
+
+export function useAdminAuth() {
+  const ctx = useContext(AdminAuthContext);
+  if (!ctx) {
+    throw new Error("useAdminAuth must be used within AdminAuthProvider");
+  }
+  return ctx;
+}
+
+=== D:\AiVastraBackend 2.3 Codex\adminPanel\src\lib\env.ts ===
+const rawApiBaseUrl = import.meta.env.VITE_ADMIN_API_BASE_URL || "http://localhost:8000";
+
+export const ADMIN_ENV = {
+  apiBaseUrl: String(rawApiBaseUrl),
+};
+
+=== D:\AiVastraBackend 2.3 Codex\adminPanel\src\lib\storage.ts ===
+import { createClient } from "@supabase/supabase-js";
+import type { AdminSession } from "./types";
+
+const SESSION_KEY = "aivastra_admin_session";
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL as string;
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+export async function createSignedUrl(
+  bucket: "hero-images" | "fabric-images" | "generated-outputs" | "shop-logos",
+  path: string,
+  expiresInSeconds = 3600
+): Promise<string> {
+  const { data, error } = await supabase.storage
+    .from(bucket)
+    .createSignedUrl(path, expiresInSeconds);
+
+  if (error) throw new Error(error.message);
+
+  const signed =
+    (data as { signedUrl?: string; signedURL?: string } | null)?.signedUrl ??
+    (data as { signedUrl?: string; signedURL?: string } | null)?.signedURL;
+
+  if (!signed) throw new Error("Signed URL response was empty");
+
+  return signed;
+}
+
+export function normalizeApiBaseUrl(value: string) {
+  return value.trim().replace(/\/+$/, "");
+}
+
+export function readSessionFromStorage(): AdminSession | null {
+  const raw = window.localStorage.getItem(SESSION_KEY);
+  if (!raw) return null;
+
+  try {
+    const parsed = JSON.parse(raw) as AdminSession;
+    if (!parsed?.apiBaseUrl || !parsed?.adminSecret) return null;
+    return {
+      apiBaseUrl: normalizeApiBaseUrl(parsed.apiBaseUrl),
+      adminSecret: parsed.adminSecret,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function writeSessionToStorage(session: AdminSession | null) {
+  if (!session) {
+    window.localStorage.removeItem(SESSION_KEY);
+    return;
+  }
+
+  window.localStorage.setItem(
+    SESSION_KEY,
+    JSON.stringify({
+      apiBaseUrl: normalizeApiBaseUrl(session.apiBaseUrl),
+      adminSecret: session.adminSecret,
+    })
+  );
+}
+
+=== D:\AiVastraBackend 2.3 Codex\adminPanel\src\lib\types.ts ===
+export type AdminSession = {
+  apiBaseUrl: string;
+  adminSecret: string;
+};
+
+export type AdminShopRow = {
+  id: string;
+  name: string;
+  header_display_text?: string | null;
+  carousel_mode_default?: boolean;
+  logo_path?: string | null;
+  is_suspended?: boolean;
+  created_at?: string;
+  updated_at?: string;
+  owner_auth_user_id?: string | null;
+  credits_balance?: number;
+};
+
+export type AdminCreateShopResponse = {
+  shop_id: string;
+  shop_name: string;
+  auth_user_id: string;
+  email: string;
+  role: string;
+  opening_credits: number;
+  balance_before: number;
+  balance_after: number;
+};
+
+export type AdminSetDefaultHeroRequest = {
+  default_hero_image_id: string | null;
+};
+
+export type AdminFolderRow = {
+  id: string;
+  shop_id: string;
+  name: string;
+  prompt_template: string;
+  default_hero_image_id?: string | null;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type AdminHeroImageRow = {
+  id: string;
+  shop_id: string;
+  folder_id: string;
+  storage_path: string;
+  original_filename: string | null;
+  mime_type: string | null;
+  file_size_bytes: number | null;
+  width: number | null;
+  height: number | null;
+  signed_url?: string | null;
+  created_at: string;
+};
+
+export type AdminCatalogImageRow = {
+  id: string;
+  shop_id: string;
+  folder_id: string;
+  storage_path: string;
+  original_filename: string | null;
+  mime_type: string | null;
+  file_size_bytes: number | null;
+  width: number | null;
+  height: number | null;
+  sort_order: number;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+
+=== D:\AiVastraBackend 2.3 Codex\adminPanel\src\pages\AdminDashboardPage.tsx ===
+import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { Link } from "react-router-dom";
+
+import { adminFetch } from "../lib/api";
+import { useAdminAuth } from "../lib/auth";
+import type { AdminCreateShopResponse, AdminShopRow } from "../lib/types";
+
+export function AdminDashboardPage() {
+  const { session, signOut } = useAdminAuth();
+
+  const [shops, setShops] = useState<AdminShopRow[]>([]);
+  const [searchText, setSearchText] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [statusText, setStatusText] = useState("Loading shops...");
+
+  const [shopName, setShopName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [openingCredits, setOpeningCredits] = useState("0");
+  const [creating, setCreating] = useState(false);
+
+  const canCreate = useMemo(
+    () => !!shopName.trim() && !!email.trim() && password.trim().length >= 6,
+    [shopName, email, password]
+  );
+
+  async function loadShops() {
+    if (!session) return;
+    setLoading(true);
+    try {
+      const params = new URLSearchParams({ limit: "100" });
+      if (searchText.trim()) {
+        params.set("search", searchText.trim());
+      }
+
+      const rows = await adminFetch<AdminShopRow[]>(session, `/admin/shops?${params.toString()}`, {
+        method: "GET",
+      });
+
+      setShops(rows);
+      setStatusText(rows.length ? `Loaded ${rows.length} shop(s)` : "No shops found");
+    } catch (err) {
+      setStatusText(`Failed to load shops: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadShops();
+  }, [session]);
+
+  async function handleCreateShop(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!session) return;
+
+    setCreating(true);
+    try {
+      const payload = {
+        shop_name: shopName.trim(),
+        email: email.trim(),
+        password,
+        opening_credits: Math.max(0, Number(openingCredits) || 0),
+        carousel_mode_default: false,
+      };
+
+      const response = await adminFetch<AdminCreateShopResponse>(session, "/admin/shops", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+
+      setShopName("");
+      setEmail("");
+      setPassword("");
+      setOpeningCredits("0");
+
+      setStatusText(
+        `Shop created: ${response.shop_name} | Login: ${response.email} | Balance: ${response.balance_after}`
+      );
+
+      await loadShops();
+    } catch (err) {
+      setStatusText(`Create failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  return (
+    <main className="screen">
+      <section className="page-shell">
+        <header className="header-row">
+          <div>
+            <h1>Admin Panel</h1>
+            <p className="muted">Onboard shops and manage catalog setup.</p>
+            <p className="tiny muted">{statusText}</p>
+          </div>
+          <div className="row">
+            <button className="btn btn-light" onClick={loadShops} disabled={loading}>
+              {loading ? "Refreshing..." : "Refresh"}
+            </button>
+            <button className="btn btn-light" onClick={signOut}>
+              Logout
+            </button>
+          </div>
+        </header>
+
+        <section className="card stack">
+          <h2>Create Shop Login</h2>
+          <form className="stack" onSubmit={handleCreateShop}>
+            <div className="grid-2">
+              <label className="field">
+                <span>Shop Name</span>
+                <input
+                  value={shopName}
+                  onChange={(event) => setShopName(event.target.value)}
+                  placeholder="e.g. ABC Mens Wear"
+                  disabled={creating}
+                />
+              </label>
+
+              <label className="field">
+                <span>Shop Email (username)</span>
+                <input
+                  type="email"
+                  value={email}
+                  onChange={(event) => setEmail(event.target.value)}
+                  placeholder="shop@example.com"
+                  disabled={creating}
+                />
+              </label>
+
+              <label className="field">
+                <span>Password</span>
+                <input
+                  type="text"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  placeholder="Minimum 6 characters"
+                  disabled={creating}
+                />
+              </label>
+
+              <label className="field">
+                <span>Opening Credits</span>
+                <input
+                  type="number"
+                  min={0}
+                  value={openingCredits}
+                  onChange={(event) => setOpeningCredits(event.target.value)}
+                  disabled={creating}
+                />
+              </label>
+            </div>
+
+            <button className="btn btn-dark" type="submit" disabled={creating || !canCreate}>
+              {creating ? "Creating..." : "Create Shop"}
+            </button>
+          </form>
+        </section>
+
+        <section className="card stack">
+          <div className="row">
+            <h2 className="grow">Shops</h2>
+            <input
+              className="search-input"
+              placeholder="Search by name"
+              value={searchText}
+              onChange={(event) => setSearchText(event.target.value)}
+            />
+            <button className="btn btn-light" onClick={loadShops} disabled={loading}>
+              Search
+            </button>
+          </div>
+
+          {shops.length === 0 ? (
+            <div className="empty-box">No shops yet.</div>
+          ) : (
+            <div className="shop-grid">
+              {shops.map((shop) => (
+                <article key={shop.id} className="shop-card">
+                  <h3>{shop.name}</h3>
+                  <p className="tiny muted">Shop ID: {shop.id}</p>
+                  <p className="tiny muted">Credits: {shop.credits_balance ?? 0}</p>
+                  <p className="tiny muted">Owner UID: {shop.owner_auth_user_id || "-"}</p>
+                  <Link className="btn btn-dark" to={`/shops/${encodeURIComponent(shop.id)}`}>
+                    Manage Shop
+                  </Link>
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
+      </section>
+    </main>
+  );
+}
+
+
+
+=== D:\AiVastraBackend 2.3 Codex\adminPanel\src\pages\AdminLoginPage.tsx ===
+import { useState, type FormEvent } from "react";
+
+import { ADMIN_ENV } from "../lib/env";
+import { useAdminAuth } from "../lib/auth";
+
+export function AdminLoginPage() {
+  const { signIn } = useAdminAuth();
+
+  const [apiBaseUrl, setApiBaseUrl] = useState(ADMIN_ENV.apiBaseUrl);
+  const [adminSecret, setAdminSecret] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError("");
+    setBusy(true);
+
+    try {
+      await signIn({ apiBaseUrl, adminSecret });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to login");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <main className="screen auth-screen">
+      <section className="card auth-card">
+        <h1>Ai Vastra Admin</h1>
+        <p className="muted">Private control panel access</p>
+
+        <form className="stack" onSubmit={handleSubmit}>
+          <label className="field">
+            <span>Backend URL</span>
+            <input
+              type="text"
+              value={apiBaseUrl}
+              onChange={(event) => setApiBaseUrl(event.target.value)}
+              placeholder="http://localhost:8000"
+              disabled={busy}
+            />
+          </label>
+
+          <label className="field">
+            <span>Admin Secret</span>
+            <input
+              type="password"
+              value={adminSecret}
+              onChange={(event) => setAdminSecret(event.target.value)}
+              placeholder="Enter ADMIN_PANEL_SECRET"
+              disabled={busy}
+            />
+          </label>
+
+          {error ? <p className="error-text">{error}</p> : null}
+
+          <button className="btn btn-dark" type="submit" disabled={busy}>
+            {busy ? "Checking..." : "Enter Admin Panel"}
+          </button>
+        </form>
+      </section>
+    </main>
+  );
+}
+
+
+=== D:\AiVastraBackend 2.3 Codex\adminPanel\src\pages\AdminShopDetailPage.tsx ===
+import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { Link, useNavigate, useParams } from "react-router-dom";
+
+import { adminFetch } from "../lib/api";
+import { useAdminAuth } from "../lib/auth";
+import { createSignedUrl } from "../lib/storage";
+import type {
+  AdminCatalogImageRow,
+  AdminFolderRow,
+  AdminHeroImageRow,
+  AdminSetDefaultHeroRequest,
+  AdminShopRow,
+} from "../lib/types";
+
+export function AdminShopDetailPage() {
+  const { shopId = "" } = useParams();
+  const navigate = useNavigate();
+  const { session } = useAdminAuth();
+
+  const [shop, setShop] = useState<AdminShopRow | null>(null);
+  const [folders, setFolders] = useState<AdminFolderRow[]>([]);
+  const [heroImages, setHeroImages] = useState<AdminHeroImageRow[]>([]);
+  const [heroSignedUrls, setHeroSignedUrls] = useState<Record<string, string>>({});
+  const [catalogImages, setCatalogImages] = useState<AdminCatalogImageRow[]>([]);
+
+  const [loading, setLoading] = useState(false);
+  const [statusText, setStatusText] = useState("Loading shop...");
+
+  const [shopName, setShopName] = useState("");
+  const [headerDisplayText, setHeaderDisplayText] = useState("");
+  const [carouselModeDefault, setCarouselModeDefault] = useState(false);
+  const [savingShop, setSavingShop] = useState(false);
+
+  const [newPassword, setNewPassword] = useState("");
+  const [resettingPassword, setResettingPassword] = useState(false);
+
+  const [logoFile, setLogoFile] = useState<File | null>(null);
+  const [uploadingLogo, setUploadingLogo] = useState(false);
+
+  const [newFolderName, setNewFolderName] = useState("");
+  const [newPromptTemplate, setNewPromptTemplate] = useState("");
+  const [creatingFolder, setCreatingFolder] = useState(false);
+
+  const [selectedFolderId, setSelectedFolderId] = useState("");
+  const [heroFile, setHeroFile] = useState<File | null>(null);
+  const [uploadingHero, setUploadingHero] = useState(false);
+  const [catalogFiles, setCatalogFiles] = useState<File[]>([]);
+  const [uploadingCatalog, setUploadingCatalog] = useState(false);
+
+  const [processingSuspend, setProcessingSuspend] = useState(false);
+  const [deletingShop, setDeletingShop] = useState(false);
+
+  const canUploadHero = useMemo(() => !!selectedFolderId && !!heroFile, [selectedFolderId, heroFile]);
+  const canUploadCatalog = useMemo(
+    () => !!selectedFolderId && catalogFiles.length > 0,
+    [selectedFolderId, catalogFiles]
+  );
+  const selectedFolder = useMemo(
+    () => folders.find((folder) => folder.id === selectedFolderId) || null,
+    [folders, selectedFolderId]
+  );
+
+  async function loadShopData() {
+    if (!session || !shopId) return;
+
+    setLoading(true);
+    try {
+      const [shopRow, folderRows] = await Promise.all([
+        adminFetch<AdminShopRow>(session, `/admin/shops/${encodeURIComponent(shopId)}`, { method: "GET" }),
+        adminFetch<AdminFolderRow[]>(session, `/admin/shops/${encodeURIComponent(shopId)}/folders`, {
+          method: "GET",
+        }),
+      ]);
+
+      setShop(shopRow);
+      setShopName(shopRow.name || "");
+      setHeaderDisplayText(shopRow.header_display_text || "");
+      setCarouselModeDefault(Boolean(shopRow.carousel_mode_default));
+      setFolders(folderRows);
+
+      if (folderRows.length && !selectedFolderId) {
+        setSelectedFolderId(folderRows[0].id);
+      }
+
+      setStatusText("Shop loaded.");
+    } catch (err) {
+      setStatusText(`Load failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadHeroImages(folderId: string) {
+    if (!session || !shopId || !folderId) {
+      setHeroImages([]);
+      setHeroSignedUrls({});
+      return;
+    }
+
+    try {
+      const rows = await adminFetch<AdminHeroImageRow[]>(
+        session,
+        `/admin/shops/${encodeURIComponent(shopId)}/hero-images?folder_id=${encodeURIComponent(folderId)}&limit=30`,
+        { method: "GET" }
+      );
+      setHeroImages(rows);
+      await loadHeroSignedUrls(rows);
+    } catch {
+      setHeroImages([]);
+      setHeroSignedUrls({});
+    }
+  }
+
+  async function loadHeroSignedUrls(images: AdminHeroImageRow[]) {
+    const urls: Record<string, string> = {};
+    for (const img of images) {
+      try {
+        const url = await createSignedUrl("hero-images", img.storage_path);
+        urls[img.id] = url;
+      } catch {
+        // skip
+      }
+    }
+    setHeroSignedUrls(urls);
+  }
+
+  async function loadCatalogImages(folderId: string) {
+    if (!session || !shopId || !folderId) {
+      setCatalogImages([]);
+      return;
+    }
+
+    try {
+      const rows = await adminFetch<AdminCatalogImageRow[]>(
+        session,
+        `/admin/shops/${encodeURIComponent(shopId)}/catalog-images?folder_id=${encodeURIComponent(folderId)}&limit=30`,
+        { method: "GET" }
+      );
+      setCatalogImages(rows);
+    } catch {
+      setCatalogImages([]);
+    }
+  }
+
+  useEffect(() => {
+    void loadShopData();
+  }, [session, shopId]);
+
+  useEffect(() => {
+    if (!selectedFolderId) {
+      setHeroImages([]);
+      setCatalogImages([]);
+      return;
+    }
+    void Promise.all([loadHeroImages(selectedFolderId), loadCatalogImages(selectedFolderId)]);
+  }, [selectedFolderId, session, shopId]);
+
+  async function handleShopUpdate(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!session || !shopId) return;
+
+    setSavingShop(true);
+    try {
+      const updated = await adminFetch<AdminShopRow>(session, `/admin/shops/${encodeURIComponent(shopId)}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          name: shopName.trim(),
+          header_display_text: headerDisplayText.trim() || null,
+          carousel_mode_default: carouselModeDefault,
+        }),
+      });
+      setShop((prev) => ({ ...prev, ...updated }));
+      setStatusText("Shop details updated.");
+    } catch (err) {
+      setStatusText(`Update failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      setSavingShop(false);
+    }
+  }
+
+  async function handlePasswordReset(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!session || !shopId || newPassword.trim().length < 6) return;
+
+    setResettingPassword(true);
+    try {
+      await adminFetch<{ password_reset: boolean }>(
+        session,
+        `/admin/shops/${encodeURIComponent(shopId)}/reset-password`,
+        {
+          method: "POST",
+          body: JSON.stringify({ password: newPassword.trim() }),
+        }
+      );
+      setNewPassword("");
+      setStatusText("Password reset successful.");
+    } catch (err) {
+      setStatusText(`Password reset failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      setResettingPassword(false);
+    }
+  }
+
+  async function handleLogoUpload(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!session || !shopId || !logoFile) return;
+
+    setUploadingLogo(true);
+    try {
+      const formData = new FormData();
+      formData.append("file", logoFile);
+
+      const result = await adminFetch<{ logo_path: string }>(
+        session,
+        `/admin/shops/${encodeURIComponent(shopId)}/logo`,
+        {
+          method: "POST",
+          body: formData,
+        }
+      );
+
+      setShop((prev) => (prev ? { ...prev, logo_path: result.logo_path } : prev));
+      setLogoFile(null);
+      setStatusText("Logo uploaded successfully.");
+    } catch (err) {
+      setStatusText(`Logo upload failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      setUploadingLogo(false);
+    }
+  }
+
+  async function handleCreateFolder(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!session || !shopId || !newFolderName.trim()) return;
+
+    setCreatingFolder(true);
+    try {
+      const created = await adminFetch<AdminFolderRow>(
+        session,
+        `/admin/shops/${encodeURIComponent(shopId)}/folders`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            name: newFolderName.trim(),
+            prompt_template: newPromptTemplate,
+          }),
+        }
+      );
+
+      setNewFolderName("");
+      setNewPromptTemplate("");
+      setFolders((prev) => [created, ...prev]);
+      if (!selectedFolderId) {
+        setSelectedFolderId(created.id);
+      }
+      setStatusText("Folder created.");
+    } catch (err) {
+      setStatusText(`Create folder failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      setCreatingFolder(false);
+    }
+  }
+
+  async function handleHeroUpload(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!session || !shopId || !heroFile || !selectedFolderId) return;
+
+    setUploadingHero(true);
+    try {
+      const formData = new FormData();
+      formData.append("folder_id", selectedFolderId);
+      formData.append("file", heroFile);
+
+      const created = await adminFetch<AdminHeroImageRow>(
+        session,
+        `/admin/shops/${encodeURIComponent(shopId)}/hero-images/upload`,
+        {
+          method: "POST",
+          body: formData,
+        }
+      );
+
+      setHeroFile(null);
+      setHeroImages((prev) => [created, ...prev]);
+      setStatusText("Hero image uploaded.");
+    } catch (err) {
+      setStatusText(`Hero upload failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      setUploadingHero(false);
+    }
+  }
+
+  async function handleCatalogBulkUpload(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!session || !shopId || !selectedFolderId || !catalogFiles.length) return;
+
+    setUploadingCatalog(true);
+    try {
+      const formData = new FormData();
+      formData.append("folder_id", selectedFolderId);
+      for (const file of catalogFiles) {
+        formData.append("files", file);
+      }
+
+      const result = await adminFetch<{
+        uploaded_count: number;
+        items: AdminCatalogImageRow[];
+      }>(
+        session,
+        `/admin/shops/${encodeURIComponent(shopId)}/catalog-images/upload-bulk`,
+        {
+          method: "POST",
+          body: formData,
+        }
+      );
+
+      setCatalogFiles([]);
+      setCatalogImages((prev) => [...result.items, ...prev]);
+      setStatusText(`Catalog upload completed. ${result.uploaded_count} image(s) added.`);
+    } catch (err) {
+      setStatusText(`Catalog upload failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      setUploadingCatalog(false);
+    }
+  }
+
+  async function handleSetDefaultHero(folderId: string, heroImageId: string) {
+    if (!session) return;
+    try {
+      const payload: AdminSetDefaultHeroRequest = {
+        default_hero_image_id: heroImageId,
+      };
+      await adminFetch(
+        session,
+        `/admin/shops/${shopId}/folders/${folderId}/default-hero`,
+        {
+          method: "PATCH",
+          body: JSON.stringify(payload),
+        }
+      );
+      // Refresh folders to show updated default
+      await loadShopData();
+      setStatusText("Default hero image updated.");
+    } catch (err) {
+      setStatusText(`Failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+  }
+
+  async function handleDeleteFolder(folderId: string, folderName: string) {
+    if (!session) return;
+    const confirmed = window.confirm(
+      `Delete garment type "${folderName}"? This cannot be undone.`
+    );
+    if (!confirmed) return;
+    try {
+      await adminFetch(
+        session,
+        `/admin/shops/${shopId}/folders/${folderId}`,
+        { method: "DELETE" }
+      );
+      setStatusText(`Deleted "${folderName}".`);
+      await loadShopData();
+    } catch (err) {
+      setStatusText(
+        `Failed to delete: ${err instanceof Error ? err.message : "Unknown error"}`
+      );
+    }
+  }
+
+  async function handleToggleSuspend() {
+    if (!session || !shopId || !shop) return;
+
+    const nextSuspended = !Boolean(shop.is_suspended);
+    const label = nextSuspended ? "suspend" : "activate";
+    const confirmed = window.confirm(`Are you sure you want to ${label} this shop?`);
+    if (!confirmed) return;
+
+    setProcessingSuspend(true);
+    try {
+      const result = await adminFetch<{ shop_id: string; is_suspended: boolean }>(
+        session,
+        `/admin/shops/${encodeURIComponent(shopId)}/suspend`,
+        {
+          method: "POST",
+          body: JSON.stringify({ suspended: nextSuspended }),
+        }
+      );
+
+      setShop((prev) => (prev ? { ...prev, is_suspended: result.is_suspended } : prev));
+      setStatusText(result.is_suspended ? "Shop suspended." : "Shop activated.");
+    } catch (err) {
+      setStatusText(`Suspend/activate failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      setProcessingSuspend(false);
+    }
+  }
+
+  async function handleDeleteShop() {
+    if (!session || !shopId || !shop) return;
+
+    const firstConfirm = window.confirm(
+      "Delete this shop permanently? This will remove all folders, hero images, generations, and credits."
+    );
+    if (!firstConfirm) return;
+
+    const secondConfirm = window.confirm("Final confirmation: this cannot be undone. Continue?");
+    if (!secondConfirm) return;
+
+    setDeletingShop(true);
+    try {
+      const result = await adminFetch<{
+        deleted: boolean;
+        shop_name: string;
+        warnings?: string[];
+      }>(session, `/admin/shops/${encodeURIComponent(shopId)}`, {
+        method: "DELETE",
+      });
+
+      if (result.warnings?.length) {
+        setStatusText(`Shop deleted with warnings: ${result.warnings.join(" | ")}`);
+      } else {
+        setStatusText(`Shop deleted: ${result.shop_name}`);
+      }
+
+      navigate("/", { replace: true });
+    } catch (err) {
+      setStatusText(`Delete failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      setDeletingShop(false);
+    }
+  }
+
+  return (
+    <main className="screen">
+      <section className="page-shell">
+        <header className="header-row">
+          <div>
+            <h1>Shop Setup</h1>
+            <p className="muted">{shop?.name || "-"}</p>
+            <p className="tiny muted">{statusText}</p>
+          </div>
+          <div className="row">
+            <Link to="/" className="btn btn-light">
+              Back to Dashboard
+            </Link>
+            <button className="btn btn-light" onClick={loadShopData} disabled={loading}>
+              {loading ? "Refreshing..." : "Refresh"}
+            </button>
+          </div>
+        </header>
+
+        <section className="card stack">
+          <h2>Shop Details</h2>
+          <p className="tiny muted">Shop ID: {shopId}</p>
+          <p className="tiny muted">Credits: {shop?.credits_balance ?? 0}</p>
+          <p className="tiny muted">Owner UID: {shop?.owner_auth_user_id || "-"}</p>
+          <p className="tiny muted">Access: {shop?.is_suspended ? "Suspended" : "Active"}</p>
+
+          <form className="stack" onSubmit={handleShopUpdate}>
+            <div className="grid-2">
+              <label className="field">
+                <span>Shop Name</span>
+                <input value={shopName} onChange={(event) => setShopName(event.target.value)} />
+              </label>
+
+              <label className="field">
+                <span>Header Text</span>
+                <input
+                  value={headerDisplayText}
+                  onChange={(event) => setHeaderDisplayText(event.target.value)}
+                  placeholder="e.g. Retero Fashion"
+                />
+              </label>
+
+              <label className="field">
+                <span>Carousel Mode Default</span>
+                <select
+                  value={carouselModeDefault ? "true" : "false"}
+                  onChange={(event) => setCarouselModeDefault(event.target.value === "true")}
+                >
+                  <option value="false">Off</option>
+                  <option value="true">On</option>
+                </select>
+              </label>
+            </div>
+
+            <button className="btn btn-dark" type="submit" disabled={savingShop}>
+              {savingShop ? "Saving..." : "Save Shop Details"}
+            </button>
+          </form>
+        </section>
+
+        <section className="card stack">
+          <h2>Access Control</h2>
+          <p className="tiny muted">Suspend disables user access while keeping data. Delete removes everything permanently.</p>
+          <div className="row">
+            <button className="btn btn-light" onClick={handleToggleSuspend} disabled={processingSuspend || deletingShop}>
+              {processingSuspend
+                ? "Updating..."
+                : shop?.is_suspended
+                  ? "Activate Shop"
+                  : "Suspend Shop"}
+            </button>
+            <button className="btn btn-danger" onClick={handleDeleteShop} disabled={deletingShop || processingSuspend}>
+              {deletingShop ? "Deleting..." : "Delete Shop"}
+            </button>
+          </div>
+        </section>
+
+        <section className="card stack">
+          <h2>Reset Shared Password</h2>
+          <form className="row" onSubmit={handlePasswordReset}>
+            <input
+              className="grow"
+              type="text"
+              placeholder="New password"
+              value={newPassword}
+              onChange={(event) => setNewPassword(event.target.value)}
+            />
+            <button className="btn btn-dark" type="submit" disabled={resettingPassword || newPassword.length < 6}>
+              {resettingPassword ? "Updating..." : "Reset Password"}
+            </button>
+          </form>
+        </section>
+
+        <section className="card stack">
+          <h2>Upload Logo</h2>
+          <p className="tiny muted">Current logo path: {shop?.logo_path || "(none)"}</p>
+          <form className="row" onSubmit={handleLogoUpload}>
+            <input type="file" accept="image/*" onChange={(event) => setLogoFile(event.target.files?.[0] || null)} />
+            <button className="btn btn-dark" type="submit" disabled={uploadingLogo || !logoFile}>
+              {uploadingLogo ? "Uploading..." : "Upload Logo"}
+            </button>
+          </form>
+        </section>
+
+        <section className="card stack">
+          <h2>Create Garment Type</h2>
+          <form className="stack" onSubmit={handleCreateFolder}>
+            <label className="field">
+              <span>Garment Type Name</span>
+              <input
+                value={newFolderName}
+                onChange={(event) => setNewFolderName(event.target.value)}
+                placeholder="e.g. Shirt, Suit"
+                disabled={creatingFolder}
+              />
+            </label>
+            <label className="field">
+              <span>Prompt Template (optional)</span>
+              <textarea
+                rows={3}
+                value={newPromptTemplate}
+                onChange={(event) => setNewPromptTemplate(event.target.value)}
+                disabled={creatingFolder}
+              />
+            </label>
+            <button className="btn btn-dark" type="submit" disabled={creatingFolder || !newFolderName.trim()}>
+              {creatingFolder ? "Creating..." : "Create Garment Type"}
+            </button>
+          </form>
+
+          <div className="stack">
+            <p className="tiny muted">Garment Types</p>
+            {folders.length === 0 ? (
+              <div className="empty-box">No folders found.</div>
+            ) : (
+              <ul className="hero-list">
+                {folders.map((folder) => (
+                  <li
+                    key={folder.id}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: "8px",
+                      padding: "4px 0",
+                    }}
+                  >
+                    <span>
+                      {folder.name}{" "}
+                      {folder.default_hero_image_id ? (
+                        <span style={{ color: "green", fontWeight: 600 }}>Default set ✓</span>
+                      ) : (
+                        <span style={{ color: "#888" }}>No default set</span>
+                      )}
+                    </span>
+                    <button
+                      onClick={() => handleDeleteFolder(folder.id, folder.name)}
+                      style={{
+                        background: "#991B1B",
+                        color: "white",
+                        border: "none",
+                        borderRadius: "6px",
+                        padding: "3px 10px",
+                        fontSize: "12px",
+                        fontWeight: 600,
+                        cursor: "pointer",
+                        flexShrink: 0,
+                      }}
+                    >
+                      Delete
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </section>
+
+        <section className="card stack">
+          <h2>Upload Hero Image</h2>
+          <div className="grid-2">
+            <label className="field">
+              <span>Select Folder</span>
+              <select
+                value={selectedFolderId}
+                onChange={(event) => setSelectedFolderId(event.target.value)}
+              >
+                <option value="">Choose folder</option>
+                {folders.map((folder) => (
+                  <option key={folder.id} value={folder.id}>
+                    {folder.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="field">
+              <span>Image File</span>
+              <input
+                type="file"
+                accept="image/*"
+                onChange={(event) => setHeroFile(event.target.files?.[0] || null)}
+              />
+            </label>
+          </div>
+
+          <form onSubmit={handleHeroUpload}>
+            <button className="btn btn-dark" type="submit" disabled={uploadingHero || !canUploadHero}>
+              {uploadingHero ? "Uploading..." : "Upload Hero Image"}
+            </button>
+          </form>
+
+          {selectedFolderId ? (
+            <div className="stack">
+              <p className="tiny muted">Recent hero images in selected folder:</p>
+              {heroImages.length === 0 ? (
+                <div className="empty-box">No hero images found.</div>
+              ) : (
+                <ul className="hero-list">
+                  {heroImages.map((row) => (
+                    <li key={row.id}>
+                      <div className="row">
+                        {heroSignedUrls[row.id] ? (
+                          <img
+                            src={heroSignedUrls[row.id]}
+                            alt={row.original_filename || "Hero image"}
+                            style={{
+                              width: 80,
+                              height: 80,
+                              objectFit: "cover",
+                              borderRadius: 12,
+                            }}
+                          />
+                        ) : (
+                          <div
+                            className="empty-box"
+                            style={{
+                              width: 80,
+                              height: 80,
+                              padding: 0,
+                              display: "grid",
+                              placeItems: "center",
+                              flex: "0 0 80px",
+                            }}
+                          >
+                            Preview
+                          </div>
+                        )}
+                        <div className="stack grow">
+                          <span>{row.original_filename || row.id}</span>
+                          <code>{row.storage_path}</code>
+                        </div>
+                        {row.id === selectedFolder?.default_hero_image_id ? (
+                          <span style={{ color: "#15803d", fontWeight: 700 }}>✓ Default</span>
+                        ) : (
+                          <button
+                            className="btn btn-light"
+                            type="button"
+                            onClick={() => void handleSetDefaultHero(selectedFolderId, row.id)}
+                          >
+                            Set as Default
+                          </button>
+                        )}
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          ) : null}
+        </section>
+
+        <section className="card stack">
+          <h2>Upload Catalog Images (Bulk)</h2>
+          <p className="tiny muted">These images appear in customer Catalog under the selected folder.</p>
+
+          <label className="field">
+            <span>Select Images (multiple)</span>
+            <input
+              type="file"
+              accept="image/*"
+              multiple
+              onChange={(event) => {
+                const nextFiles = Array.from(event.target.files ?? []);
+                setCatalogFiles(nextFiles);
+              }}
+            />
+          </label>
+
+          <form onSubmit={handleCatalogBulkUpload}>
+            <button className="btn btn-dark" type="submit" disabled={uploadingCatalog || !canUploadCatalog}>
+              {uploadingCatalog ? "Uploading..." : "Upload Catalog Images"}
+            </button>
+          </form>
+
+          {selectedFolderId ? (
+            <div className="stack">
+              <p className="tiny muted">Recent catalog images in selected folder:</p>
+              {catalogImages.length === 0 ? (
+                <div className="empty-box">No catalog images found.</div>
+              ) : (
+                <ul className="hero-list">
+                  {catalogImages.map((row) => (
+                    <li key={row.id}>
+                      <span>{row.original_filename || row.id}</span>
+                      <code>{row.storage_path}</code>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          ) : null}
+        </section>
+      </section>
+    </main>
+  );
+}
+
+=== D:\AiVastraBackend 2.3 Codex\adminPanel\src\App.tsx ===
+import { AppRouter } from "./router";
+
+export default function App() {
+  return <AppRouter />;
+}
+
+=== D:\AiVastraBackend 2.3 Codex\adminPanel\src\main.tsx ===
+import React from "react";
+import ReactDOM from "react-dom/client";
+import { BrowserRouter } from "react-router-dom";
+
+import App from "./App";
+import { AdminAuthProvider } from "./lib/auth";
+import "./styles.css";
+
+ReactDOM.createRoot(document.getElementById("root")!).render(
+  <React.StrictMode>
+    <BrowserRouter>
+      <AdminAuthProvider>
+        <App />
+      </AdminAuthProvider>
+    </BrowserRouter>
+  </React.StrictMode>
+);
+
+=== D:\AiVastraBackend 2.3 Codex\adminPanel\src\router.tsx ===
+import { Navigate, Route, Routes } from "react-router-dom";
+
+import { useAdminAuth } from "./lib/auth";
+import { AdminDashboardPage } from "./pages/AdminDashboardPage";
+import { AdminLoginPage } from "./pages/AdminLoginPage";
+import { AdminShopDetailPage } from "./pages/AdminShopDetailPage";
+
+function RequireAdminAuth({ children }: { children: React.ReactNode }) {
+  const { isAuthenticated } = useAdminAuth();
+  if (!isAuthenticated) {
+    return <Navigate to="/login" replace />;
+  }
+  return <>{children}</>;
+}
+
+function LoginRoute() {
+  const { isAuthenticated } = useAdminAuth();
+  if (isAuthenticated) {
+    return <Navigate to="/" replace />;
+  }
+  return <AdminLoginPage />;
+}
+
+export function AppRouter() {
+  return (
+    <Routes>
+      <Route path="/login" element={<LoginRoute />} />
+
+      <Route
+        path="/"
+        element={
+          <RequireAdminAuth>
+            <AdminDashboardPage />
+          </RequireAdminAuth>
+        }
+      />
+
+      <Route
+        path="/shops/:shopId"
+        element={
+          <RequireAdminAuth>
+            <AdminShopDetailPage />
+          </RequireAdminAuth>
+        }
+      />
+
+      <Route path="*" element={<Navigate to="/" replace />} />
+    </Routes>
+  );
+}
+
+=== D:\AiVastraBackend 2.3 Codex\adminPanel\eslint.config.js ===
+import js from '@eslint/js'
+import globals from 'globals'
+import reactHooks from 'eslint-plugin-react-hooks'
+import reactRefresh from 'eslint-plugin-react-refresh'
+import tseslint from 'typescript-eslint'
+import { defineConfig, globalIgnores } from 'eslint/config'
+
+export default defineConfig([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{ts,tsx}'],
+    extends: [
+      js.configs.recommended,
+      tseslint.configs.recommended,
+      reactHooks.configs.flat.recommended,
+      reactRefresh.configs.vite,
+    ],
+    languageOptions: {
+      ecmaVersion: 2020,
+      globals: globals.browser,
+    },
+  },
+])
+
+=== D:\AiVastraBackend 2.3 Codex\adminPanel\vite.config.ts ===
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+// https://vite.dev/config/
+export default defineConfig({
+  plugins: [react()],
+})
+
