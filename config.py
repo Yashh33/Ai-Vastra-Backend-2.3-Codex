@@ -19,6 +19,12 @@ class Settings(BaseSettings):
     # Used by /admin endpoints. Keep this long and private.
     ADMIN_PANEL_SECRET: str = Field(default="")
 
+    # WhatsApp Cloud API (Meta Graph API)
+    WHATSAPP_ACCESS_TOKEN: str = Field(default="")
+    WHATSAPP_PHONE_NUMBER_ID: str = Field(default="")
+    WHATSAPP_VERIFY_TOKEN: str = Field(default="")
+    WHATSAPP_GRAPH_VERSION: str = Field(default="v25.0")
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

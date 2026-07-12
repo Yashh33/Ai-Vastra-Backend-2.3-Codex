@@ -10,3 +10,4 @@ pillow==12.1.1
 python-multipart==0.0.22
 PyJWT[crypto]>=2.8
 cachetools>=5.3
+httpx>=0.27

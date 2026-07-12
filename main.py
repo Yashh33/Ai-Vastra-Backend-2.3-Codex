@@ -14,6 +14,7 @@ from generations_api import router as generations_router
 from images_api import router as images_router
 from supabase_client import get_supabase_admin_client
 from tryon_api import router as tryon_router
+from whatsapp_api import router as whatsapp_router
 
 app = FastAPI(title="Ai Vastra Backend")
 
@@ -42,6 +43,7 @@ app.include_router(images_router)
 app.include_router(generations_router)
 app.include_router(tryon_router)
 app.include_router(admin_router)
+app.include_router(whatsapp_router)
 
 
 @app.get("/health")
@@ -57,6 +59,9 @@ def health():
         ),
         "gemini_api_configured": bool(settings.GEMINI_API_KEY),
         "gemini_image_model_id": settings.GEMINI_IMAGE_MODEL_ID,
+        "whatsapp_configured": bool(
+            settings.WHATSAPP_ACCESS_TOKEN and settings.WHATSAPP_PHONE_NUMBER_ID
+        ),
     }
 
 
