@@ -2,14 +2,10 @@ from fastapi import APIRouter, BackgroundTasks, Query, Request
 from fastapi.responses import PlainTextResponse
 
 from config import get_settings
-from whatsapp_transport import parse_webhook_payload, send_text
+from whatsapp_state import handle_incoming
+from whatsapp_transport import parse_webhook_payload
 
 router = APIRouter(tags=["WhatsApp"])
-
-_UNDER_CONSTRUCTION_REPLY = (
-    "MyTryonAi bot is under construction. Aap jald hi yahan apne kapde ka "
-    "AI look bana payenge!"
-)
 
 
 @router.get("/webhook/whatsapp")
@@ -52,7 +48,6 @@ def process_webhook_events(body: dict) -> None:
                 f"text={event.get('text')} media={event.get('media_id')}"
             )
 
-            if kind == "text":
-                send_text(event.get("from_phone"), _UNDER_CONSTRUCTION_REPLY)
+            handle_incoming(event)
         except Exception as exc:
             print(f"[whatsapp] failed to process event error={exc}")
