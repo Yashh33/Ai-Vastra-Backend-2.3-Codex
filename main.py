@@ -15,6 +15,7 @@ from images_api import router as images_router
 from supabase_client import get_supabase_admin_client
 from tryon_api import router as tryon_router
 from whatsapp_api import router as whatsapp_router
+from whatsapp_watcher import start_completion_watcher
 
 app = FastAPI(title="Ai Vastra Backend")
 
@@ -44,6 +45,11 @@ app.include_router(generations_router)
 app.include_router(tryon_router)
 app.include_router(admin_router)
 app.include_router(whatsapp_router)
+
+
+@app.on_event("startup")
+async def _start_whatsapp_completion_watcher() -> None:
+    start_completion_watcher()
 
 
 @app.get("/health")
