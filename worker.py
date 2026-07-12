@@ -1,21 +1,65 @@
 import base64
 import io
+import threading
 import time
 import traceback
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 
+import httpcore
+import httpx
 from google import genai
 from google.genai import types
+from supabase import create_client
 
 from config import get_settings
 from generations_api import derive_thumb_path
-from supabase_client import get_supabase_admin_client
 
 _MAX_INPUT_IMAGE_DIMENSION = 1536
 _THUMB_MAX_WIDTH = 400
 _MAX_CONCURRENT_JOBS = 3
+
+_thread_local = threading.local()
+
+_TRANSPORT_ERRORS = (
+    httpx.ReadError,
+    httpx.RemoteProtocolError,
+    httpx.ConnectError,
+    httpcore.ReadError,
+    httpcore.RemoteProtocolError,
+    httpcore.ConnectError,
+)
+
+
+def get_supabase():
+    """Thread-local Supabase client. Each thread (main loop, each executor
+    worker thread) lazily builds and reuses its own client/connection pool
+    — sharing one client across threads races inside httpx's sync HTTP/2
+    transport and surfaces as intermittent ReadError."""
+    client = getattr(_thread_local, "client", None)
+    if client is None:
+        settings = get_settings()
+        client = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
+        _thread_local.client = client
+    return client
+
+
+def reset_thread_client() -> None:
+    _thread_local.client = None
+
+
+def call_with_retry(fn):
+    """Run a zero-arg callable that resolves its own client via
+    get_supabase(); on a transport error, drop the thread's client and
+    retry once with a fresh one."""
+    try:
+        return fn()
+    except _TRANSPORT_ERRORS as exc:
+        print(f"[worker] transport error, resetting client and retrying once: {exc}")
+        reset_thread_client()
+        time.sleep(1)
+        return fn()
 
 
 def utc_now_iso() -> str:
@@ -86,6 +130,20 @@ def claim_next_job(supabase) -> Optional[dict]:
     result = supabase.rpc("claim_next_generation_job", {}).execute()
     rows = getattr(result, "data", None) or []
     return rows[0] if rows else None
+
+
+def claim_next_job_with_retry() -> Optional[dict]:
+    try:
+        return claim_next_job(get_supabase())
+    except _TRANSPORT_ERRORS as exc:
+        print(f"[worker] transport error on claim, resetting client: {exc}")
+        reset_thread_client()
+        time.sleep(1)
+        try:
+            return claim_next_job(get_supabase())
+        except _TRANSPORT_ERRORS as exc2:
+            print(f"[worker] transport error on claim retry, giving up this tick: {exc2}")
+            return None
 
 
 def fetch_generation_assets(supabase, job: dict) -> dict:
@@ -372,7 +430,7 @@ def mark_generation_failed_with_refund(
 
 
 
-def process_job(supabase, gemini_client: genai.Client, settings, job: dict) -> None:
+def process_job(gemini_client: genai.Client, settings, job: dict) -> None:
     """Process an already-claimed job. Fully self-contained: any failure is
     caught here and routed to mark_generation_failed_with_refund, so this
     can run safely on a worker thread without taking down the pool."""
@@ -380,7 +438,7 @@ def process_job(supabase, gemini_client: genai.Client, settings, job: dict) -> N
     shop_id = str(job["shop_id"])
 
     try:
-        assets = fetch_generation_assets(supabase, job)
+        assets = call_with_retry(lambda: fetch_generation_assets(get_supabase(), job))
 
         hero = assets["hero"]
         fabrics = assets["fabrics"]
@@ -390,7 +448,9 @@ def process_job(supabase, gemini_client: genai.Client, settings, job: dict) -> N
         hero_mime = str(hero.get("mime_type") or "image/jpeg")
 
         print(f"[worker] downloading hero image: {hero_path}")
-        hero_bytes = download_storage_bytes(supabase, "hero-images", hero_path)
+        hero_bytes = call_with_retry(
+            lambda: download_storage_bytes(get_supabase(), "hero-images", hero_path)
+        )
         hero_bytes, hero_mime = downscale_image_if_needed(hero_bytes, hero_mime)
 
         fabric_inputs: list[dict[str, Any]] = []
@@ -403,7 +463,11 @@ def process_job(supabase, gemini_client: genai.Client, settings, job: dict) -> N
                 "[worker] downloading fabric image "
                 f"{idx}/{len(fabrics)} apply_to={apply_to}: {fabric_path}"
             )
-            fabric_bytes = download_storage_bytes(supabase, "fabric-images", fabric_path)
+            fabric_bytes = call_with_retry(
+                lambda fabric_path=fabric_path: download_storage_bytes(
+                    get_supabase(), "fabric-images", fabric_path
+                )
+            )
             fabric_bytes, fabric_mime = downscale_image_if_needed(fabric_bytes, fabric_mime)
             fabric_inputs.append(
                 {
@@ -427,36 +491,42 @@ def process_job(supabase, gemini_client: genai.Client, settings, job: dict) -> N
         output_path = f"{shop_id}/{generation_id}/output_v{int(time.time())}.{ext}"
 
         print(f"[worker] uploading generated output: {output_path}")
-        supabase.storage.from_("generated-outputs").upload(
-            output_path,
-            output_bytes,
-            {
-                "content-type": output_mime,
-                "upsert": "true",
-            },
+        call_with_retry(
+            lambda: get_supabase().storage.from_("generated-outputs").upload(
+                output_path,
+                output_bytes,
+                {
+                    "content-type": output_mime,
+                    "upsert": "true",
+                },
+            )
         )
 
         thumb_path = derive_thumb_path(output_path)
         try:
             thumb_bytes = build_thumbnail_jpeg_bytes(output_bytes)
-            supabase.storage.from_("generated-outputs").upload(
-                thumb_path,
-                thumb_bytes,
-                {
-                    "content-type": "image/jpeg",
-                    "upsert": "true",
-                },
+            call_with_retry(
+                lambda: get_supabase().storage.from_("generated-outputs").upload(
+                    thumb_path,
+                    thumb_bytes,
+                    {
+                        "content-type": "image/jpeg",
+                        "upsert": "true",
+                    },
+                )
             )
             print(f"[worker] uploaded thumbnail: {thumb_path}")
         except Exception as exc:
             print(f"[worker] WARNING: failed to generate/upload thumbnail for {output_path}: {exc}")
 
-        mark_generation_done(
-            supabase,
-            generation_id=generation_id,
-            shop_id=shop_id,
-            output_path=output_path,
-            external_request_id=external_request_id,
+        call_with_retry(
+            lambda: mark_generation_done(
+                get_supabase(),
+                generation_id=generation_id,
+                shop_id=shop_id,
+                output_path=output_path,
+                external_request_id=external_request_id,
+            )
         )
 
         print(f"[worker] generation done: {generation_id}")
@@ -468,7 +538,7 @@ def process_job(supabase, gemini_client: genai.Client, settings, job: dict) -> N
 
         try:
             refund_info = mark_generation_failed_with_refund(
-                supabase,
+                get_supabase(),
                 generation_id=generation_id,
                 shop_id=shop_id,
                 error_message=error_message,
@@ -487,7 +557,6 @@ def process_job(supabase, gemini_client: genai.Client, settings, job: dict) -> N
 
 def main() -> None:
     settings = get_settings()
-    supabase = get_supabase_admin_client()
 
     if not settings.GEMINI_API_KEY or settings.GEMINI_API_KEY == "PENDING_NANO_KEY":
         raise RuntimeError("Set a real GEMINI_API_KEY in backend/.env before running worker")
@@ -508,7 +577,7 @@ def main() -> None:
                 claimed_any = False
 
                 while len(in_flight) < _MAX_CONCURRENT_JOBS:
-                    job = claim_next_job(supabase)
+                    job = claim_next_job_with_retry()
                     if not job:
                         break
 
@@ -517,7 +586,7 @@ def main() -> None:
                     shop_id = str(job["shop_id"])
                     print(f"[worker] claimed generation={generation_id} shop={shop_id}")
 
-                    future = executor.submit(process_job, supabase, gemini_client, settings, job)
+                    future = executor.submit(process_job, gemini_client, settings, job)
                     in_flight.add(future)
 
                 if not claimed_any or len(in_flight) >= _MAX_CONCURRENT_JOBS:
