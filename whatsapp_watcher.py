@@ -15,6 +15,7 @@ _STUCK_PROCESSING_MINUTES = 15
 _MSG_LOOK_READY_CAPTION = (
     "Aapka look ready hai! 🎉✨\nNaya look banana ho to apne agle FABRIC ki "
     "photo bhejiye 📸"
+    "\n\n👤 Is look ko apne CUSTOMER par dekhna hai? Reply TRYON"
 )
 _MSG_LAST_FREE_LOOK = "Ye aapka aakhri free look tha 🙏 Paid plans jald aa rahe hain!"
 _MSG_GENERATION_FAILED = (
@@ -174,9 +175,8 @@ def _process_session_sync(supabase, session: dict) -> None:
             supabase,
             session["id"],
             {
-                "state": "DELIVERED",
+                "state": "OFFER_TRYON",
                 "free_generations_used": free_generations_used,
-                "active_generation_id": None,
             },
         )
 

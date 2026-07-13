@@ -1,3 +1,4 @@
+import base64
 import time
 import traceback
 from datetime import datetime, timezone
@@ -5,9 +6,21 @@ from typing import Optional
 from uuid import uuid4
 
 from config import get_settings
-from prompting import build_generation_prompt
+from prompting import build_generation_prompt, build_tryon_prompt, build_tryon_quick_prompt
 from supabase_client import get_supabase_admin_client
-from whatsapp_transport import WhatsAppTransportError, download_media, send_text
+from tryon_api import (
+    _call_gemini_tryon,
+    _downscale_image_if_needed,
+    _fetch_storage_bytes,
+    _prepare_tryon_assets_sync,
+)
+from whatsapp_transport import (
+    WhatsAppTransportError,
+    download_media,
+    send_image_by_media_id,
+    send_text,
+    upload_media,
+)
 
 _RESET_COMMANDS = {"reset", "restart", "start over"}
 _MAX_MEDIA_BYTES = 8 * 1024 * 1024
@@ -58,6 +71,45 @@ _MSG_TECH_ERROR = (
 )
 _MSG_MEDIA_TOO_LARGE = "Yeh photo bahut badi hai. Chhoti size ki photo bhejiye please 📸"
 _MSG_MEDIA_DOWNLOAD_FAILED = "Photo download nahi ho payi, dobara bhejiye please 📸"
+
+_MSG_CHOOSE_MODE = (
+    "Garment mil gaya ✅ Ab batayiye:\n\n"
+    "1️⃣ LOOK — sirf garment ka AI look\n"
+    "2️⃣ TRYON — apne CUSTOMER par pehna ke dikhao\n\n"
+    "1 ya 2 bhejein."
+)
+_MSG_CHOOSE_MODE_REPEAT = (
+    "1 ya 2 bhejein:\n\n"
+    "1️⃣ LOOK — sirf garment ka AI look\n"
+    "2️⃣ TRYON — apne CUSTOMER par pehna ke dikhao\n\n"
+    "(Type 'reset' to start over)"
+)
+_MSG_CONSENT_ASK = (
+    "Customer try-on ke liye unki permission zaroori hai 🙏 Kya customer ne "
+    "apni photo use karne ki haan boli hai? Haan ho to YES bhejein."
+)
+_MSG_CONSENT_THANKS = "Dhanyavaad ✅ Ab customer ki photo bhejiye (saamne se, poori body) 📸"
+_MSG_CONSENT_DECLINE = (
+    "Customer ki permission ke bina hum aage nahi badh sakte 🙏 Jab unki haan "
+    "ho jaaye, YES bhejein. Naya fabric try karna ho to fabric photo bhejiye."
+)
+_MSG_WAITING_CUSTOMER_PHOTO_TEXT = (
+    "Customer ki photo bhejiye please (saamne se, poori body) 📸 "
+    "(Type 'reset' to start over)"
+)
+_MSG_TRYON_PROCESSING = "Try-on ban raha hai... 🎨 1-2 minute!"
+_MSG_TRYON_RECEIVED = "Customer photo mil gayi ✅ Try-on ban raha hai 🎨 1-2 minute!"
+_MSG_TRYON_DELIVERED = (
+    "Aapke customer ka look! 🤩✨\nNaya look banana ho to agla FABRIC bhejiye 📸"
+)
+_MSG_TRYON_FAILED = (
+    "Try-on mein problem aa gayi 😔 Customer ki photo dobara bhejiye, ya naya "
+    "fabric bhejein."
+)
+_MSG_OFFER_TRYON_REPEAT = (
+    "Naya look ke liye apna agla FABRIC bhejiye, ya is look ko customer par "
+    "dekhne ke liye TRYON likhiye 📸"
+)
 
 
 def _utc_now_iso() -> str:
@@ -293,11 +345,12 @@ def _handle_garment_image(supabase, session: dict, msg: dict) -> None:
         raise RuntimeError("Failed to save hero image metadata")
     hero_image_id = str(hero_rows[0]["id"])
 
-    _update_session(supabase, session["id"], {"hero_image_id": hero_image_id})
-
-    session = dict(session)
-    session["hero_image_id"] = hero_image_id
-    create_generation_for_session(supabase, session)
+    _update_session(
+        supabase,
+        session["id"],
+        {"state": "CHOOSING_MODE", "hero_image_id": hero_image_id},
+    )
+    send_text(phone, _MSG_CHOOSE_MODE)
 
 
 def create_generation_for_session(supabase, session: dict) -> None:
@@ -379,6 +432,160 @@ def create_generation_for_session(supabase, session: dict) -> None:
     send_text(phone, _MSG_GENERATION_STARTED)
 
 
+def _log_whatsapp_consent(supabase, shop_id: str) -> None:
+    try:
+        supabase.table("customer_consent_logs").insert(
+            {
+                "shop_id": shop_id,
+                "purpose": "virtual_tryon_whatsapp",
+                "confirmed_by_staff": False,
+            }
+        ).execute()
+    except Exception as exc:
+        print(f"[whatsapp_state] consent log insert failed: {exc}")
+
+
+def _start_consent_flow(supabase, session: dict) -> None:
+    send_text(session["phone_number"], _MSG_CONSENT_ASK)
+    _update_session(supabase, session["id"], {"state": "WAITING_CONSENT"})
+
+
+def _prepare_direct_tryon_assets(
+    supabase, shop_id: str, hero_image_id: str, fabric_image_id: str
+) -> tuple[bytes, str, bytes, str]:
+    hero_result = (
+        supabase.table("hero_images")
+        .select("id, storage_path, mime_type")
+        .eq("id", hero_image_id)
+        .eq("shop_id", shop_id)
+        .limit(1)
+        .execute()
+    )
+    hero_rows = getattr(hero_result, "data", None) or []
+    if not hero_rows:
+        raise RuntimeError("Hero image not found for direct try-on")
+    hero = hero_rows[0]
+
+    fabric_result = (
+        supabase.table("fabric_images")
+        .select("id, storage_path, mime_type")
+        .eq("id", fabric_image_id)
+        .eq("shop_id", shop_id)
+        .limit(1)
+        .execute()
+    )
+    fabric_rows = getattr(fabric_result, "data", None) or []
+    if not fabric_rows:
+        raise RuntimeError("Fabric image not found for direct try-on")
+    fabric = fabric_rows[0]
+
+    hero_bytes = _fetch_storage_bytes(supabase, "hero-images", hero["storage_path"])
+    fabric_bytes = _fetch_storage_bytes(supabase, "fabric-images", fabric["storage_path"])
+
+    return (
+        hero_bytes,
+        str(hero.get("mime_type") or "image/jpeg"),
+        fabric_bytes,
+        str(fabric.get("mime_type") or "image/jpeg"),
+    )
+
+
+def run_tryon_for_session(
+    supabase, session: dict, media_id: Optional[str], mime_type: Optional[str]
+) -> None:
+    phone = session["phone_number"]
+    session_id = session["id"]
+    shop_id = session["shop_id"]
+
+    _update_session(supabase, session_id, {"state": "TRYON_PROCESSING"})
+    send_text(phone, _MSG_TRYON_RECEIVED)
+
+    generation_id = session.get("active_generation_id")
+    is_direct = not generation_id
+    balance_before: Optional[int] = None
+
+    try:
+        if not media_id:
+            raise RuntimeError("Missing media_id for customer photo")
+
+        # Customer photo lives only in these local variables for the
+        # duration of this call — never written to storage, DB, or logs.
+        customer_bytes, downloaded_mime = download_media(media_id)
+        customer_mime = downloaded_mime or mime_type or "image/jpeg"
+
+        if len(customer_bytes) > _MAX_MEDIA_BYTES:
+            raise RuntimeError("Customer photo too large")
+
+        customer_bytes, customer_mime = _downscale_image_if_needed(customer_bytes, customer_mime)
+
+        if is_direct:
+            folder_result = (
+                supabase.table("hero_folders")
+                .select("id, name")
+                .eq("id", session["folder_id"])
+                .eq("shop_id", shop_id)
+                .limit(1)
+                .execute()
+            )
+            folder_rows = getattr(folder_result, "data", None) or []
+            folder_name = folder_rows[0].get("name") if folder_rows else None
+
+            hero_bytes, hero_mime, fabric_bytes, fabric_mime = _prepare_direct_tryon_assets(
+                supabase, shop_id, session["hero_image_id"], session["fabric_image_id"]
+            )
+            hero_bytes, hero_mime = _downscale_image_if_needed(hero_bytes, hero_mime)
+            fabric_bytes, fabric_mime = _downscale_image_if_needed(fabric_bytes, fabric_mime)
+
+            balance_before = _get_shop_balance(supabase, shop_id)
+            if balance_before < 1:
+                send_text(phone, _MSG_NO_CREDITS)
+                _update_session(supabase, session_id, {"state": "DELIVERED"})
+                return
+
+            prompt = build_tryon_quick_prompt(folder_name=folder_name)
+            image_parts = [
+                (hero_bytes, hero_mime),
+                (fabric_bytes, fabric_mime),
+                (customer_bytes, customer_mime),
+            ]
+        else:
+            garment_bytes, folder_name = _prepare_tryon_assets_sync(supabase, shop_id, generation_id)
+            garment_bytes, garment_mime = _downscale_image_if_needed(garment_bytes, "image/jpeg")
+
+            prompt = build_tryon_prompt(folder_name=folder_name)
+            image_parts = [
+                (customer_bytes, customer_mime),
+                (garment_bytes, garment_mime),
+            ]
+
+        result = _call_gemini_tryon(prompt=prompt, image_parts=image_parts)
+        result_bytes = base64.b64decode(result.result_b64)
+
+        result_media_id = upload_media(result_bytes, result.result_mime)
+        send_image_by_media_id(phone, result_media_id, caption=_MSG_TRYON_DELIVERED)
+    except Exception as exc:
+        print(f"[whatsapp_state] tryon failed for session {session_id}: {exc}")
+        send_text(phone, _MSG_TRYON_FAILED)
+        _update_session(supabase, session_id, {"state": "WAITING_CUSTOMER_PHOTO"})
+        return
+
+    update_payload = {"state": "DELIVERED", "active_generation_id": None}
+
+    if is_direct:
+        new_balance = (balance_before or 0) - 1
+        supabase.table("credit_ledger").insert(
+            {
+                "shop_id": shop_id,
+                "delta": -1,
+                "reason": "whatsapp_direct_tryon",
+                "balance_after": new_balance,
+            }
+        ).execute()
+        update_payload["free_generations_used"] = int(session.get("free_generations_used") or 0) + 1
+
+    _update_session(supabase, session_id, update_payload)
+
+
 def _dispatch(supabase, session: dict, msg: dict) -> None:
     phone = session["phone_number"]
     session_id = session["id"]
@@ -415,6 +622,57 @@ def _dispatch(supabase, session: dict, msg: dict) -> None:
             _update_session(supabase, session_id, {})
         else:
             send_text(phone, _MSG_ONLY_PHOTO)
+            _update_session(supabase, session_id, {})
+        return
+
+    if state == "CHOOSING_MODE":
+        normalized = text.lower()
+        if kind == "text" and normalized in {"1", "look"}:
+            create_generation_for_session(supabase, session)
+        elif kind == "text" and normalized in {"2", "tryon", "try on"}:
+            _start_consent_flow(supabase, session)
+        else:
+            send_text(phone, _MSG_CHOOSE_MODE_REPEAT)
+            _update_session(supabase, session_id, {})
+        return
+
+    if state == "WAITING_CONSENT":
+        normalized = text.lower()
+        if kind == "text" and normalized in {"yes", "haan"}:
+            _log_whatsapp_consent(supabase, session["shop_id"])
+            send_text(phone, _MSG_CONSENT_THANKS)
+            _update_session(supabase, session_id, {"state": "WAITING_CUSTOMER_PHOTO"})
+        elif kind == "image":
+            _handle_fabric_image(supabase, session, msg)
+        else:
+            send_text(phone, _MSG_CONSENT_DECLINE)
+            _update_session(supabase, session_id, {})
+        return
+
+    if state == "WAITING_CUSTOMER_PHOTO":
+        if kind == "image":
+            run_tryon_for_session(supabase, session, msg.get("media_id"), msg.get("mime_type"))
+        elif kind == "text":
+            send_text(phone, _MSG_WAITING_CUSTOMER_PHOTO_TEXT)
+            _update_session(supabase, session_id, {})
+        else:
+            send_text(phone, _MSG_ONLY_PHOTO)
+            _update_session(supabase, session_id, {})
+        return
+
+    if state == "TRYON_PROCESSING":
+        send_text(phone, _MSG_TRYON_PROCESSING)
+        _update_session(supabase, session_id, {})
+        return
+
+    if state == "OFFER_TRYON":
+        normalized = text.lower()
+        if kind == "text" and normalized in {"tryon", "try on"}:
+            _start_consent_flow(supabase, session)
+        elif kind == "image":
+            _handle_fabric_image(supabase, session, msg)
+        else:
+            send_text(phone, _MSG_OFFER_TRYON_REPEAT)
             _update_session(supabase, session_id, {})
         return
 

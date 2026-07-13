@@ -114,6 +114,50 @@ def send_text(to_phone: str, body: str) -> None:
         print(f"[whatsapp_transport] send_text raised to={to_phone} error={exc}")
 
 
+def upload_media(image_bytes: bytes, mime_type: str) -> str:
+    settings = get_settings()
+    url = f"{GRAPH_BASE}/{settings.WHATSAPP_PHONE_NUMBER_ID}/media"
+    data = {"messaging_product": "whatsapp", "type": mime_type}
+    files = {"file": ("upload", image_bytes, mime_type)}
+
+    try:
+        response = _client.post(url, headers=_auth_headers(), data=data, files=files)
+    except Exception as exc:
+        raise WhatsAppTransportError(f"upload_media raised: {exc}")
+
+    if response.status_code != 200:
+        raise WhatsAppTransportError(
+            f"upload_media failed status={response.status_code} body={response.text}"
+        )
+
+    media_id = response.json().get("id")
+    if not media_id:
+        raise WhatsAppTransportError("upload_media response missing media id")
+
+    return media_id
+
+
+def send_image_by_media_id(to_phone: str, media_id: str, caption: str = "") -> None:
+    settings = get_settings()
+    url = f"{GRAPH_BASE}/{settings.WHATSAPP_PHONE_NUMBER_ID}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_phone,
+        "type": "image",
+        "image": {"id": media_id, "caption": caption},
+    }
+
+    try:
+        response = _client.post(url, headers=_auth_headers(), json=payload)
+    except Exception as exc:
+        raise WhatsAppTransportError(f"send_image_by_media_id raised: {exc}")
+
+    if response.status_code != 200:
+        raise WhatsAppTransportError(
+            f"send_image_by_media_id failed status={response.status_code} body={response.text}"
+        )
+
+
 def send_image_by_link(to_phone: str, image_url: str, caption: str = "") -> None:
     settings = get_settings()
     url = f"{GRAPH_BASE}/{settings.WHATSAPP_PHONE_NUMBER_ID}/messages"
