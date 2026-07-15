@@ -39,7 +39,7 @@ def process_webhook_events(body: dict) -> None:
     for event in events:
         kind = event.get("kind")
 
-        if kind not in ("text", "image"):
+        if kind not in ("text", "image", "interactive"):
             continue
 
         try:

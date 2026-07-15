@@ -18,12 +18,16 @@ from whatsapp_transport import (
     WhatsAppTransportError,
     download_media,
     send_image_by_media_id,
+    send_interactive_list,
     send_text,
     upload_media,
 )
 
 _RESET_COMMANDS = {"reset", "restart", "start over"}
 _MAX_MEDIA_BYTES = 8 * 1024 * 1024
+
+_MASTER_TEMPLATE_CACHE_TTL_SECONDS = 300
+_master_template_cache: dict = {"data": None, "loaded_at": 0.0}
 
 _FABRIC_PROMPT_TEMPLATE = (
     "Photorealistic recreation of the garment shown in the reference photo, "
@@ -34,10 +38,9 @@ _FABRIC_PROMPT_TEMPLATE = (
 
 _MSG_GREETING = (
     "Namaste {name}! 🙏 Main MyTryonAi hoon. Aapke fabric ko kisi bhi garment "
-    "mein AI se dikha sakta hoon.\n\nShuru karne ke liye apne FABRIC (kapde) "
-    "ki photo bhejiye 📸"
+    "mein AI se dikha sakta hoon."
 )
-_MSG_RESET = "Theek hai, fresh start! Apne FABRIC (kapde) ki photo bhejiye 📸"
+_MSG_RESET = "Theek hai, fresh start! 🔄"
 _MSG_ONLY_PHOTO = "Sirf photo bhejiye please 📸"
 _MSG_WAITING_FABRIC_TEXT = (
     "Pehle apne fabric ki PHOTO bhejiye 📸 (Type 'reset' to start over)"
@@ -49,11 +52,34 @@ _MSG_FABRIC_RECEIVED = (
     "Fabric mil gaya ✅ Ab GARMENT ki photo bhejiye — jo design/style aap "
     "banana chahte ho (koi bhi suit, sherwani, shirt ki reference photo) 👔"
 )
+_MSG_GARMENT_RECEIVED_NEED_FABRIC = "Garment mil gaya ✅ Ab apne FABRIC ki photo bhejiye 📸"
+
+_MSG_GARMENT_MENU_HEADER = "Garment Type"
+_MSG_GARMENT_MENU_BODY = (
+    "Konsa garment banwana hai? Neeche list se choose karein 👇\n\n"
+    "Apna khud ka garment chahiye? 'custom' likhein."
+)
+_MSG_GARMENT_MENU_BUTTON = "Choose"
+_MSG_GARMENT_MENU_INVALID = (
+    "Sahi option list se choose karein, ya number bhejein 👆 "
+    "(Apna khud ka garment chahiye to 'custom' likhein)"
+)
+_MSG_GARMENT_CHOSEN_TEMPLATE = "{garment} select ho gaya ✅ Ab apne FABRIC ki photo bhejiye 📸"
+_MSG_ENHANCED_LOCKED = (
+    "Custom garment design Enhanced plan mein milta hai ⭐ Interested ho to "
+    "reply karein, hum aapko details bhejenge!"
+)
+_MSG_ENHANCED_UNLOCKED = "Apne GARMENT ki reference photo bhejiye 👔"
+_MSG_MENU_HINT_SUFFIX = "\n\nDoosra garment chahiye? 'menu' bhejein."
+
 _MSG_PROCESSING = (
     "Aapka look ban raha hai... 🎨 2-3 minute lagenge. Ready hote hi yahin "
     "bhej dunga!"
 )
-_MSG_DELIVERED_TEXT = "Naya look banana ho to apne agle FABRIC ki photo bhejiye 📸"
+_MSG_DELIVERED_TEXT = (
+    "Naya look banana ho to apne agle FABRIC ki photo bhejiye 📸 "
+    "(Ya 'menu' bhejein doosra garment choose karne ke liye)"
+)
 _MSG_NO_CREDITS = (
     "Aapke 3 free looks complete ho gaye 🙏 Paid credits jald aa rahe hain — "
     "thoda intezaar kijiye, hum aapko yahin batayenge!"
@@ -63,8 +89,7 @@ _MSG_GENERATION_STARTED = (
     "Ready hote hi photo yahin aa jayegi!"
 )
 _MSG_ERROR_RECOVERY = (
-    "Maaf kijiye, kuch problem ho gayi thi 😔 Chaliye phir se shuru karte hain "
-    "— apne FABRIC (kapde) ki photo bhejiye 📸"
+    "Maaf kijiye, kuch problem ho gayi thi 😔 Chaliye phir se shuru karte hain."
 )
 _MSG_TECH_ERROR = (
     "Kuch technical problem aa gayi 😔 'reset' bhej ke dobara try kijiye."
@@ -107,8 +132,8 @@ _MSG_TRYON_FAILED = (
     "fabric bhejein."
 )
 _MSG_OFFER_TRYON_REPEAT = (
-    "Naya look ke liye apna agla FABRIC bhejiye, ya is look ko customer par "
-    "dekhne ke liye TRYON likhiye 📸"
+    "Naya look ke liye apna agla FABRIC bhejiye, is look ko customer par "
+    "dekhne ke liye TRYON likhiye, ya doosra garment ke liye 'menu' bhejein 📸"
 )
 
 
@@ -143,6 +168,125 @@ def _update_session(supabase, session_id: str, payload: dict) -> None:
     payload = dict(payload)
     payload["last_message_at"] = _utc_now_iso()
     supabase.table("whatsapp_sessions").update(payload).eq("id", session_id).execute()
+
+
+def _load_master_templates(supabase) -> list[dict]:
+    settings = get_settings()
+    master_shop_id = settings.MASTER_SHOP_ID
+    if not master_shop_id:
+        raise RuntimeError("MASTER_SHOP_ID is not configured")
+
+    folder_result = (
+        supabase.table("hero_folders")
+        .select("id, name")
+        .eq("shop_id", master_shop_id)
+        .eq("is_active", True)
+        .order("name")
+        .execute()
+    )
+    folder_rows = getattr(folder_result, "data", None) or []
+    if not folder_rows:
+        return []
+
+    folder_ids = [str(row["id"]) for row in folder_rows]
+    hero_result = (
+        supabase.table("hero_images")
+        .select("id, folder_id, storage_path, mime_type")
+        .eq("shop_id", master_shop_id)
+        .in_("folder_id", folder_ids)
+        .execute()
+    )
+    hero_rows = getattr(hero_result, "data", None) or []
+    hero_by_folder = {str(row["folder_id"]): row for row in hero_rows}
+
+    templates: list[dict] = []
+    for folder in folder_rows:
+        folder_id = str(folder["id"])
+        hero = hero_by_folder.get(folder_id)
+        if not hero:
+            # Folder has no hero image yet — not selectable in the menu.
+            continue
+        templates.append(
+            {
+                "folder_id": folder_id,
+                "name": str(folder["name"]),
+                "hero_storage_path": str(hero["storage_path"]),
+                "hero_mime_type": str(hero.get("mime_type") or "image/jpeg"),
+            }
+        )
+
+    return templates
+
+
+def get_master_templates(supabase) -> list[dict]:
+    """Master garment-type list for the BASIC menu, cached in memory with a
+    short TTL so new garment types added to the master shop show up without
+    a redeploy."""
+    now = time.time()
+    cached = _master_template_cache["data"]
+    if cached is not None and (now - _master_template_cache["loaded_at"]) < _MASTER_TEMPLATE_CACHE_TTL_SECONDS:
+        return cached
+
+    templates = _load_master_templates(supabase)
+    _master_template_cache["data"] = templates
+    _master_template_cache["loaded_at"] = now
+    return templates
+
+
+def _resolve_shadow_hero_image(supabase, *, shop_id: str, folder_id: str, template: dict) -> str:
+    """fetch_generation_assets in worker.py scopes hero_images lookups by
+    shop_id, so a shadow-shop generation cannot reference the master shop's
+    hero_image_id directly. Lazily copy the row (same storage_path, no file
+    copy) into the shadow shop the first time a garment type is picked, and
+    reuse it by storage_path afterwards."""
+    storage_path = template["hero_storage_path"]
+
+    existing = (
+        supabase.table("hero_images")
+        .select("id")
+        .eq("shop_id", shop_id)
+        .eq("storage_path", storage_path)
+        .limit(1)
+        .execute()
+    )
+    existing_rows = getattr(existing, "data", None) or []
+    if existing_rows:
+        return str(existing_rows[0]["id"])
+
+    payload = {
+        "shop_id": shop_id,
+        "folder_id": folder_id,
+        "storage_path": storage_path,
+        "original_filename": f"master-{template['name']}",
+        "mime_type": template.get("hero_mime_type") or "image/jpeg",
+        "file_size_bytes": None,
+        "width": None,
+        "height": None,
+    }
+    result = supabase.table("hero_images").insert(payload).execute()
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise RuntimeError("Failed to copy master hero image into shadow shop")
+    return str(rows[0]["id"])
+
+
+def _send_garment_menu(supabase, session: dict, *, extra_fields: Optional[dict] = None) -> None:
+    phone = session["phone_number"]
+    templates = get_master_templates(supabase)
+    rows = [{"id": t["folder_id"], "title": t["name"]} for t in templates]
+
+    send_interactive_list(
+        phone,
+        header=_MSG_GARMENT_MENU_HEADER,
+        body=_MSG_GARMENT_MENU_BODY,
+        button_label=_MSG_GARMENT_MENU_BUTTON,
+        rows=rows,
+    )
+
+    payload = {"state": "CHOOSING_GARMENT"}
+    if extra_fields:
+        payload.update(extra_fields)
+    _update_session(supabase, session["id"], payload)
 
 
 def _create_session_with_shadow_shop(supabase, phone: str, profile_name: Optional[str]) -> dict:
@@ -217,22 +361,23 @@ def get_or_create_session(phone: str, profile_name: Optional[str]) -> dict:
     return _create_session_with_shadow_shop(supabase, phone, profile_name)
 
 
-def _reset_to_waiting_fabric(supabase, session: dict, *, reply: str) -> None:
-    _update_session(
+def _reset_to_choosing_garment(supabase, session: dict, *, reply: str) -> None:
+    send_text(session["phone_number"], reply)
+    _send_garment_menu(
         supabase,
-        session["id"],
-        {
-            "state": "WAITING_FABRIC",
+        session,
+        extra_fields={
             "fabric_image_id": None,
             "hero_image_id": None,
             "active_generation_id": None,
             "error_detail": None,
         },
     )
-    send_text(session["phone_number"], reply)
 
 
-def _handle_fabric_image(supabase, session: dict, msg: dict) -> None:
+def _handle_fabric_image(
+    supabase, session: dict, msg: dict, *, mode_menu_suffix: str = ""
+) -> None:
     phone = session["phone_number"]
     shop_id = session["shop_id"]
     media_id = msg.get("media_id")
@@ -281,17 +426,30 @@ def _handle_fabric_image(supabase, session: dict, msg: dict) -> None:
         raise RuntimeError("Failed to save fabric image metadata")
     fabric_image_id = str(fabric_rows[0]["id"])
 
-    _update_session(
-        supabase,
-        session["id"],
-        {
-            "state": "WAITING_GARMENT",
-            "fabric_image_id": fabric_image_id,
-            "hero_image_id": None,
-            "active_generation_id": None,
-        },
-    )
-    send_text(phone, _MSG_FABRIC_RECEIVED)
+    if session.get("hero_image_id"):
+        # Garment already resolved (BASIC menu pick or a completed ENHANCED
+        # custom-garment upload) — skip straight to the mode menu.
+        _update_session(
+            supabase,
+            session["id"],
+            {
+                "state": "CHOOSING_MODE",
+                "fabric_image_id": fabric_image_id,
+                "active_generation_id": None,
+            },
+        )
+        send_text(phone, _MSG_CHOOSE_MODE + mode_menu_suffix)
+    else:
+        _update_session(
+            supabase,
+            session["id"],
+            {
+                "state": "WAITING_GARMENT",
+                "fabric_image_id": fabric_image_id,
+                "active_generation_id": None,
+            },
+        )
+        send_text(phone, _MSG_FABRIC_RECEIVED)
 
 
 def _handle_garment_image(supabase, session: dict, msg: dict) -> None:
@@ -345,12 +503,23 @@ def _handle_garment_image(supabase, session: dict, msg: dict) -> None:
         raise RuntimeError("Failed to save hero image metadata")
     hero_image_id = str(hero_rows[0]["id"])
 
-    _update_session(
-        supabase,
-        session["id"],
-        {"state": "CHOOSING_MODE", "hero_image_id": hero_image_id},
-    )
-    send_text(phone, _MSG_CHOOSE_MODE)
+    if session.get("fabric_image_id"):
+        _update_session(
+            supabase,
+            session["id"],
+            {"state": "CHOOSING_MODE", "hero_image_id": hero_image_id},
+        )
+        send_text(phone, _MSG_CHOOSE_MODE)
+    else:
+        # ENHANCED entry: garment reference is resolved before fabric —
+        # a generation needs both, so collect fabric next rather than
+        # jumping straight to the mode menu.
+        _update_session(
+            supabase,
+            session["id"],
+            {"state": "WAITING_FABRIC", "hero_image_id": hero_image_id},
+        )
+        send_text(phone, _MSG_GARMENT_RECEIVED_NEED_FABRIC)
 
 
 def create_generation_for_session(supabase, session: dict) -> None:
@@ -594,13 +763,62 @@ def _dispatch(supabase, session: dict, msg: dict) -> None:
     state = session.get("state") or "NEW"
 
     if kind == "text" and text.lower() in _RESET_COMMANDS:
-        _reset_to_waiting_fabric(supabase, session, reply=_MSG_RESET)
+        _reset_to_choosing_garment(supabase, session, reply=_MSG_RESET)
         return
 
     if state == "NEW":
         name = session.get("profile_name") or msg.get("profile_name") or "dost"
         send_text(phone, _MSG_GREETING.format(name=name))
-        _update_session(supabase, session_id, {"state": "WAITING_FABRIC"})
+        _send_garment_menu(supabase, session)
+        return
+
+    if state == "CHOOSING_GARMENT":
+        normalized = text.lower()
+
+        if kind == "text" and normalized == "custom":
+            if session.get("enhanced_enabled"):
+                send_text(phone, _MSG_ENHANCED_UNLOCKED)
+                _update_session(supabase, session_id, {"state": "WAITING_GARMENT"})
+            else:
+                send_text(phone, _MSG_ENHANCED_LOCKED)
+                _update_session(supabase, session_id, {})
+            return
+
+        templates = get_master_templates(supabase)
+        template = None
+
+        if kind == "interactive":
+            reply_id = msg.get("reply_id")
+            template = next((t for t in templates if t["folder_id"] == reply_id), None)
+        elif kind == "text" and normalized.isdigit():
+            idx = int(normalized)
+            if 1 <= idx <= len(templates):
+                template = templates[idx - 1]
+
+        if template is None:
+            send_text(phone, _MSG_GARMENT_MENU_INVALID)
+            _update_session(supabase, session_id, {})
+            return
+
+        try:
+            hero_image_id = _resolve_shadow_hero_image(
+                supabase,
+                shop_id=session["shop_id"],
+                folder_id=session["folder_id"],
+                template=template,
+            )
+        except Exception as exc:
+            print(f"[whatsapp_state] failed to resolve master hero image: {exc}")
+            send_text(phone, _MSG_TECH_ERROR)
+            _update_session(supabase, session_id, {})
+            return
+
+        _update_session(
+            supabase,
+            session_id,
+            {"state": "WAITING_FABRIC", "hero_image_id": hero_image_id},
+        )
+        send_text(phone, _MSG_GARMENT_CHOSEN_TEMPLATE.format(garment=template["name"]))
         return
 
     if state == "WAITING_FABRIC":
@@ -669,8 +887,10 @@ def _dispatch(supabase, session: dict, msg: dict) -> None:
         normalized = text.lower()
         if kind == "text" and normalized in {"tryon", "try on"}:
             _start_consent_flow(supabase, session)
+        elif kind == "text" and normalized == "menu":
+            _send_garment_menu(supabase, session)
         elif kind == "image":
-            _handle_fabric_image(supabase, session, msg)
+            _handle_fabric_image(supabase, session, msg, mode_menu_suffix=_MSG_MENU_HINT_SUFFIX)
         else:
             send_text(phone, _MSG_OFFER_TRYON_REPEAT)
             _update_session(supabase, session_id, {})
@@ -682,8 +902,11 @@ def _dispatch(supabase, session: dict, msg: dict) -> None:
         return
 
     if state == "DELIVERED":
-        if kind == "image":
-            _handle_fabric_image(supabase, session, msg)
+        normalized = text.lower()
+        if kind == "text" and normalized == "menu":
+            _send_garment_menu(supabase, session)
+        elif kind == "image":
+            _handle_fabric_image(supabase, session, msg, mode_menu_suffix=_MSG_MENU_HINT_SUFFIX)
         elif kind == "text":
             send_text(phone, _MSG_DELIVERED_TEXT)
             _update_session(supabase, session_id, {})
@@ -693,11 +916,11 @@ def _dispatch(supabase, session: dict, msg: dict) -> None:
         return
 
     if state == "ERROR":
-        _reset_to_waiting_fabric(supabase, session, reply=_MSG_ERROR_RECOVERY)
+        _reset_to_choosing_garment(supabase, session, reply=_MSG_ERROR_RECOVERY)
         return
 
     # Unknown/legacy state: recover into a known-good state.
-    _reset_to_waiting_fabric(supabase, session, reply=_MSG_ERROR_RECOVERY)
+    _reset_to_choosing_garment(supabase, session, reply=_MSG_ERROR_RECOVERY)
 
 
 def handle_incoming(msg: dict) -> None:

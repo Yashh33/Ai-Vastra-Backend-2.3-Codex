@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     WHATSAPP_VERIFY_TOKEN: str = Field(default="")
     WHATSAPP_GRAPH_VERSION: str = Field(default="v25.0")
 
+    # Shop that holds the fixed-garment-menu master templates (one
+    # hero_folders row + one hero_images row per garment type).
+    MASTER_SHOP_ID: str = Field(default="")
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

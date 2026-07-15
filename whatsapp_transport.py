@@ -42,6 +42,7 @@ def parse_webhook_payload(body: dict) -> list[dict]:
                     text = None
                     media_id = None
                     mime_type = None
+                    reply_id = None
 
                     if msg_type == "text":
                         kind = "text"
@@ -51,6 +52,12 @@ def parse_webhook_payload(body: dict) -> list[dict]:
                         image = message.get("image") or {}
                         media_id = image.get("id")
                         mime_type = image.get("mime_type")
+                    elif msg_type == "interactive":
+                        kind = "interactive"
+                        interactive = message.get("interactive") or {}
+                        list_reply = interactive.get("list_reply") or {}
+                        button_reply = interactive.get("button_reply") or {}
+                        reply_id = list_reply.get("id") or button_reply.get("id")
                     else:
                         kind = "other"
 
@@ -63,6 +70,7 @@ def parse_webhook_payload(body: dict) -> list[dict]:
                             "text": text,
                             "media_id": media_id,
                             "mime_type": mime_type,
+                            "reply_id": reply_id,
                         }
                     )
     except Exception:
@@ -112,6 +120,63 @@ def send_text(to_phone: str, body: str) -> None:
             )
     except Exception as exc:
         print(f"[whatsapp_transport] send_text raised to={to_phone} error={exc}")
+
+
+def _build_numbered_menu_text(body: str, rows: list[dict]) -> str:
+    lines = [body, ""]
+    for idx, row in enumerate(rows, start=1):
+        lines.append(f"{idx}. {row.get('title', '')}")
+    lines.append("")
+    lines.append("Reply with a number.")
+    return "\n".join(lines)
+
+
+def send_interactive_list(
+    to_phone: str,
+    header: str,
+    body: str,
+    button_label: str,
+    rows: list[dict],
+) -> None:
+    """Send a WhatsApp interactive list message (max 10 rows). On any
+    failure (non-200 response or transport exception), falls back to a
+    plain numbered-menu text message built from the same rows, so the
+    flow never dead-ends on clients/accounts that reject interactive
+    messages."""
+    settings = get_settings()
+    url = f"{GRAPH_BASE}/{settings.WHATSAPP_PHONE_NUMBER_ID}/messages"
+
+    capped_rows = rows[:10]
+    list_rows = [
+        {"id": str(row["id"]), "title": str(row["title"])[:24]} for row in capped_rows
+    ]
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_phone,
+        "type": "interactive",
+        "interactive": {
+            "type": "list",
+            "header": {"type": "text", "text": header},
+            "body": {"text": body},
+            "action": {
+                "button": button_label,
+                "sections": [{"title": header, "rows": list_rows}],
+            },
+        },
+    }
+
+    try:
+        response = _client.post(url, headers=_auth_headers(), json=payload)
+        if response.status_code != 200:
+            print(
+                f"[whatsapp_transport] send_interactive_list failed to={to_phone} "
+                f"status={response.status_code} body={response.text}"
+            )
+            send_text(to_phone, _build_numbered_menu_text(body, capped_rows))
+    except Exception as exc:
+        print(f"[whatsapp_transport] send_interactive_list raised to={to_phone} error={exc}")
+        send_text(to_phone, _build_numbered_menu_text(body, capped_rows))
 
 
 def upload_media(image_bytes: bytes, mime_type: str) -> str:
