@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     SUPABASE_SERVICE_ROLE_KEY: str
 
     GEMINI_API_KEY: str
-    GEMINI_IMAGE_MODEL_ID: str = "gemini-3-pro-image-preview"
+    GEMINI_IMAGE_MODEL_ID: str = "gemini-3.1-flash-image-preview"
 
     CREDITS_PER_GENERATION: int = Field(default=1, gt=0)
     WORKER_POLL_INTERVAL_SECONDS: float = Field(default=3, gt=0)
