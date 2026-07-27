@@ -12,6 +12,7 @@ from folders_api import router as folders_router
 from garment_types_api import router as garment_types_router
 from generations_api import router as generations_router
 from images_api import router as images_router
+from payments_api import router as payments_router
 from supabase_client import get_supabase_admin_client
 from tryon_api import router as tryon_router
 from whatsapp_api import router as whatsapp_router
@@ -45,6 +46,7 @@ app.include_router(generations_router)
 app.include_router(tryon_router)
 app.include_router(admin_router)
 app.include_router(whatsapp_router)
+app.include_router(payments_router)
 
 
 @app.on_event("startup")

@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     # hero_folders row + one hero_images row per garment type).
     MASTER_SHOP_ID: str = Field(default="")
 
+    # Razorpay (shared by React checkout and WhatsApp payment links)
+    RAZORPAY_KEY_ID: str = Field(default="")
+    RAZORPAY_KEY_SECRET: str = Field(default="")
+    RAZORPAY_WEBHOOK_SECRET: str = Field(default="")
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
