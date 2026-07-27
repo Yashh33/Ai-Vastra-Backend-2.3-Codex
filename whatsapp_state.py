@@ -6,6 +6,7 @@ from typing import Optional
 from uuid import uuid4
 
 from config import get_settings
+from payments_api import CREDIT_PACKS, create_payment_link_for_shop
 from prompting import build_generation_prompt, build_tryon_prompt, build_tryon_quick_prompt
 from supabase_client import get_supabase_admin_client
 from tryon_api import (
@@ -24,6 +25,7 @@ from whatsapp_transport import (
 )
 
 _RESET_COMMANDS = {"reset", "restart", "start over"}
+_BUY_PACK_ID = "starter"
 _MAX_MEDIA_BYTES = 8 * 1024 * 1024
 
 _MASTER_TEMPLATE_CACHE_TTL_SECONDS = 300
@@ -80,10 +82,21 @@ _MSG_DELIVERED_TEXT = (
     "Naya look banana ho to apne agle FABRIC ki photo bhejiye 📸 "
     "(Ya 'menu' bhejein doosra garment choose karne ke liye)"
 )
+_BUY_PACK = CREDIT_PACKS[_BUY_PACK_ID]
+_BUY_PACK_CREDITS = _BUY_PACK["credits"]
+_BUY_PACK_RUPEES = _BUY_PACK["amount_paise"] // 100
+
 _MSG_NO_CREDITS = (
-    "Aapke 3 free looks complete ho gaye 🙏 Paid credits jald aa rahe hain — "
-    "thoda intezaar kijiye, hum aapko yahin batayenge!"
+    f"Aapke free looks complete ho gaye 🎉\n\n"
+    f"{_BUY_PACK_CREDITS} aur looks sirf Rs.{_BUY_PACK_RUPEES} mein! "
+    "Lene ke liye 'BUY' likhein 💳"
 )
+_MSG_BUY_OFFER_TEMPLATE = (
+    "{credits} looks ka pack - sirf Rs.{rupees} 💳\n\n"
+    "Yahan pay karein:\n{short_url}\n\n"
+    "Payment ke baad looks turant add ho jaayenge!"
+)
+_MSG_BUY_FAILED = "Payment link banane mein problem 😔 Thodi der baad 'buy' bhejein."
 _MSG_GENERATION_STARTED = (
     "Sab mil gaya! ✅ Aapka look ban raha hai 🎨 Usually 2-3 minute lagta hai. "
     "Ready hote hi photo yahin aa jayegi!"
@@ -755,6 +768,29 @@ def run_tryon_for_session(
     _update_session(supabase, session_id, update_payload)
 
 
+def _handle_buy_command(supabase, session: dict) -> None:
+    phone = session["phone_number"]
+
+    try:
+        link = create_payment_link_for_shop(supabase, session["shop_id"], _BUY_PACK_ID)
+    except Exception as exc:
+        print(
+            f"[whatsapp_state] failed to create payment link shop_id={session['shop_id']} "
+            f"error={exc}"
+        )
+        send_text(phone, _MSG_BUY_FAILED)
+        return
+
+    send_text(
+        phone,
+        _MSG_BUY_OFFER_TEMPLATE.format(
+            credits=_BUY_PACK_CREDITS,
+            rupees=_BUY_PACK_RUPEES,
+            short_url=link["short_url"],
+        ),
+    )
+
+
 def _dispatch(supabase, session: dict, msg: dict) -> None:
     phone = session["phone_number"]
     session_id = session["id"]
@@ -764,6 +800,10 @@ def _dispatch(supabase, session: dict, msg: dict) -> None:
 
     if kind == "text" and text.lower() in _RESET_COMMANDS:
         _reset_to_choosing_garment(supabase, session, reply=_MSG_RESET)
+        return
+
+    if kind == "text" and text.lower() == "buy":
+        _handle_buy_command(supabase, session)
         return
 
     if state == "NEW":
