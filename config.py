@@ -13,7 +13,11 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str
     GEMINI_IMAGE_MODEL_ID: str = "gemini-3.1-flash-image-preview"
 
-    CREDITS_PER_GENERATION: int = Field(default=1, gt=0)
+    # Single source of truth for the credit/image ratio. A future ratio
+    # change (e.g. perception pricing) is a one-line edit here.
+    CREDITS_PER_IMAGE: int = Field(default=50, gt=0)
+    # WhatsApp shadow-shop opening trial, expressed in images (not credits).
+    WHATSAPP_FREE_IMAGES: int = Field(default=3, ge=0)
     WORKER_POLL_INTERVAL_SECONDS: float = Field(default=3, gt=0)
 
     # Used by /admin endpoints. Keep this long and private.

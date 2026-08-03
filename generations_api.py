@@ -919,7 +919,7 @@ def create_generation(
                     "p_shop_id": current.shop_id,
                     "p_hero_image_id": hero_image_id,
                     "p_fabrics": normalized_fabrics,
-                    "p_credits_cost": settings.CREDITS_PER_GENERATION,
+                    "p_credits_cost": settings.CREDITS_PER_IMAGE,
                 },
             )
             .execute()

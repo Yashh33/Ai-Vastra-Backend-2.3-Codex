@@ -91,16 +91,16 @@ _MSG_DELIVERED_TEXT = (
     "(Ya 'menu' bhejein doosra garment choose karne ke liye)"
 )
 _BUY_PACK = CREDIT_PACKS[_BUY_PACK_ID]
-_BUY_PACK_CREDITS = _BUY_PACK["credits"]
+_BUY_PACK_IMAGES = _BUY_PACK["images"]
 _BUY_PACK_RUPEES = _BUY_PACK["amount_paise"] // 100
 
 _MSG_NO_CREDITS = (
     f"Aapke free looks complete ho gaye 🎉\n\n"
-    f"{_BUY_PACK_CREDITS} aur looks sirf Rs.{_BUY_PACK_RUPEES} mein! "
+    f"{_BUY_PACK_IMAGES} aur looks sirf Rs.{_BUY_PACK_RUPEES} mein! "
     "Lene ke liye 'BUY' likhein 💳"
 )
 _MSG_BUY_OFFER_TEMPLATE = (
-    "{credits} looks ka pack - sirf Rs.{rupees} 💳\n\n"
+    "{images} looks ka pack - sirf Rs.{rupees} 💳\n\n"
     "Yahan pay karein:\n{short_url}\n\n"
     "Payment ke baad looks turant add ho jaayenge!"
 )
@@ -401,12 +401,14 @@ def _create_session_with_shadow_shop(supabase, phone: str, profile_name: Optiona
 
     folder_id = _get_or_create_whatsapp_folder(supabase, shop_id)
 
+    settings = get_settings()
+    free_trial_credits = settings.WHATSAPP_FREE_IMAGES * settings.CREDITS_PER_IMAGE
     supabase.table("credit_ledger").insert(
         {
             "shop_id": shop_id,
-            "delta": 3,
+            "delta": free_trial_credits,
             "reason": "whatsapp_free_trial",
-            "balance_after": 3,
+            "balance_after": free_trial_credits,
         }
     ).execute()
 
@@ -609,13 +611,12 @@ def create_generation_for_session(supabase, session: dict) -> None:
     hero_image_id = session.get("hero_image_id")
     fabric_image_id = session.get("fabric_image_id")
 
+    settings = get_settings()
     balance = _get_shop_balance(supabase, shop_id)
-    if balance < 1:
+    if balance < settings.CREDITS_PER_IMAGE:
         send_text(phone, _MSG_NO_CREDITS)
         _update_session(supabase, session["id"], {"state": "DELIVERED"})
         return
-
-    settings = get_settings()
 
     normalized_fabrics = [
         {
@@ -654,7 +655,7 @@ def create_generation_for_session(supabase, session: dict) -> None:
                 "p_shop_id": shop_id,
                 "p_hero_image_id": hero_image_id,
                 "p_fabrics": normalized_fabrics,
-                "p_credits_cost": settings.CREDITS_PER_GENERATION,
+                "p_credits_cost": settings.CREDITS_PER_IMAGE,
             },
         )
         .execute()
@@ -746,6 +747,7 @@ def run_tryon_for_session(
     phone = session["phone_number"]
     session_id = session["id"]
     shop_id = session["shop_id"]
+    settings = get_settings()
 
     _update_session(supabase, session_id, {"state": "TRYON_PROCESSING"})
     send_text(phone, _MSG_TRYON_RECEIVED)
@@ -787,7 +789,7 @@ def run_tryon_for_session(
             fabric_bytes, fabric_mime = _downscale_image_if_needed(fabric_bytes, fabric_mime)
 
             balance_before = _get_shop_balance(supabase, shop_id)
-            if balance_before < 1:
+            if balance_before < settings.CREDITS_PER_IMAGE:
                 send_text(phone, _MSG_NO_CREDITS)
                 _update_session(supabase, session_id, {"state": "DELIVERED"})
                 return
@@ -822,11 +824,11 @@ def run_tryon_for_session(
     update_payload = {"state": "DELIVERED", "active_generation_id": None}
 
     if is_direct:
-        new_balance = (balance_before or 0) - 1
+        new_balance = (balance_before or 0) - settings.CREDITS_PER_IMAGE
         supabase.table("credit_ledger").insert(
             {
                 "shop_id": shop_id,
-                "delta": -1,
+                "delta": -settings.CREDITS_PER_IMAGE,
                 "reason": "whatsapp_direct_tryon",
                 "balance_after": new_balance,
             }
@@ -852,7 +854,7 @@ def _handle_buy_command(supabase, session: dict) -> None:
     send_text(
         phone,
         _MSG_BUY_OFFER_TEMPLATE.format(
-            credits=_BUY_PACK_CREDITS,
+            images=_BUY_PACK_IMAGES,
             rupees=_BUY_PACK_RUPEES,
             short_url=link["short_url"],
         ),

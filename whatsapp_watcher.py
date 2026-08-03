@@ -181,7 +181,7 @@ def _process_session_sync(supabase, session: dict) -> None:
         )
 
         balance = _get_shop_balance_sync(supabase, shop_id)
-        if balance <= 0:
+        if balance < get_settings().CREDITS_PER_IMAGE:
             send_text(phone, _MSG_LAST_FREE_LOOK)
         return
 

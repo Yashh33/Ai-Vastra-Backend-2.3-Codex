@@ -16,10 +16,20 @@ from whatsapp_transport import send_text
 router = APIRouter(tags=["Payments"])
 
 # Single source of truth for purchasable credit packs. Amounts are in paise
-# (Razorpay's smallest currency unit for INR): Rs.70 = 7000 paise.
-# Adding a new pack later is a one-line addition here.
+# (Razorpay's smallest currency unit for INR): Rs.70 = 7000 paise. Packs are
+# authored in images; credits = images * CREDITS_PER_IMAGE so the ledger
+# stores the perception-priced amount while the pack definition stays in the
+# unit tailors actually think in. Adding a new pack later is a one-line
+# addition here.
+_CREDITS_PER_IMAGE = get_settings().CREDITS_PER_IMAGE
+
 CREDIT_PACKS: dict[str, dict[str, Any]] = {
-    "starter": {"credits": 5, "amount_paise": 7000, "label": "5 looks - Rs.70"},
+    "starter": {
+        "images": 5,
+        "credits": 5 * _CREDITS_PER_IMAGE,
+        "amount_paise": 7000,
+        "label": "5 looks - Rs.70",
+    },
 }
 
 _WEBHOOK_EVENTS = {"payment_link.paid", "order.paid", "payment.captured"}
@@ -212,8 +222,9 @@ def _notify_whatsapp_topup(shop_id: str, credits: int) -> None:
         rows = getattr(result, "data", None) or []
         phones = sorted({str(row["phone_number"]) for row in rows if row.get("phone_number")})
 
+        images = credits // get_settings().CREDITS_PER_IMAGE
         message = (
-            f"Payment mil gaya! {credits} looks add ho gaye \U0001F389 "
+            f"Payment mil gaya! {images} looks add ho gaye \U0001F389 "
             "Ab agla FABRIC bhejiye \U0001F4F8"
         )
         for phone in phones:

@@ -61,7 +61,7 @@ def health():
     return {
         "status": "ok",
         "app_env": settings.APP_ENV,
-        "credits_per_generation": settings.CREDITS_PER_GENERATION,
+        "credits_per_generation": settings.CREDITS_PER_IMAGE,
         "supabase_configured": bool(
             settings.SUPABASE_URL and settings.SUPABASE_SERVICE_ROLE_KEY
         ),
