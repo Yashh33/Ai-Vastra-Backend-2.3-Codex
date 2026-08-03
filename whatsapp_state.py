@@ -1,4 +1,6 @@
 import base64
+import random
+import re
 import time
 import traceback
 from datetime import datetime, timezone
@@ -27,6 +29,12 @@ from whatsapp_transport import (
 _RESET_COMMANDS = {"reset", "restart", "start over"}
 _BUY_PACK_ID = "starter"
 _MAX_MEDIA_BYTES = 8 * 1024 * 1024
+
+# Unambiguous alphabet for join codes — excludes O/0 and I/1, which are easy
+# to mis-type or mis-read when a shop owner reads a code aloud.
+_JOIN_CODE_LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+_JOIN_CODE_DIGITS = "23456789"
+_JOIN_COMMAND_RE = re.compile(r"^join\s+([a-z0-9\s]+)$", re.IGNORECASE)
 
 _MASTER_TEMPLATE_CACHE_TTL_SECONDS = 300
 _master_template_cache: dict = {"data": None, "loaded_at": 0.0}
@@ -149,6 +157,18 @@ _MSG_OFFER_TRYON_REPEAT = (
     "dekhne ke liye TRYON likhiye, ya doosra garment ke liye 'menu' bhejein 📸"
 )
 
+_MSG_TEAM_INVITE_TEMPLATE = (
+    "Apni team ko isi number par bhejwayein:\n\n"
+    "JOIN {code}\n\n"
+    "Sab ek hi credit pool use karenge. Aap owner rahenge — recharge sirf "
+    "aapke bolne par 👥"
+)
+_MSG_JOIN_NOT_FOUND = "Ye code sahi nahi lag raha 🤔 Shop owner se dobara confirm karein."
+_MSG_JOIN_ALREADY_MEMBER = "Aap pehle se isi team mein hain 👍"
+_MSG_JOIN_SUCCESS_TEMPLATE = (
+    "Aap {shop_name} ki team se jud gaye! 🎉 Ab aapke looks shop ke shared "
+    "credits se banenge."
+)
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -302,6 +322,63 @@ def _send_garment_menu(supabase, session: dict, *, extra_fields: Optional[dict] 
     _update_session(supabase, session["id"], payload)
 
 
+def _generate_join_code() -> str:
+    letters = "".join(random.choice(_JOIN_CODE_LETTERS) for _ in range(4))
+    digits = "".join(random.choice(_JOIN_CODE_DIGITS) for _ in range(2))
+    return letters + digits
+
+
+def get_or_create_join_code(supabase, shop_id: str) -> str:
+    result = (
+        supabase.table("shops")
+        .select("whatsapp_join_code")
+        .eq("id", shop_id)
+        .limit(1)
+        .execute()
+    )
+    rows = getattr(result, "data", None) or []
+    existing = rows[0].get("whatsapp_join_code") if rows else None
+    if existing:
+        return str(existing)
+
+    for _ in range(10):
+        code = _generate_join_code()
+        try:
+            supabase.table("shops").update({"whatsapp_join_code": code}).eq("id", shop_id).execute()
+        except Exception as exc:
+            if "duplicate" in str(exc).lower() or "unique" in str(exc).lower():
+                continue
+            raise
+        return code
+
+    raise RuntimeError("Failed to generate a unique WhatsApp join code")
+
+
+def _get_or_create_whatsapp_folder(supabase, shop_id: str) -> str:
+    result = (
+        supabase.table("hero_folders")
+        .select("id")
+        .eq("shop_id", shop_id)
+        .eq("name", "WhatsApp")
+        .limit(1)
+        .execute()
+    )
+    rows = getattr(result, "data", None) or []
+    if rows:
+        return str(rows[0]["id"])
+
+    folder_payload = {
+        "shop_id": shop_id,
+        "name": "WhatsApp",
+        "prompt_template": _FABRIC_PROMPT_TEMPLATE,
+    }
+    folder_result = supabase.table("hero_folders").insert(folder_payload).execute()
+    folder_rows = getattr(folder_result, "data", None) or []
+    if not folder_rows:
+        raise RuntimeError("Failed to create WhatsApp hero folder")
+    return str(folder_rows[0]["id"])
+
+
 def _create_session_with_shadow_shop(supabase, phone: str, profile_name: Optional[str]) -> dict:
     shop_payload = {
         "name": f"WA +{phone}",
@@ -322,16 +399,7 @@ def _create_session_with_shadow_shop(supabase, phone: str, profile_name: Optiona
         raise RuntimeError("Failed to create shadow shop for WhatsApp session")
     shop_id = str(shop_rows[0]["id"])
 
-    folder_payload = {
-        "shop_id": shop_id,
-        "name": "WhatsApp",
-        "prompt_template": _FABRIC_PROMPT_TEMPLATE,
-    }
-    folder_result = supabase.table("hero_folders").insert(folder_payload).execute()
-    folder_rows = getattr(folder_result, "data", None) or []
-    if not folder_rows:
-        raise RuntimeError("Failed to create WhatsApp hero folder")
-    folder_id = str(folder_rows[0]["id"])
+    folder_id = _get_or_create_whatsapp_folder(supabase, shop_id)
 
     supabase.table("credit_ledger").insert(
         {
@@ -791,6 +859,53 @@ def _handle_buy_command(supabase, session: dict) -> None:
     )
 
 
+def _handle_team_command(supabase, session: dict) -> None:
+    phone = session["phone_number"]
+    code = get_or_create_join_code(supabase, session["shop_id"])
+    send_text(phone, _MSG_TEAM_INVITE_TEMPLATE.format(code=code))
+    _update_session(supabase, session["id"], {})
+
+
+def _handle_join_command(supabase, session: dict, code: str) -> None:
+    phone = session["phone_number"]
+
+    result = (
+        supabase.table("shops")
+        .select("id, name")
+        .eq("whatsapp_join_code", code)
+        .limit(1)
+        .execute()
+    )
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        send_text(phone, _MSG_JOIN_NOT_FOUND)
+        _update_session(supabase, session["id"], {})
+        return
+
+    shop_id = str(rows[0]["id"])
+    shop_name = rows[0].get("name") or "is"
+
+    if shop_id == str(session.get("shop_id")):
+        send_text(phone, _MSG_JOIN_ALREADY_MEMBER)
+        _send_garment_menu(supabase, session)
+        return
+
+    folder_id = _get_or_create_whatsapp_folder(supabase, shop_id)
+
+    send_text(phone, _MSG_JOIN_SUCCESS_TEMPLATE.format(shop_name=shop_name))
+    _send_garment_menu(
+        supabase,
+        session,
+        extra_fields={
+            "shop_id": shop_id,
+            "folder_id": folder_id,
+            "fabric_image_id": None,
+            "hero_image_id": None,
+            "active_generation_id": None,
+        },
+    )
+
+
 def _dispatch(supabase, session: dict, msg: dict) -> None:
     phone = session["phone_number"]
     session_id = session["id"]
@@ -805,6 +920,17 @@ def _dispatch(supabase, session: dict, msg: dict) -> None:
     if kind == "text" and text.lower() == "buy":
         _handle_buy_command(supabase, session)
         return
+
+    if kind == "text" and text.lower() == "team":
+        _handle_team_command(supabase, session)
+        return
+
+    if kind == "text":
+        join_match = _JOIN_COMMAND_RE.match(text.strip())
+        if join_match:
+            code = join_match.group(1).replace(" ", "").upper()
+            _handle_join_command(supabase, session, code)
+            return
 
     if state == "NEW":
         name = session.get("profile_name") or msg.get("profile_name") or "dost"
