@@ -1,4 +1,4 @@
-import io
+﻿import io
 import time
 from typing import Any, Optional
 
@@ -491,7 +491,7 @@ def _load_folder_prompt_context_for_hero_image(
 
     try:
         folder_result = (
-            supabase.table("hero_folders")
+            supabase.table("garment_types")
             .select("id, name, prompt_template")
             .eq("id", folder_id)
             .eq("shop_id", shop_id)

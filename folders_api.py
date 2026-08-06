@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+﻿from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -50,7 +50,7 @@ def create_folder(
 
     try:
         result = (
-            supabase.table("hero_folders")
+            supabase.table("garment_types")
             .insert(payload)
             .execute()
         )
@@ -69,7 +69,7 @@ def create_folder(
     if not rows:
         # Fallback fetch (in case insert returns no representation)
         fetch = (
-            supabase.table("hero_folders")
+            supabase.table("garment_types")
             .select("*")
             .eq("shop_id", current.shop_id)
             .eq("name", payload["name"])
@@ -96,7 +96,7 @@ def list_folders(
     supabase = get_supabase_admin_client()
 
     query = (
-        supabase.table("hero_folders")
+        supabase.table("garment_types")
         .select("*")
         .eq("shop_id", current.shop_id)
         .order("created_at", desc=True)
@@ -139,7 +139,7 @@ def update_folder(
 
     # Confirm folder belongs to this shop
     existing = (
-        supabase.table("hero_folders")
+        supabase.table("garment_types")
         .select("id")
         .eq("id", folder_id)
         .eq("shop_id", current.shop_id)
@@ -154,7 +154,7 @@ def update_folder(
 
     try:
         result = (
-            supabase.table("hero_folders")
+            supabase.table("garment_types")
             .update(update_data)
             .eq("id", folder_id)
             .eq("shop_id", current.shop_id)
@@ -174,7 +174,7 @@ def update_folder(
     rows = getattr(result, "data", None) or []
     if not rows:
         fetch = (
-            supabase.table("hero_folders")
+            supabase.table("garment_types")
             .select("*")
             .eq("id", folder_id)
             .eq("shop_id", current.shop_id)
@@ -201,7 +201,7 @@ def delete_folder(
 
     # Confirm folder belongs to this shop
     existing = (
-        supabase.table("hero_folders")
+        supabase.table("garment_types")
         .select("id, name")
         .eq("id", folder_id)
         .eq("shop_id", current.shop_id)
@@ -219,7 +219,7 @@ def delete_folder(
 
     try:
         (
-            supabase.table("hero_folders")
+            supabase.table("garment_types")
             .delete()
             .eq("id", folder_id)
             .eq("shop_id", current.shop_id)

@@ -1,4 +1,4 @@
-import base64
+﻿import base64
 import random
 import re
 import time
@@ -30,7 +30,7 @@ _RESET_COMMANDS = {"reset", "restart", "start over"}
 _BUY_PACK_ID = "starter"
 _MAX_MEDIA_BYTES = 8 * 1024 * 1024
 
-# Unambiguous alphabet for join codes — excludes O/0 and I/1, which are easy
+# Unambiguous alphabet for join codes â€” excludes O/0 and I/1, which are easy
 # to mis-type or mis-read when a shop owner reads a code aloud.
 _JOIN_CODE_LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"
 _JOIN_CODE_DIGITS = "23456789"
@@ -42,52 +42,52 @@ _master_template_cache: dict = {"data": None, "loaded_at": 0.0}
 _FABRIC_PROMPT_TEMPLATE = (
     "Photorealistic recreation of the garment shown in the reference photo, "
     "re-rendered in the provided fabric swatch. Front view, clean studio "
-    "background. Preserve all garment construction details — seams, collar, "
-    "buttons, lapels, and silhouette — exactly as shown in the reference photo."
+    "background. Preserve all garment construction details â€” seams, collar, "
+    "buttons, lapels, and silhouette â€” exactly as shown in the reference photo."
 )
 
 _MSG_GREETING = (
-    "Namaste {name}! 🙏 Main MyTryonAi hoon. Aapke fabric ko kisi bhi garment "
+    "Namaste {name}! ðŸ™ Main MyTryonAi hoon. Aapke fabric ko kisi bhi garment "
     "mein AI se dikha sakta hoon."
 )
-_MSG_RESET = "Theek hai, fresh start! 🔄"
-_MSG_ONLY_PHOTO = "Sirf photo bhejiye please 📸"
+_MSG_RESET = "Theek hai, fresh start! ðŸ”„"
+_MSG_ONLY_PHOTO = "Sirf photo bhejiye please ðŸ“¸"
 _MSG_WAITING_FABRIC_TEXT = (
-    "Pehle apne fabric ki PHOTO bhejiye 📸 (Type 'reset' to start over)"
+    "Pehle apne fabric ki PHOTO bhejiye ðŸ“¸ (Type 'reset' to start over)"
 )
 _MSG_WAITING_GARMENT_TEXT = (
-    "Ab GARMENT ki reference photo bhejiye 👔 (Type 'reset' to start over)"
+    "Ab GARMENT ki reference photo bhejiye ðŸ‘” (Type 'reset' to start over)"
 )
 _MSG_FABRIC_RECEIVED = (
-    "Fabric mil gaya ✅ Ab GARMENT ki photo bhejiye — jo design/style aap "
-    "banana chahte ho (koi bhi suit, sherwani, shirt ki reference photo) 👔"
+    "Fabric mil gaya âœ… Ab GARMENT ki photo bhejiye â€” jo design/style aap "
+    "banana chahte ho (koi bhi suit, sherwani, shirt ki reference photo) ðŸ‘”"
 )
-_MSG_GARMENT_RECEIVED_NEED_FABRIC = "Garment mil gaya ✅ Ab apne FABRIC ki photo bhejiye 📸"
+_MSG_GARMENT_RECEIVED_NEED_FABRIC = "Garment mil gaya âœ… Ab apne FABRIC ki photo bhejiye ðŸ“¸"
 
 _MSG_GARMENT_MENU_HEADER = "Garment Type"
 _MSG_GARMENT_MENU_BODY = (
-    "Konsa garment banwana hai? Neeche list se choose karein 👇\n\n"
+    "Konsa garment banwana hai? Neeche list se choose karein ðŸ‘‡\n\n"
     "Apna khud ka garment chahiye? 'custom' likhein."
 )
 _MSG_GARMENT_MENU_BUTTON = "Choose"
 _MSG_GARMENT_MENU_INVALID = (
-    "Sahi option list se choose karein, ya number bhejein 👆 "
+    "Sahi option list se choose karein, ya number bhejein ðŸ‘† "
     "(Apna khud ka garment chahiye to 'custom' likhein)"
 )
-_MSG_GARMENT_CHOSEN_TEMPLATE = "{garment} select ho gaya ✅ Ab apne FABRIC ki photo bhejiye 📸"
+_MSG_GARMENT_CHOSEN_TEMPLATE = "{garment} select ho gaya âœ… Ab apne FABRIC ki photo bhejiye ðŸ“¸"
 _MSG_ENHANCED_LOCKED = (
-    "Custom garment design Enhanced plan mein milta hai ⭐ Interested ho to "
+    "Custom garment design Enhanced plan mein milta hai â­ Interested ho to "
     "reply karein, hum aapko details bhejenge!"
 )
-_MSG_ENHANCED_UNLOCKED = "Apne GARMENT ki reference photo bhejiye 👔"
+_MSG_ENHANCED_UNLOCKED = "Apne GARMENT ki reference photo bhejiye ðŸ‘”"
 _MSG_MENU_HINT_SUFFIX = "\n\nDoosra garment chahiye? 'menu' bhejein."
 
 _MSG_PROCESSING = (
-    "Aapka look ban raha hai... 🎨 2-3 minute lagenge. Ready hote hi yahin "
+    "Aapka look ban raha hai... ðŸŽ¨ 2-3 minute lagenge. Ready hote hi yahin "
     "bhej dunga!"
 )
 _MSG_DELIVERED_TEXT = (
-    "Naya look banana ho to apne agle FABRIC ki photo bhejiye 📸 "
+    "Naya look banana ho to apne agle FABRIC ki photo bhejiye ðŸ“¸ "
     "(Ya 'menu' bhejein doosra garment choose karne ke liye)"
 )
 _BUY_PACK = CREDIT_PACKS[_BUY_PACK_ID]
@@ -95,78 +95,78 @@ _BUY_PACK_IMAGES = _BUY_PACK["images"]
 _BUY_PACK_RUPEES = _BUY_PACK["amount_paise"] // 100
 
 _MSG_NO_CREDITS = (
-    f"Aapke free looks complete ho gaye 🎉\n\n"
+    f"Aapke free looks complete ho gaye ðŸŽ‰\n\n"
     f"{_BUY_PACK_IMAGES} aur looks sirf Rs.{_BUY_PACK_RUPEES} mein! "
-    "Lene ke liye 'BUY' likhein 💳"
+    "Lene ke liye 'BUY' likhein ðŸ’³"
 )
 _MSG_BUY_OFFER_TEMPLATE = (
-    "{images} looks ka pack - sirf Rs.{rupees} 💳\n\n"
+    "{images} looks ka pack - sirf Rs.{rupees} ðŸ’³\n\n"
     "Yahan pay karein:\n{short_url}\n\n"
     "Payment ke baad looks turant add ho jaayenge!"
 )
-_MSG_BUY_FAILED = "Payment link banane mein problem 😔 Thodi der baad 'buy' bhejein."
+_MSG_BUY_FAILED = "Payment link banane mein problem ðŸ˜” Thodi der baad 'buy' bhejein."
 _MSG_GENERATION_STARTED = (
-    "Sab mil gaya! ✅ Aapka look ban raha hai 🎨 Usually 2-3 minute lagta hai. "
+    "Sab mil gaya! âœ… Aapka look ban raha hai ðŸŽ¨ Usually 2-3 minute lagta hai. "
     "Ready hote hi photo yahin aa jayegi!"
 )
 _MSG_ERROR_RECOVERY = (
-    "Maaf kijiye, kuch problem ho gayi thi 😔 Chaliye phir se shuru karte hain."
+    "Maaf kijiye, kuch problem ho gayi thi ðŸ˜” Chaliye phir se shuru karte hain."
 )
 _MSG_TECH_ERROR = (
-    "Kuch technical problem aa gayi 😔 'reset' bhej ke dobara try kijiye."
+    "Kuch technical problem aa gayi ðŸ˜” 'reset' bhej ke dobara try kijiye."
 )
-_MSG_MEDIA_TOO_LARGE = "Yeh photo bahut badi hai. Chhoti size ki photo bhejiye please 📸"
-_MSG_MEDIA_DOWNLOAD_FAILED = "Photo download nahi ho payi, dobara bhejiye please 📸"
+_MSG_MEDIA_TOO_LARGE = "Yeh photo bahut badi hai. Chhoti size ki photo bhejiye please ðŸ“¸"
+_MSG_MEDIA_DOWNLOAD_FAILED = "Photo download nahi ho payi, dobara bhejiye please ðŸ“¸"
 
 _MSG_CHOOSE_MODE = (
-    "Garment mil gaya ✅ Ab batayiye:\n\n"
-    "1️⃣ LOOK — sirf garment ka AI look\n"
-    "2️⃣ TRYON — apne CUSTOMER par pehna ke dikhao\n\n"
+    "Garment mil gaya âœ… Ab batayiye:\n\n"
+    "1ï¸âƒ£ LOOK â€” sirf garment ka AI look\n"
+    "2ï¸âƒ£ TRYON â€” apne CUSTOMER par pehna ke dikhao\n\n"
     "1 ya 2 bhejein."
 )
 _MSG_CHOOSE_MODE_REPEAT = (
     "1 ya 2 bhejein:\n\n"
-    "1️⃣ LOOK — sirf garment ka AI look\n"
-    "2️⃣ TRYON — apne CUSTOMER par pehna ke dikhao\n\n"
+    "1ï¸âƒ£ LOOK â€” sirf garment ka AI look\n"
+    "2ï¸âƒ£ TRYON â€” apne CUSTOMER par pehna ke dikhao\n\n"
     "(Type 'reset' to start over)"
 )
 _MSG_CONSENT_ASK = (
-    "Customer try-on ke liye unki permission zaroori hai 🙏 Kya customer ne "
+    "Customer try-on ke liye unki permission zaroori hai ðŸ™ Kya customer ne "
     "apni photo use karne ki haan boli hai? Haan ho to YES bhejein."
 )
-_MSG_CONSENT_THANKS = "Dhanyavaad ✅ Ab customer ki photo bhejiye (saamne se, poori body) 📸"
+_MSG_CONSENT_THANKS = "Dhanyavaad âœ… Ab customer ki photo bhejiye (saamne se, poori body) ðŸ“¸"
 _MSG_CONSENT_DECLINE = (
-    "Customer ki permission ke bina hum aage nahi badh sakte 🙏 Jab unki haan "
+    "Customer ki permission ke bina hum aage nahi badh sakte ðŸ™ Jab unki haan "
     "ho jaaye, YES bhejein. Naya fabric try karna ho to fabric photo bhejiye."
 )
 _MSG_WAITING_CUSTOMER_PHOTO_TEXT = (
-    "Customer ki photo bhejiye please (saamne se, poori body) 📸 "
+    "Customer ki photo bhejiye please (saamne se, poori body) ðŸ“¸ "
     "(Type 'reset' to start over)"
 )
-_MSG_TRYON_PROCESSING = "Try-on ban raha hai... 🎨 1-2 minute!"
-_MSG_TRYON_RECEIVED = "Customer photo mil gayi ✅ Try-on ban raha hai 🎨 1-2 minute!"
+_MSG_TRYON_PROCESSING = "Try-on ban raha hai... ðŸŽ¨ 1-2 minute!"
+_MSG_TRYON_RECEIVED = "Customer photo mil gayi âœ… Try-on ban raha hai ðŸŽ¨ 1-2 minute!"
 _MSG_TRYON_DELIVERED = (
-    "Aapke customer ka look! 🤩✨\nNaya look banana ho to agla FABRIC bhejiye 📸"
+    "Aapke customer ka look! ðŸ¤©âœ¨\nNaya look banana ho to agla FABRIC bhejiye ðŸ“¸"
 )
 _MSG_TRYON_FAILED = (
-    "Try-on mein problem aa gayi 😔 Customer ki photo dobara bhejiye, ya naya "
+    "Try-on mein problem aa gayi ðŸ˜” Customer ki photo dobara bhejiye, ya naya "
     "fabric bhejein."
 )
 _MSG_OFFER_TRYON_REPEAT = (
     "Naya look ke liye apna agla FABRIC bhejiye, is look ko customer par "
-    "dekhne ke liye TRYON likhiye, ya doosra garment ke liye 'menu' bhejein 📸"
+    "dekhne ke liye TRYON likhiye, ya doosra garment ke liye 'menu' bhejein ðŸ“¸"
 )
 
 _MSG_TEAM_INVITE_TEMPLATE = (
     "Apni team ko isi number par bhejwayein:\n\n"
     "JOIN {code}\n\n"
-    "Sab ek hi credit pool use karenge. Aap owner rahenge — recharge sirf "
-    "aapke bolne par 👥"
+    "Sab ek hi credit pool use karenge. Aap owner rahenge â€” recharge sirf "
+    "aapke bolne par ðŸ‘¥"
 )
-_MSG_JOIN_NOT_FOUND = "Ye code sahi nahi lag raha 🤔 Shop owner se dobara confirm karein."
-_MSG_JOIN_ALREADY_MEMBER = "Aap pehle se isi team mein hain 👍"
+_MSG_JOIN_NOT_FOUND = "Ye code sahi nahi lag raha ðŸ¤” Shop owner se dobara confirm karein."
+_MSG_JOIN_ALREADY_MEMBER = "Aap pehle se isi team mein hain ðŸ‘"
 _MSG_JOIN_SUCCESS_TEMPLATE = (
-    "Aap {shop_name} ki team se jud gaye! 🎉 Ab aapke looks shop ke shared "
+    "Aap {shop_name} ki team se jud gaye! ðŸŽ‰ Ab aapke looks shop ke shared "
     "credits se banenge."
 )
 
@@ -210,7 +210,7 @@ def _load_master_templates(supabase) -> list[dict]:
         raise RuntimeError("MASTER_SHOP_ID is not configured")
 
     folder_result = (
-        supabase.table("hero_folders")
+        supabase.table("garment_types")
         .select("id, name")
         .eq("shop_id", master_shop_id)
         .eq("is_active", True)
@@ -237,7 +237,7 @@ def _load_master_templates(supabase) -> list[dict]:
         folder_id = str(folder["id"])
         hero = hero_by_folder.get(folder_id)
         if not hero:
-            # Folder has no hero image yet — not selectable in the menu.
+            # Folder has no hero image yet â€” not selectable in the menu.
             continue
         templates.append(
             {
@@ -356,7 +356,7 @@ def get_or_create_join_code(supabase, shop_id: str) -> str:
 
 def _get_or_create_whatsapp_folder(supabase, shop_id: str) -> str:
     result = (
-        supabase.table("hero_folders")
+        supabase.table("garment_types")
         .select("id")
         .eq("shop_id", shop_id)
         .eq("name", "WhatsApp")
@@ -372,7 +372,7 @@ def _get_or_create_whatsapp_folder(supabase, shop_id: str) -> str:
         "name": "WhatsApp",
         "prompt_template": _FABRIC_PROMPT_TEMPLATE,
     }
-    folder_result = supabase.table("hero_folders").insert(folder_payload).execute()
+    folder_result = supabase.table("garment_types").insert(folder_payload).execute()
     folder_rows = getattr(folder_result, "data", None) or []
     if not folder_rows:
         raise RuntimeError("Failed to create WhatsApp hero folder")
@@ -511,7 +511,7 @@ def _handle_fabric_image(
 
     if session.get("hero_image_id"):
         # Garment already resolved (BASIC menu pick or a completed ENHANCED
-        # custom-garment upload) — skip straight to the mode menu.
+        # custom-garment upload) â€” skip straight to the mode menu.
         _update_session(
             supabase,
             session["id"],
@@ -594,7 +594,7 @@ def _handle_garment_image(supabase, session: dict, msg: dict) -> None:
         )
         send_text(phone, _MSG_CHOOSE_MODE)
     else:
-        # ENHANCED entry: garment reference is resolved before fabric —
+        # ENHANCED entry: garment reference is resolved before fabric â€”
         # a generation needs both, so collect fabric next rather than
         # jumping straight to the mode menu.
         _update_session(
@@ -629,7 +629,7 @@ def create_generation_for_session(supabase, session: dict) -> None:
     ]
 
     folder_result = (
-        supabase.table("hero_folders")
+        supabase.table("garment_types")
         .select("id, name, prompt_template")
         .eq("id", session["folder_id"])
         .eq("shop_id", shop_id)
@@ -761,7 +761,7 @@ def run_tryon_for_session(
             raise RuntimeError("Missing media_id for customer photo")
 
         # Customer photo lives only in these local variables for the
-        # duration of this call — never written to storage, DB, or logs.
+        # duration of this call â€” never written to storage, DB, or logs.
         customer_bytes, downloaded_mime = download_media(media_id)
         customer_mime = downloaded_mime or mime_type or "image/jpeg"
 
@@ -772,7 +772,7 @@ def run_tryon_for_session(
 
         if is_direct:
             folder_result = (
-                supabase.table("hero_folders")
+                supabase.table("garment_types")
                 .select("id, name")
                 .eq("id", session["folder_id"])
                 .eq("shop_id", shop_id)

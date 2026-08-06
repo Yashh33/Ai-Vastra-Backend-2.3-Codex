@@ -1,4 +1,4 @@
-import base64
+﻿import base64
 import io
 import threading
 from typing import Optional, Tuple
@@ -48,7 +48,7 @@ class TryOnRequest(BaseModel):
     )
     consent_confirmed: bool = Field(
         default=False,
-        description="Must be true — confirms tailor obtained customer consent before photo was taken"
+        description="Must be true â€” confirms tailor obtained customer consent before photo was taken"
     )
 
 
@@ -62,7 +62,7 @@ class TryOnQuickRequest(BaseModel):
     )
     consent_confirmed: bool = Field(
         default=False,
-        description="Must be true — confirms tailor obtained customer consent before photo was taken"
+        description="Must be true â€” confirms tailor obtained customer consent before photo was taken"
     )
 
 
@@ -265,7 +265,7 @@ def _prepare_tryon_assets_sync(
     folder_id = gen.get("folder_id")
     if folder_id:
         folder_result = (
-            supabase.table("hero_folders")
+            supabase.table("garment_types")
             .select("name")
             .eq("id", folder_id)
             .limit(1)
@@ -289,7 +289,7 @@ def _prepare_tryon_quick_assets_sync(
 ) -> Tuple[bytes, str, bytes, str, Optional[str]]:
     """Blocking DB + storage prep phase for /tryon/quick/v2. Runs off the event loop."""
     folder_result = (
-        supabase.table("hero_folders")
+        supabase.table("garment_types")
         .select("id, name, default_hero_image_id")
         .eq("id", folder_id)
         .eq("shop_id", shop_id)
@@ -373,7 +373,7 @@ def _prepare_tryon_multi_assets_sync(
 ) -> Tuple[bytes, str, list[Tuple[bytes, str]], Optional[str]]:
     """Blocking DB + storage prep phase for /tryon/multi/v2. Runs off the event loop."""
     folder_result = (
-        supabase.table("hero_folders")
+        supabase.table("garment_types")
         .select("id, name")
         .eq("id", folder_id)
         .eq("shop_id", shop_id)
@@ -488,7 +488,7 @@ def tryon(
     folder_id = gen.get("folder_id")
     if folder_id:
         folder_result = (
-            supabase.table("hero_folders")
+            supabase.table("garment_types")
             .select("name")
             .eq("id", folder_id)
             .limit(1)
@@ -546,7 +546,7 @@ def tryon_quick(
 
     # Fetch folder -> default hero image
     folder_result = (
-        supabase.table("hero_folders")
+        supabase.table("garment_types")
         .select("id, name, default_hero_image_id")
         .eq("id", body.folder_id.strip())
         .eq("shop_id", shop_id)

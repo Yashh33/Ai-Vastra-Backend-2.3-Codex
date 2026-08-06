@@ -1,4 +1,4 @@
-from typing import Optional
+﻿from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
@@ -97,7 +97,7 @@ def list_garment_types(
 
     try:
         folder_result = (
-            supabase.table("hero_folders")
+            supabase.table("garment_types")
             .select("id, name, prompt_template, default_hero_image_id")
             .eq("shop_id", current.shop_id)
             .eq("is_active", True)

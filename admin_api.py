@@ -1,4 +1,4 @@
-import re
+﻿import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import uuid4
@@ -698,7 +698,7 @@ def delete_shop(shop_id: str):
         supabase.table("catalog_images").delete().eq("shop_id", shop_id).execute()
         supabase.table("hero_images").delete().eq("shop_id", shop_id).execute()
         supabase.table("fabric_images").delete().eq("shop_id", shop_id).execute()
-        supabase.table("hero_folders").delete().eq("shop_id", shop_id).execute()
+        supabase.table("garment_types").delete().eq("shop_id", shop_id).execute()
         supabase.table("shop_users").delete().eq("shop_id", shop_id).execute()
         supabase.table("shops").delete().eq("id", shop_id).execute()
     except Exception as exc:
@@ -866,7 +866,7 @@ def list_shop_folders(shop_id: str):
     supabase = get_supabase_admin_client()
 
     result = (
-        supabase.table("hero_folders")
+        supabase.table("garment_types")
         .select("*")
         .eq("shop_id", shop_id)
         .order("created_at", desc=True)
@@ -887,7 +887,7 @@ def create_shop_folder(shop_id: str, body: AdminCreateFolderRequest):
     }
 
     try:
-        result = supabase.table("hero_folders").insert(payload).execute()
+        result = supabase.table("garment_types").insert(payload).execute()
     except Exception as exc:
         message = str(exc)
         if "hero_folders_shop_id_name_key" in message:
@@ -920,7 +920,7 @@ async def delete_folder(
     supabase = get_supabase_admin_client()
 
     result = (
-        supabase.table("hero_folders")
+        supabase.table("garment_types")
         .delete()
         .eq("id", folder_id)
         .eq("shop_id", shop_id)
@@ -965,7 +965,7 @@ def update_shop_folder_default_hero(
 
     try:
         result = (
-            supabase.table("hero_folders")
+            supabase.table("garment_types")
             .update(
                 {
                     "default_hero_image_id": default_hero_image_id,
@@ -1001,7 +1001,7 @@ def create_folder_fabric_slot(
     supabase = get_supabase_admin_client()
 
     folder_check = (
-        supabase.table("hero_folders")
+        supabase.table("garment_types")
         .select("id")
         .eq("id", folder_id)
         .eq("shop_id", shop_id)
@@ -1077,7 +1077,7 @@ def list_folder_fabric_slots(shop_id: str, folder_id: str):
     supabase = get_supabase_admin_client()
 
     folder_check = (
-        supabase.table("hero_folders")
+        supabase.table("garment_types")
         .select("id")
         .eq("id", folder_id)
         .eq("shop_id", shop_id)
@@ -1167,7 +1167,7 @@ async def upload_shop_hero_image(
         )
 
     folder_check = (
-        supabase.table("hero_folders")
+        supabase.table("garment_types")
         .select("id")
         .eq("id", normalized_folder_id)
         .eq("shop_id", shop_id)
@@ -1259,7 +1259,7 @@ async def upload_shop_catalog_images_bulk(
     normalized_folder_id = _clean_text(folder_id, "folder_id")
 
     folder_check = (
-        supabase.table("hero_folders")
+        supabase.table("garment_types")
         .select("id")
         .eq("id", normalized_folder_id)
         .eq("shop_id", shop_id)

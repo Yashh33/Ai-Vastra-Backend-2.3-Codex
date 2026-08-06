@@ -1,4 +1,4 @@
-from typing import Optional
+﻿from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -99,7 +99,7 @@ def create_hero_image_metadata(
     # Validate folder belongs to current shop
     try:
         folder_check = (
-            supabase.table("hero_folders")
+            supabase.table("garment_types")
             .select("id")
             .eq("id", folder_id)
             .eq("shop_id", current.shop_id)
@@ -174,7 +174,7 @@ def create_catalog_image_metadata(
 
     try:
         folder_check = (
-            supabase.table("hero_folders")
+            supabase.table("garment_types")
             .select("id")
             .eq("id", folder_id)
             .eq("shop_id", current.shop_id)
