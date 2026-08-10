@@ -5,6 +5,14 @@ import { adminFetch } from "../lib/api";
 import { useAdminAuth } from "../lib/auth";
 import type { AdminCreateShopResponse, AdminShopRow } from "../lib/types";
 
+function formatPhone(raw: string | null | undefined): string {
+  if (!raw) return "";
+  if (raw.startsWith("91") && raw.length === 12) {
+    return "+91 " + raw.slice(2);
+  }
+  return raw;
+}
+
 export function AdminDashboardPage() {
   const { session, signOut } = useAdminAuth();
 
@@ -182,7 +190,17 @@ export function AdminDashboardPage() {
                   <h3>{shop.name}</h3>
                   <p className="tiny muted">Shop ID: {shop.id}</p>
                   <p className="tiny muted">Credits: {shop.credits_balance ?? 0}</p>
-                  <p className="tiny muted">Owner UID: {shop.owner_auth_user_id || "-"}</p>
+                  {shop.channel === "whatsapp" ? (
+                    <p className="tiny muted">
+                      <strong>WhatsApp</strong> · {formatPhone(shop.whatsapp_phone) || "no number"}
+                    </p>
+                  ) : shop.channel === "react" ? (
+                    <p className="tiny muted">
+                      <strong>React</strong> · {shop.owner_email || "no email"}
+                    </p>
+                  ) : (
+                    <p className="tiny muted">System / other</p>
+                  )}
                   <Link className="btn btn-dark" to={`/shops/${encodeURIComponent(shop.id)}`}>
                     Manage Shop
                   </Link>

@@ -14,6 +14,9 @@ export type AdminShopRow = {
   updated_at?: string;
   owner_auth_user_id?: string | null;
   credits_balance?: number;
+  whatsapp_phone?: string | null;
+  owner_email?: string | null;
+  channel?: string | null;
 };
 
 export type AdminCreateShopResponse = {

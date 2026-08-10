@@ -122,6 +122,46 @@ def _extract_user_id(payload: Any) -> Optional[str]:
     return None
 
 
+def _extract_user_email(payload: Any) -> Optional[str]:
+    if payload is None:
+        return None
+
+    if isinstance(payload, dict):
+        direct = payload.get("email")
+        if direct:
+            return str(direct)
+
+        for key in ("user", "data"):
+            nested = _extract_user_email(payload.get(key))
+            if nested:
+                return nested
+
+        return None
+
+    model_dump = getattr(payload, "model_dump", None)
+    if callable(model_dump):
+        try:
+            nested = _extract_user_email(model_dump())
+            if nested:
+                return nested
+        except Exception:
+            pass
+
+    direct_email = getattr(payload, "email", None)
+    if direct_email:
+        return str(direct_email)
+
+    nested_user = _extract_user_email(getattr(payload, "user", None))
+    if nested_user:
+        return nested_user
+
+    nested_data = _extract_user_email(getattr(payload, "data", None))
+    if nested_data:
+        return nested_data
+
+    return None
+
+
 def _get_shop_mapping_for_auth_user(supabase, auth_user_id: str) -> Optional[dict[str, Any]]:
     result = (
         supabase.table("shop_users")
@@ -414,16 +454,57 @@ def list_shops(
         except Exception:
             owners_by_shop = {}
 
+    phones_by_shop: dict[str, str] = {}
+    if shop_ids:
+        try:
+            phone_result = (
+                supabase.table("whatsapp_sessions")
+                .select("shop_id, phone_number, created_at")
+                .in_("shop_id", shop_ids)
+                .order("created_at", desc=False)
+                .execute()
+            )
+            phone_rows = getattr(phone_result, "data", None) or []
+            for row in phone_rows:
+                target_shop_id = str(row.get("shop_id") or "")
+                phone_number = str(row.get("phone_number") or "")
+                if target_shop_id and phone_number and target_shop_id not in phones_by_shop:
+                    phones_by_shop[target_shop_id] = phone_number
+        except Exception:
+            phones_by_shop = {}
+
+    emails_by_uid: dict[str, Optional[str]] = {}
+    owner_uids = {uid for uid in owners_by_shop.values() if uid}
+    for uid in owner_uids:
+        try:
+            user_result = supabase.auth.admin.get_user_by_id(uid)
+            emails_by_uid[uid] = _extract_user_email(user_result)
+        except Exception:
+            emails_by_uid[uid] = None
+
     enriched = []
     for shop in shops:
         target_shop_id = str(shop.get("id") or "")
         balance = _get_shop_balance(supabase, target_shop_id) if target_shop_id else 0
+        owner_auth_user_id = owners_by_shop.get(target_shop_id)
+        whatsapp_phone = phones_by_shop.get(target_shop_id)
+
+        if whatsapp_phone:
+            channel = "whatsapp"
+        elif owner_auth_user_id:
+            channel = "react"
+        else:
+            channel = "other"
+
         enriched.append(
             {
                 **shop,
                 "is_suspended": bool(shop.get("is_suspended", False)),
-                "owner_auth_user_id": owners_by_shop.get(target_shop_id),
+                "owner_auth_user_id": owner_auth_user_id,
                 "credits_balance": balance,
+                "whatsapp_phone": whatsapp_phone,
+                "owner_email": emails_by_uid.get(owner_auth_user_id) if owner_auth_user_id else None,
+                "channel": channel,
             }
         )
 
