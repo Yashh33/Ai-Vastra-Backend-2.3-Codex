@@ -13,14 +13,6 @@ import type {
   AdminShopRow,
 } from "../lib/types";
 
-const FABRIC_SLOT_APPLY_TO_OPTIONS = [
-  "shirt",
-  "pant",
-  "suit_full_body",
-  "suit_upper",
-  "koti",
-];
-
 export function AdminShopDetailPage() {
   const { shopId = "" } = useParams();
   const navigate = useNavigate();
@@ -58,7 +50,7 @@ export function AdminShopDetailPage() {
 
   const [fabricSlots, setFabricSlots] = useState<AdminFabricSlotRow[]>([]);
   const [newSlotLabel, setNewSlotLabel] = useState("");
-  const [newSlotApplyTo, setNewSlotApplyTo] = useState("shirt");
+  const [newSlotApplyTo, setNewSlotApplyTo] = useState("");
   const [newSlotSortOrder, setNewSlotSortOrder] = useState(0);
   const [savingSlot, setSavingSlot] = useState(false);
   const [deletingSlotId, setDeletingSlotId] = useState<string | null>(null);
@@ -369,6 +361,11 @@ export function AdminShopDetailPage() {
     event.preventDefault();
     if (!session || !shopId || !selectedFolderId || !newSlotLabel.trim()) return;
 
+    if (!newSlotApplyTo.trim()) {
+      setStatusText("Apply To is required");
+      return;
+    }
+
     setSavingSlot(true);
     try {
       await adminFetch<AdminFabricSlotRow>(
@@ -385,7 +382,7 @@ export function AdminShopDetailPage() {
       );
 
       setNewSlotLabel("");
-      setNewSlotApplyTo("shirt");
+      setNewSlotApplyTo("");
       setNewSlotSortOrder(0);
       await loadFabricSlots(selectedFolderId);
       setStatusText("Fabric slot added.");
@@ -887,17 +884,12 @@ export function AdminShopDetailPage() {
 
                 <label className="field">
                   <span>Apply To</span>
-                  <select
+                  <input
                     value={newSlotApplyTo}
                     onChange={(event) => setNewSlotApplyTo(event.target.value)}
+                    placeholder="e.g. shirt, pant, outer koti, kurta"
                     disabled={savingSlot}
-                  >
-                    {FABRIC_SLOT_APPLY_TO_OPTIONS.map((option) => (
-                      <option key={option} value={option}>
-                        {option}
-                      </option>
-                    ))}
-                  </select>
+                  />
                 </label>
 
                 <label className="field">
