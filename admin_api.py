@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Upload
 from pydantic import BaseModel, Field
 
 from admin_deps import verify_admin_secret
+from config import get_settings
 from supabase_client import get_supabase_admin_client
 
 router = APIRouter(prefix="/admin", tags=["Admin"], dependencies=[Depends(verify_admin_secret)])
@@ -1124,6 +1125,44 @@ def delete_folder_fabric_slot(shop_id: str, folder_id: str, slot_id: str):
     return {"deleted": True}
 
 
+def _extract_signed_url(signed_payload: object) -> Optional[str]:
+    if isinstance(signed_payload, dict):
+        data = signed_payload.get("data")
+        nested = data if isinstance(data, dict) else {}
+        return (
+            signed_payload.get("signedURL")
+            or signed_payload.get("signedUrl")
+            or signed_payload.get("signed_url")
+            or nested.get("signedURL")
+            or nested.get("signedUrl")
+            or nested.get("signed_url")
+        )
+    return None
+
+
+def _create_hero_image_signed_url(supabase, storage_path: str) -> Optional[str]:
+    try:
+        cleaned_path = (storage_path or "").strip()
+        if not cleaned_path:
+            return None
+
+        signed = supabase.storage.from_("hero-images").create_signed_url(
+            cleaned_path,
+            3600,
+        )
+
+        signed_url = _extract_signed_url(signed)
+        if not signed_url:
+            return None
+
+        if signed_url.startswith("/"):
+            signed_url = f"{get_settings().SUPABASE_URL}{signed_url}"
+
+        return signed_url
+    except Exception:
+        return None
+
+
 @router.get("/shops/{shop_id}/hero-images")
 def list_shop_hero_images(
     shop_id: str,
@@ -1146,7 +1185,12 @@ def list_shop_hero_images(
     query = query.range(offset, offset + limit - 1)
 
     result = query.execute()
-    return getattr(result, "data", None) or []
+    rows = getattr(result, "data", None) or []
+
+    for row in rows:
+        row["signed_url"] = _create_hero_image_signed_url(supabase, row.get("storage_path"))
+
+    return rows
 
 
 @router.post("/shops/{shop_id}/hero-images/upload")
