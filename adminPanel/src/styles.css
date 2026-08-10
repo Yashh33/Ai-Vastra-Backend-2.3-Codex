@@ -227,6 +227,26 @@ input[type="number"] {
   font-size: 0.85rem;
 }
 
+.tab {
+  min-height: 40px;
+  border: 1px solid var(--line);
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  border-radius: 10px 10px 0 0;
+  padding: 0.5rem 0.9rem;
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+
+.tab-active {
+  color: var(--ink);
+  background: var(--paper);
+  border-color: var(--line);
+  border-bottom: 2px solid var(--accent-dark);
+}
+
 @media (min-width: 860px) {
   .grid-2 {
     grid-template-columns: repeat(2, minmax(0, 1fr));

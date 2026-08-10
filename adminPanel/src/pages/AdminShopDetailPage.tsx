@@ -66,6 +66,8 @@ export function AdminShopDetailPage() {
   const [processingSuspend, setProcessingSuspend] = useState(false);
   const [deletingShop, setDeletingShop] = useState(false);
 
+  const [activeTab, setActiveTab] = useState<"overview" | "garments">("overview");
+
   const canUploadHero = useMemo(() => !!selectedFolderId && !!heroFile, [selectedFolderId, heroFile]);
   const canUploadCatalog = useMemo(
     () => !!selectedFolderId && catalogFiles.length > 0,
@@ -292,9 +294,9 @@ export function AdminShopDetailPage() {
       if (!selectedFolderId) {
         setSelectedFolderId(created.id);
       }
-      setStatusText("Folder created.");
+      setStatusText("Garment type created.");
     } catch (err) {
-      setStatusText(`Create folder failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+      setStatusText(`Create garment type failed: ${err instanceof Error ? err.message : "Unknown error"}`);
     } finally {
       setCreatingFolder(false);
     }
@@ -540,6 +542,23 @@ export function AdminShopDetailPage() {
           </div>
         </header>
 
+        <div className="row">
+          <button
+            className={activeTab === "overview" ? "tab tab-active" : "tab"}
+            onClick={() => setActiveTab("overview")}
+          >
+            Overview
+          </button>
+          <button
+            className={activeTab === "garments" ? "tab tab-active" : "tab"}
+            onClick={() => setActiveTab("garments")}
+          >
+            Garment Types
+          </button>
+        </div>
+
+        {activeTab === "overview" && (
+        <>
         <section className="card stack">
           <h2>Shop Details</h2>
           <p className="tiny muted">Shop ID: {shopId}</p>
@@ -624,7 +643,11 @@ export function AdminShopDetailPage() {
             </button>
           </form>
         </section>
+        </>
+        )}
 
+        {activeTab === "garments" && (
+        <>
         <section className="card stack">
           <h2>Create Garment Type</h2>
           <form className="stack" onSubmit={handleCreateFolder}>
@@ -654,7 +677,7 @@ export function AdminShopDetailPage() {
           <div className="stack">
             <p className="tiny muted">Garment Types</p>
             {folders.length === 0 ? (
-              <div className="empty-box">No folders found.</div>
+              <div className="empty-box">No garment types found.</div>
             ) : (
               <ul className="hero-list">
                 {folders.map((folder) => (
@@ -703,12 +726,12 @@ export function AdminShopDetailPage() {
           <h2>Upload Hero Image</h2>
           <div className="grid-2">
             <label className="field">
-              <span>Select Folder</span>
+              <span>Select Garment Type</span>
               <select
                 value={selectedFolderId}
                 onChange={(event) => setSelectedFolderId(event.target.value)}
               >
-                <option value="">Choose folder</option>
+                <option value="">Choose garment type</option>
                 {folders.map((folder) => (
                   <option key={folder.id} value={folder.id}>
                     {folder.name}
@@ -735,7 +758,7 @@ export function AdminShopDetailPage() {
 
           {selectedFolderId ? (
             <div className="stack">
-              <p className="tiny muted">Recent hero images in selected folder:</p>
+              <p className="tiny muted">Recent hero images in selected garment type:</p>
               {heroImages.length === 0 ? (
                 <div className="empty-box">No hero images found.</div>
               ) : (
@@ -898,7 +921,7 @@ export function AdminShopDetailPage() {
 
         <section className="card stack">
           <h2>Upload Catalog Images (Bulk)</h2>
-          <p className="tiny muted">These images appear in customer Catalog under the selected folder.</p>
+          <p className="tiny muted">These images appear in customer Catalog under the selected garment type.</p>
 
           <label className="field">
             <span>Select Images (multiple)</span>
@@ -921,7 +944,7 @@ export function AdminShopDetailPage() {
 
           {selectedFolderId ? (
             <div className="stack">
-              <p className="tiny muted">Recent catalog images in selected folder:</p>
+              <p className="tiny muted">Recent catalog images in selected garment type:</p>
               {catalogImages.length === 0 ? (
                 <div className="empty-box">No catalog images found.</div>
               ) : (
@@ -937,6 +960,8 @@ export function AdminShopDetailPage() {
             </div>
           ) : null}
         </section>
+        </>
+        )}
       </section>
     </main>
   );
