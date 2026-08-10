@@ -58,6 +58,7 @@ export function AdminShopDetailPage() {
   const [deletingShop, setDeletingShop] = useState(false);
 
   const [activeTab, setActiveTab] = useState<"overview" | "garments">("overview");
+  const [showCreateModal, setShowCreateModal] = useState(false);
 
   const canUploadHero = useMemo(() => !!selectedFolderId && !!heroFile, [selectedFolderId, heroFile]);
   const canUploadCatalog = useMemo(
@@ -183,6 +184,18 @@ export function AdminShopDetailPage() {
       loadFabricSlots(selectedFolderId),
     ]);
   }, [selectedFolderId, session, shopId]);
+
+  useEffect(() => {
+    if (!selectedFolderId && folders.length > 0) {
+      setSelectedFolderId(folders[0].id);
+    }
+  }, [folders]);
+
+  useEffect(() => {
+    if (showCreateModal) {
+      setShowCreateModal(false);
+    }
+  }, [folders]);
 
   async function handleShopUpdate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -640,315 +653,294 @@ export function AdminShopDetailPage() {
         )}
 
         {activeTab === "garments" && (
-        <>
-        <section className="card stack">
-          <h2>Create Garment Type</h2>
-          <form className="stack" onSubmit={handleCreateFolder}>
-            <label className="field">
-              <span>Garment Type Name</span>
-              <input
-                value={newFolderName}
-                onChange={(event) => setNewFolderName(event.target.value)}
-                placeholder="e.g. Shirt, Suit"
-                disabled={creatingFolder}
-              />
-            </label>
-            <label className="field">
-              <span>Prompt Template (optional)</span>
-              <textarea
-                rows={3}
-                value={newPromptTemplate}
-                onChange={(event) => setNewPromptTemplate(event.target.value)}
-                disabled={creatingFolder}
-              />
-            </label>
-            <button className="btn btn-dark" type="submit" disabled={creatingFolder || !newFolderName.trim()}>
-              {creatingFolder ? "Creating..." : "Create Garment Type"}
-            </button>
-          </form>
+        <div className="gt-layout">
+          <div className="card stack gt-list-panel">
+            <div className="gt-list-header">
+              <h2>Garment Types</h2>
+              <button
+                type="button"
+                className="gt-add-btn"
+                onClick={() => setShowCreateModal(true)}
+                aria-label="Create garment type"
+              >
+                +
+              </button>
+            </div>
 
-          <div className="stack">
-            <p className="tiny muted">Garment Types</p>
             {folders.length === 0 ? (
-              <div className="empty-box">No garment types found.</div>
+              <p className="tiny muted">No garment types yet. Click + to create one.</p>
             ) : (
-              <ul className="hero-list">
+              <ul className="gt-list">
                 {folders.map((folder) => (
                   <li
                     key={folder.id}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "space-between",
-                      gap: "8px",
-                      padding: "4px 0",
-                    }}
+                    className={
+                      folder.id === selectedFolderId
+                        ? "gt-list-item gt-list-item-active"
+                        : "gt-list-item"
+                    }
+                    onClick={() => setSelectedFolderId(folder.id)}
                   >
-                    <span>
-                      {folder.name}{" "}
-                      {folder.default_hero_image_id ? (
-                        <span style={{ color: "green", fontWeight: 600 }}>Default set ✓</span>
-                      ) : (
-                        <span style={{ color: "#888" }}>No default set</span>
-                      )}
-                    </span>
-                    <button
-                      onClick={() => handleDeleteFolder(folder.id, folder.name)}
-                      style={{
-                        background: "#991B1B",
-                        color: "white",
-                        border: "none",
-                        borderRadius: "6px",
-                        padding: "3px 10px",
-                        fontSize: "12px",
-                        fontWeight: 600,
-                        cursor: "pointer",
-                        flexShrink: 0,
-                      }}
-                    >
-                      Delete
-                    </button>
+                    <span>{folder.name}</span>
+                    {folder.default_hero_image_id ? (
+                      <span className="gt-default-badge">Default set ✓</span>
+                    ) : null}
                   </li>
                 ))}
               </ul>
             )}
           </div>
-        </section>
 
-        <section className="card stack">
-          <h2>Upload Hero Image</h2>
-          <div className="grid-2">
-            <label className="field">
-              <span>Select Garment Type</span>
-              <select
-                value={selectedFolderId}
-                onChange={(event) => setSelectedFolderId(event.target.value)}
-              >
-                <option value="">Choose garment type</option>
-                {folders.map((folder) => (
-                  <option key={folder.id} value={folder.id}>
-                    {folder.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <label className="field">
-              <span>Image File</span>
-              <input
-                type="file"
-                accept="image/*"
-                onChange={(event) => setHeroFile(event.target.files?.[0] || null)}
-              />
-            </label>
-          </div>
-
-          <form onSubmit={handleHeroUpload}>
-            <button className="btn btn-dark" type="submit" disabled={uploadingHero || !canUploadHero}>
-              {uploadingHero ? "Uploading..." : "Upload Hero Image"}
-            </button>
-          </form>
-
-          {selectedFolderId ? (
-            <div className="stack">
-              <p className="tiny muted">Recent hero images in selected garment type:</p>
-              {heroImages.length === 0 ? (
-                <div className="empty-box">No hero images found.</div>
-              ) : (
-                <ul className="hero-list">
-                  {heroImages.map((row) => (
-                    <li key={row.id}>
-                      <div className="row">
-                        {heroSignedUrls[row.id] ? (
-                          <img
-                            src={heroSignedUrls[row.id]}
-                            alt={row.original_filename || "Hero image"}
-                            style={{
-                              width: 80,
-                              height: 80,
-                              objectFit: "cover",
-                              borderRadius: 12,
-                            }}
-                          />
-                        ) : (
-                          <div
-                            className="empty-box"
-                            style={{
-                              width: 80,
-                              height: 80,
-                              padding: 0,
-                              display: "grid",
-                              placeItems: "center",
-                              flex: "0 0 80px",
-                            }}
-                          >
-                            Preview
-                          </div>
-                        )}
-                        <div className="stack grow">
-                          <span>{row.original_filename || row.id}</span>
-                          <code>{row.storage_path}</code>
-                        </div>
-                        {row.id === selectedFolder?.default_hero_image_id ? (
-                          <span style={{ color: "#15803d", fontWeight: 700 }}>✓ Default</span>
-                        ) : (
-                          <button
-                            className="btn btn-light"
-                            type="button"
-                            onClick={() => void handleSetDefaultHero(selectedFolderId, row.id)}
-                          >
-                            Set as Default
-                          </button>
-                        )}
-                      </div>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-          ) : null}
-        </section>
-
-        {selectedFolderId ? (
-          <section className="card stack">
-            <h2>Fabric slots</h2>
-            <p className="tiny muted">Garment type: {selectedFolder?.name || "-"}</p>
-
-            {fabricSlots.length === 0 ? (
-              <div className="empty-box">No fabric slots found.</div>
+          <div className="card stack gt-detail-panel">
+            {!selectedFolder ? (
+              <p className="tiny muted">Select a garment type on the left, or create one with +.</p>
             ) : (
-              <ul className="hero-list">
-                {fabricSlots.map((slot) => (
-                  <li
-                    key={slot.id}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "space-between",
-                      gap: "8px",
-                      padding: "4px 0",
-                    }}
+              <>
+                <div className="gt-detail-header">
+                  <h2>{selectedFolder.name}</h2>
+                  <button
+                    className="btn btn-danger"
+                    type="button"
+                    onClick={() => handleDeleteFolder(selectedFolder.id, selectedFolder.name)}
                   >
-                    <span>
-                      {slot.sort_order}. {slot.label}{" "}
-                      <span
-                        style={{
-                          background: "#e5e7eb",
-                          color: "#374151",
-                          borderRadius: "6px",
-                          padding: "2px 8px",
-                          fontSize: "12px",
-                          fontWeight: 600,
-                        }}
-                      >
-                        {slot.apply_to}
-                      </span>
-                    </span>
-                    <button
-                      onClick={() => void handleDeleteFabricSlot(slot.id, slot.label)}
-                      disabled={deletingSlotId === slot.id}
-                      style={{
-                        background: "#991B1B",
-                        color: "white",
-                        border: "none",
-                        borderRadius: "6px",
-                        padding: "3px 10px",
-                        fontSize: "12px",
-                        fontWeight: 600,
-                        cursor: "pointer",
-                        flexShrink: 0,
-                      }}
-                    >
-                      {deletingSlotId === slot.id ? "Deleting..." : "Delete"}
+                    Delete garment type
+                  </button>
+                </div>
+
+                <div className="stack">
+                  <h3>Hero Images</h3>
+                  <div className="grid-2">
+                    <label className="field">
+                      <span>Image File</span>
+                      <input
+                        type="file"
+                        accept="image/*"
+                        onChange={(event) => setHeroFile(event.target.files?.[0] || null)}
+                      />
+                    </label>
+                  </div>
+
+                  <form onSubmit={handleHeroUpload}>
+                    <button className="btn btn-dark" type="submit" disabled={uploadingHero || !canUploadHero}>
+                      {uploadingHero ? "Uploading..." : "Upload Hero Image"}
                     </button>
-                  </li>
-                ))}
-              </ul>
+                  </form>
+
+                  <div className="stack">
+                    <p className="tiny muted">Recent hero images in selected garment type:</p>
+                    {heroImages.length === 0 ? (
+                      <div className="empty-box">No hero images found.</div>
+                    ) : (
+                      <ul className="hero-list">
+                        {heroImages.map((row) => (
+                          <li key={row.id}>
+                            <div className="row">
+                              {heroSignedUrls[row.id] ? (
+                                <img
+                                  src={heroSignedUrls[row.id]}
+                                  alt={row.original_filename || "Hero image"}
+                                  className="gt-hero-thumb"
+                                />
+                              ) : (
+                                <div className="empty-box gt-hero-thumb-placeholder">Preview</div>
+                              )}
+                              <div className="stack grow">
+                                <span>{row.original_filename || row.id}</span>
+                                <code>{row.storage_path}</code>
+                              </div>
+                              {row.id === selectedFolder?.default_hero_image_id ? (
+                                <span style={{ color: "#15803d", fontWeight: 700 }}>✓ Default</span>
+                              ) : (
+                                <button
+                                  className="btn btn-light"
+                                  type="button"
+                                  onClick={() => void handleSetDefaultHero(selectedFolderId, row.id)}
+                                >
+                                  Set as Default
+                                </button>
+                              )}
+                            </div>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                </div>
+
+                <div className="stack">
+                  <h3>Fabric slots</h3>
+
+                  {fabricSlots.length === 0 ? (
+                    <div className="empty-box">No fabric slots found.</div>
+                  ) : (
+                    <ul className="hero-list">
+                      {fabricSlots.map((slot) => (
+                        <li
+                          key={slot.id}
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            gap: "8px",
+                            padding: "4px 0",
+                          }}
+                        >
+                          <span>
+                            {slot.sort_order}. {slot.label}{" "}
+                            <span
+                              style={{
+                                background: "#e5e7eb",
+                                color: "#374151",
+                                borderRadius: "6px",
+                                padding: "2px 8px",
+                                fontSize: "12px",
+                                fontWeight: 600,
+                              }}
+                            >
+                              {slot.apply_to}
+                            </span>
+                          </span>
+                          <button
+                            onClick={() => void handleDeleteFabricSlot(slot.id, slot.label)}
+                            disabled={deletingSlotId === slot.id}
+                            style={{
+                              background: "#991B1B",
+                              color: "white",
+                              border: "none",
+                              borderRadius: "6px",
+                              padding: "3px 10px",
+                              fontSize: "12px",
+                              fontWeight: 600,
+                              cursor: "pointer",
+                              flexShrink: 0,
+                            }}
+                          >
+                            {deletingSlotId === slot.id ? "Deleting..." : "Delete"}
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+
+                  <form className="stack" onSubmit={handleCreateFabricSlot}>
+                    <div className="grid-2">
+                      <label className="field">
+                        <span>Label</span>
+                        <input
+                          value={newSlotLabel}
+                          onChange={(event) => setNewSlotLabel(event.target.value)}
+                          placeholder="e.g. Shirt fabric"
+                          disabled={savingSlot}
+                        />
+                      </label>
+
+                      <label className="field">
+                        <span>Apply To</span>
+                        <input
+                          value={newSlotApplyTo}
+                          onChange={(event) => setNewSlotApplyTo(event.target.value)}
+                          placeholder="e.g. shirt, pant, outer koti, kurta"
+                          disabled={savingSlot}
+                        />
+                      </label>
+
+                      <label className="field">
+                        <span>Sort Order</span>
+                        <input
+                          type="number"
+                          min={0}
+                          value={newSlotSortOrder}
+                          onChange={(event) => setNewSlotSortOrder(Number(event.target.value))}
+                          disabled={savingSlot}
+                        />
+                      </label>
+                    </div>
+
+                    <button className="btn btn-dark" type="submit" disabled={savingSlot || !newSlotLabel.trim()}>
+                      {savingSlot ? "Adding..." : "Add slot"}
+                    </button>
+                  </form>
+                </div>
+
+                <div className="stack">
+                  <h3>Upload Catalog Images (Bulk)</h3>
+                  <p className="tiny muted">These images appear in customer Catalog under the selected garment type.</p>
+
+                  <label className="field">
+                    <span>Select Images (multiple)</span>
+                    <input
+                      type="file"
+                      accept="image/*"
+                      multiple
+                      onChange={(event) => {
+                        const nextFiles = Array.from(event.target.files ?? []);
+                        setCatalogFiles(nextFiles);
+                      }}
+                    />
+                  </label>
+
+                  <form onSubmit={handleCatalogBulkUpload}>
+                    <button className="btn btn-dark" type="submit" disabled={uploadingCatalog || !canUploadCatalog}>
+                      {uploadingCatalog ? "Uploading..." : "Upload Catalog Images"}
+                    </button>
+                  </form>
+
+                  <div className="stack">
+                    <p className="tiny muted">Recent catalog images in selected garment type:</p>
+                    {catalogImages.length === 0 ? (
+                      <div className="empty-box">No catalog images found.</div>
+                    ) : (
+                      <ul className="hero-list">
+                        {catalogImages.map((row) => (
+                          <li key={row.id}>
+                            <span>{row.original_filename || row.id}</span>
+                            <code>{row.storage_path}</code>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                </div>
+              </>
             )}
+          </div>
+        </div>
+        )}
 
-            <form className="stack" onSubmit={handleCreateFabricSlot}>
-              <div className="grid-2">
+        {showCreateModal && (
+          <div className="modal-overlay" onClick={() => setShowCreateModal(false)}>
+            <div className="card stack modal-card" onClick={(event) => event.stopPropagation()}>
+              <h2>Create Garment Type</h2>
+              <form className="stack" onSubmit={handleCreateFolder}>
                 <label className="field">
-                  <span>Label</span>
+                  <span>Garment Type Name</span>
                   <input
-                    value={newSlotLabel}
-                    onChange={(event) => setNewSlotLabel(event.target.value)}
-                    placeholder="e.g. Shirt fabric"
-                    disabled={savingSlot}
+                    value={newFolderName}
+                    onChange={(event) => setNewFolderName(event.target.value)}
+                    placeholder="e.g. Shirt, Suit"
+                    disabled={creatingFolder}
                   />
                 </label>
-
                 <label className="field">
-                  <span>Apply To</span>
-                  <input
-                    value={newSlotApplyTo}
-                    onChange={(event) => setNewSlotApplyTo(event.target.value)}
-                    placeholder="e.g. shirt, pant, outer koti, kurta"
-                    disabled={savingSlot}
+                  <span>Prompt Template (optional)</span>
+                  <textarea
+                    rows={3}
+                    value={newPromptTemplate}
+                    onChange={(event) => setNewPromptTemplate(event.target.value)}
+                    disabled={creatingFolder}
                   />
                 </label>
-
-                <label className="field">
-                  <span>Sort Order</span>
-                  <input
-                    type="number"
-                    min={0}
-                    value={newSlotSortOrder}
-                    onChange={(event) => setNewSlotSortOrder(Number(event.target.value))}
-                    disabled={savingSlot}
-                  />
-                </label>
-              </div>
-
-              <button className="btn btn-dark" type="submit" disabled={savingSlot || !newSlotLabel.trim()}>
-                {savingSlot ? "Adding..." : "Add slot"}
-              </button>
-            </form>
-          </section>
-        ) : null}
-
-        <section className="card stack">
-          <h2>Upload Catalog Images (Bulk)</h2>
-          <p className="tiny muted">These images appear in customer Catalog under the selected garment type.</p>
-
-          <label className="field">
-            <span>Select Images (multiple)</span>
-            <input
-              type="file"
-              accept="image/*"
-              multiple
-              onChange={(event) => {
-                const nextFiles = Array.from(event.target.files ?? []);
-                setCatalogFiles(nextFiles);
-              }}
-            />
-          </label>
-
-          <form onSubmit={handleCatalogBulkUpload}>
-            <button className="btn btn-dark" type="submit" disabled={uploadingCatalog || !canUploadCatalog}>
-              {uploadingCatalog ? "Uploading..." : "Upload Catalog Images"}
-            </button>
-          </form>
-
-          {selectedFolderId ? (
-            <div className="stack">
-              <p className="tiny muted">Recent catalog images in selected garment type:</p>
-              {catalogImages.length === 0 ? (
-                <div className="empty-box">No catalog images found.</div>
-              ) : (
-                <ul className="hero-list">
-                  {catalogImages.map((row) => (
-                    <li key={row.id}>
-                      <span>{row.original_filename || row.id}</span>
-                      <code>{row.storage_path}</code>
-                    </li>
-                  ))}
-                </ul>
-              )}
+                <div className="row">
+                  <button className="btn btn-dark" type="submit" disabled={creatingFolder || !newFolderName.trim()}>
+                    {creatingFolder ? "Creating..." : "Create"}
+                  </button>
+                  <button className="btn btn-light" type="button" onClick={() => setShowCreateModal(false)}>
+                    Cancel
+                  </button>
+                </div>
+              </form>
             </div>
-          ) : null}
-        </section>
-        </>
+          </div>
         )}
       </section>
     </main>

@@ -247,6 +247,129 @@ input[type="number"] {
   border-bottom: 2px solid var(--accent-dark);
 }
 
+.gt-layout {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  gap: 0.85rem;
+  align-items: start;
+}
+
+.gt-list-panel {
+  position: sticky;
+  top: 0.85rem;
+}
+
+.gt-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.gt-add-btn {
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  border-radius: 999px;
+  border: 1px solid #0b1220;
+  background: var(--accent-dark);
+  color: #fff;
+  font-size: 1.1rem;
+  font-weight: 800;
+  line-height: 1;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+
+.gt-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0.3rem;
+}
+
+.gt-list-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.55rem 0.65rem;
+  border-radius: 10px;
+  border-left: 3px solid transparent;
+  font-size: 0.9rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.gt-list-item:hover {
+  background: #f3efe7;
+}
+
+.gt-list-item-active {
+  background: #f3efe7;
+  border-left: 3px solid var(--accent-dark);
+}
+
+.gt-default-badge {
+  flex-shrink: 0;
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: #15803d;
+}
+
+.gt-detail-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.gt-hero-thumb {
+  width: 72px;
+  height: 72px;
+  flex-shrink: 0;
+  object-fit: cover;
+  border-radius: 12px;
+}
+
+.gt-hero-thumb-placeholder {
+  width: 72px;
+  height: 72px;
+  flex: 0 0 72px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: rgba(17, 24, 39, 0.5);
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+}
+
+.modal-card {
+  width: min(100%, 480px);
+  max-height: 90vh;
+  overflow-y: auto;
+}
+
+@media (max-width: 720px) {
+  .gt-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .gt-list-panel {
+    position: static;
+  }
+}
+
 @media (min-width: 860px) {
   .grid-2 {
     grid-template-columns: repeat(2, minmax(0, 1fr));
