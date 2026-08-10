@@ -482,15 +482,24 @@ def list_shops(
         except Exception:
             emails_by_uid[uid] = None
 
+    master_shop_id = get_settings().MASTER_SHOP_ID
+
     enriched = []
     for shop in shops:
         target_shop_id = str(shop.get("id") or "")
         balance = _get_shop_balance(supabase, target_shop_id) if target_shop_id else 0
         owner_auth_user_id = owners_by_shop.get(target_shop_id)
         whatsapp_phone = phones_by_shop.get(target_shop_id)
+        shop_name = str(shop.get("name") or "")
 
-        if whatsapp_phone:
+        if master_shop_id and target_shop_id == master_shop_id:
+            channel = "master"
+            whatsapp_phone = None
+        elif whatsapp_phone:
             channel = "whatsapp"
+        elif shop_name.startswith("WA "):
+            channel = "whatsapp"
+            whatsapp_phone = shop_name[len("WA "):].strip()
         elif owner_auth_user_id:
             channel = "react"
         else:
@@ -505,6 +514,7 @@ def list_shops(
                 "whatsapp_phone": whatsapp_phone,
                 "owner_email": emails_by_uid.get(owner_auth_user_id) if owner_auth_user_id else None,
                 "channel": channel,
+                "status": shop.get("status") or "active",
             }
         )
 
@@ -762,6 +772,11 @@ def grant_shop_credits(shop_id: str, body: AdminGrantCreditsRequest):
         )
 
     balances = _append_credit_ledger(supabase, shop_id=shop_id, delta=delta, reason=reason)
+
+    try:
+        supabase.table("shops").update({"status": "active"}).eq("id", shop_id).execute()
+    except Exception:
+        pass
 
     return {
         "shop_id": shop_id,

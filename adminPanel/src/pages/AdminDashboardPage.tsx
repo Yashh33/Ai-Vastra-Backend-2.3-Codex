@@ -20,6 +20,7 @@ export function AdminDashboardPage() {
   const [searchText, setSearchText] = useState("");
   const [loading, setLoading] = useState(false);
   const [statusText, setStatusText] = useState("Loading shops...");
+  const [showTrial, setShowTrial] = useState(false);
 
   const [shopName, setShopName] = useState("");
   const [email, setEmail] = useState("");
@@ -30,6 +31,11 @@ export function AdminDashboardPage() {
   const canCreate = useMemo(
     () => !!shopName.trim() && !!email.trim() && password.trim().length >= 6,
     [shopName, email, password]
+  );
+
+  const visibleShops = useMemo(
+    () => (showTrial ? shops : shops.filter((shop) => shop.status !== "trial")),
+    [shops, showTrial]
   );
 
   async function loadShops() {
@@ -179,18 +185,46 @@ export function AdminDashboardPage() {
             <button className="btn btn-light" onClick={loadShops} disabled={loading}>
               Search
             </button>
+            <label className="row tiny muted" style={{ gap: "0.35rem", cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={showTrial}
+                onChange={(event) => setShowTrial(event.target.checked)}
+              />
+              Show trial shops
+            </label>
           </div>
 
-          {shops.length === 0 ? (
+          {visibleShops.length === 0 ? (
             <div className="empty-box">No shops yet.</div>
           ) : (
             <div className="shop-grid">
-              {shops.map((shop) => (
+              {visibleShops.map((shop) => (
                 <article key={shop.id} className="shop-card">
-                  <h3>{shop.name}</h3>
+                  <h3>
+                    {shop.name}
+                    {shop.status === "trial" ? (
+                      <span
+                        style={{
+                          marginLeft: "0.4rem",
+                          fontSize: "0.7rem",
+                          fontWeight: 700,
+                          color: "#b45309",
+                          background: "#fef3c7",
+                          borderRadius: "6px",
+                          padding: "1px 6px",
+                          verticalAlign: "middle",
+                        }}
+                      >
+                        TRIAL
+                      </span>
+                    ) : null}
+                  </h3>
                   <p className="tiny muted">Shop ID: {shop.id}</p>
                   <p className="tiny muted">Credits: {shop.credits_balance ?? 0}</p>
-                  {shop.channel === "whatsapp" ? (
+                  {shop.channel === "master" ? (
+                    <p className="tiny muted">Master Template</p>
+                  ) : shop.channel === "whatsapp" ? (
                     <p className="tiny muted">
                       <strong>WhatsApp</strong> · {formatPhone(shop.whatsapp_phone) || "no number"}
                     </p>
@@ -199,7 +233,7 @@ export function AdminDashboardPage() {
                       <strong>React</strong> · {shop.owner_email || "no email"}
                     </p>
                   ) : (
-                    <p className="tiny muted">System / other</p>
+                    <p className="tiny muted">Unlinked</p>
                   )}
                   <Link className="btn btn-dark" to={`/shops/${encodeURIComponent(shop.id)}`}>
                     Manage Shop

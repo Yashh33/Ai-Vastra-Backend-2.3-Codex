@@ -384,6 +384,7 @@ def _create_session_with_shadow_shop(supabase, phone: str, profile_name: Optiona
         "name": f"WA +{phone}",
         "carousel_mode_default": False,
         "is_suspended": False,
+        "status": "trial",
     }
     try:
         shop_result = supabase.table("shops").insert(shop_payload).execute()

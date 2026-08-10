@@ -17,6 +17,7 @@ export type AdminShopRow = {
   whatsapp_phone?: string | null;
   owner_email?: string | null;
   channel?: string | null;
+  status?: string | null;
 };
 
 export type AdminCreateShopResponse = {
