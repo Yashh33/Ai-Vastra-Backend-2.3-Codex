@@ -31,6 +31,10 @@ export function AdminShopDetailPage() {
   const [carouselModeDefault, setCarouselModeDefault] = useState(false);
   const [savingShop, setSavingShop] = useState(false);
 
+  const [creditDelta, setCreditDelta] = useState("");
+  const [creditReason, setCreditReason] = useState("");
+  const [grantingCredits, setGrantingCredits] = useState(false);
+
   const [newPassword, setNewPassword] = useState("");
   const [resettingPassword, setResettingPassword] = useState(false);
 
@@ -217,6 +221,41 @@ export function AdminShopDetailPage() {
       setStatusText(`Update failed: ${err instanceof Error ? err.message : "Unknown error"}`);
     } finally {
       setSavingShop(false);
+    }
+  }
+
+  async function handleGrantCredits() {
+    if (!session || !shopId) return;
+
+    const reason = creditReason.trim();
+    const delta = Number(creditDelta);
+
+    if (!reason || !delta || Number.isNaN(delta)) {
+      setStatusText("Enter a non-zero amount and a reason to update credits.");
+      return;
+    }
+
+    setGrantingCredits(true);
+    try {
+      const result = await adminFetch<{
+        shop_id: string;
+        delta: number;
+        reason: string;
+        balance_before: number;
+        balance_after: number;
+      }>(session, `/admin/shops/${encodeURIComponent(shopId)}/credits`, {
+        method: "POST",
+        body: JSON.stringify({ delta, reason }),
+      });
+
+      setShop((prev) => (prev ? { ...prev, credits_balance: result.balance_after } : prev));
+      setCreditDelta("");
+      setCreditReason("");
+      setStatusText(`Credits updated. New balance: ${result.balance_after}`);
+    } catch (err) {
+      setStatusText(`Credits update failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      setGrantingCredits(false);
     }
   }
 
@@ -604,6 +643,40 @@ export function AdminShopDetailPage() {
               {savingShop ? "Saving..." : "Save Shop Details"}
             </button>
           </form>
+        </section>
+
+        <section className="card stack">
+          <h2>Credits</h2>
+          <p className="tiny muted">Current balance: {shop?.credits_balance ?? 0} credits</p>
+
+          <div className="grid-2">
+            <label className="field">
+              <span>Amount to Add</span>
+              <input
+                type="number"
+                value={creditDelta}
+                onChange={(event) => setCreditDelta(event.target.value)}
+                placeholder="e.g. 500 or -100"
+                disabled={grantingCredits}
+              />
+            </label>
+
+            <label className="field">
+              <span>Reason</span>
+              <input
+                value={creditReason}
+                onChange={(event) => setCreditReason(event.target.value)}
+                placeholder="e.g. Monthly grant - MaleHub"
+                disabled={grantingCredits}
+              />
+            </label>
+          </div>
+
+          <p className="tiny muted">≈ {Math.round((Number(creditDelta) || 0) / 50)} looks</p>
+
+          <button className="btn btn-dark" type="button" onClick={handleGrantCredits} disabled={grantingCredits}>
+            {grantingCredits ? "Updating..." : "Update Credits"}
+          </button>
         </section>
 
         <section className="card stack">

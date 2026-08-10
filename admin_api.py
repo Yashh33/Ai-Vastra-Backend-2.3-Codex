@@ -35,6 +35,11 @@ class AdminSuspendShopRequest(BaseModel):
     suspended: bool = True
 
 
+class AdminGrantCreditsRequest(BaseModel):
+    delta: int
+    reason: str
+
+
 class AdminCreateFolderRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
     prompt_template: str = ""
@@ -634,6 +639,55 @@ def suspend_shop(shop_id: str, body: AdminSuspendShopRequest):
     return {
         "shop_id": shop_id,
         "is_suspended": bool(rows[0].get("is_suspended", body.suspended)),
+    }
+
+
+@router.post("/shops/{shop_id}/credits")
+def grant_shop_credits(shop_id: str, body: AdminGrantCreditsRequest):
+    supabase = get_supabase_admin_client()
+
+    reason = body.reason.strip()
+    if not reason:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="reason is required",
+        )
+
+    delta = body.delta
+    if delta == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="delta must be a non-zero integer",
+        )
+
+    if abs(delta) > 1_000_000:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="delta must not exceed 1,000,000 in magnitude",
+        )
+
+    shop_check = (
+        supabase.table("shops")
+        .select("id")
+        .eq("id", shop_id)
+        .limit(1)
+        .execute()
+    )
+    shop_rows = getattr(shop_check, "data", None) or []
+    if not shop_rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Shop not found",
+        )
+
+    balances = _append_credit_ledger(supabase, shop_id=shop_id, delta=delta, reason=reason)
+
+    return {
+        "shop_id": shop_id,
+        "delta": delta,
+        "reason": reason,
+        "balance_before": balances["balance_before"],
+        "balance_after": balances["balance_after"],
     }
 
 
