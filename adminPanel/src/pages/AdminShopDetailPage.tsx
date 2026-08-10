@@ -3,7 +3,6 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { adminFetch } from "../lib/api";
 import { useAdminAuth } from "../lib/auth";
-import { createSignedUrl } from "../lib/storage";
 import type {
   AdminCatalogImageRow,
   AdminFabricSlotRow,
@@ -124,11 +123,8 @@ export function AdminShopDetailPage() {
   async function loadHeroSignedUrls(images: AdminHeroImageRow[]) {
     const urls: Record<string, string> = {};
     for (const img of images) {
-      try {
-        const url = await createSignedUrl("hero-images", img.storage_path);
-        urls[img.id] = url;
-      } catch {
-        // skip
+      if (img.signed_url) {
+        urls[img.id] = img.signed_url;
       }
     }
     setHeroSignedUrls(urls);
