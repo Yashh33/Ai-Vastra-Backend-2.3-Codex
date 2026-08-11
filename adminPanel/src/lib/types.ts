@@ -45,6 +45,7 @@ export type AdminFolderRow = {
   is_active: boolean;
   created_at: string;
   updated_at: string;
+  show_in_whatsapp_menu?: boolean;
 };
 
 export type AdminHeroImageRow = {

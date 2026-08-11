@@ -53,6 +53,10 @@ class AdminUpdateDefaultHeroRequest(BaseModel):
     default_hero_image_id: Optional[str] = Field(...)
 
 
+class AdminSetWhatsappMenuRequest(BaseModel):
+    enabled: bool
+
+
 _ALLOWED_FABRIC_SLOT_APPLY_TO = {"shirt", "pant", "suit_full_body", "suit_upper", "koti"}
 
 
@@ -1173,6 +1177,46 @@ def update_shop_folder_default_hero(
         )
 
     return rows[0]
+
+
+@router.post("/shops/{shop_id}/folders/{folder_id}/whatsapp-menu")
+def set_folder_whatsapp_menu(
+    shop_id: str,
+    folder_id: str,
+    body: AdminSetWhatsappMenuRequest,
+):
+    supabase = get_supabase_admin_client()
+
+    try:
+        result = (
+            supabase.table("garment_types")
+            .update(
+                {
+                    "show_in_whatsapp_menu": body.enabled,
+                    "updated_at": _utc_now_iso(),
+                }
+            )
+            .eq("id", folder_id)
+            .eq("shop_id", shop_id)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update WhatsApp menu flag",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Folder not found for this shop",
+        )
+
+    return {
+        "folder_id": folder_id,
+        "show_in_whatsapp_menu": body.enabled,
+    }
 
 
 @router.post("/shops/{shop_id}/folders/{folder_id}/fabric-slots")

@@ -57,6 +57,7 @@ export function AdminShopDetailPage() {
   const [newSlotSortOrder, setNewSlotSortOrder] = useState(0);
   const [savingSlot, setSavingSlot] = useState(false);
   const [deletingSlotId, setDeletingSlotId] = useState<string | null>(null);
+  const [togglingWhatsappMenu, setTogglingWhatsappMenu] = useState(false);
 
   const [processingSuspend, setProcessingSuspend] = useState(false);
   const [deletingShop, setDeletingShop] = useState(false);
@@ -536,6 +537,38 @@ export function AdminShopDetailPage() {
     }
   }
 
+  async function handleToggleWhatsappMenu(folderId: string, current: boolean) {
+    if (!session || !shopId) return;
+
+    setTogglingWhatsappMenu(true);
+    try {
+      const result = await adminFetch<{
+        folder_id: string;
+        show_in_whatsapp_menu: boolean;
+      }>(session, `/admin/shops/${encodeURIComponent(shopId)}/folders/${encodeURIComponent(folderId)}/whatsapp-menu`, {
+        method: "POST",
+        body: JSON.stringify({ enabled: !current }),
+      });
+
+      setFolders((prev) =>
+        prev.map((folder) =>
+          folder.id === folderId
+            ? { ...folder, show_in_whatsapp_menu: result.show_in_whatsapp_menu }
+            : folder
+        )
+      );
+      setStatusText(
+        result.show_in_whatsapp_menu
+          ? "Garment type added to WhatsApp menu."
+          : "Garment type removed from WhatsApp menu."
+      );
+    } catch (err) {
+      setStatusText(`WhatsApp menu update failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      setTogglingWhatsappMenu(false);
+    }
+  }
+
   async function handleToggleSuspend() {
     if (!session || !shopId || !shop) return;
 
@@ -821,6 +854,17 @@ export function AdminShopDetailPage() {
               <>
                 <div className="gt-detail-header">
                   <h2>{selectedFolder.name}</h2>
+                  <label className="row tiny">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(selectedFolder.show_in_whatsapp_menu)}
+                      onChange={() =>
+                        handleToggleWhatsappMenu(selectedFolder.id, Boolean(selectedFolder.show_in_whatsapp_menu))
+                      }
+                      disabled={togglingWhatsappMenu}
+                    />
+                    Show in WhatsApp menu
+                  </label>
                   <button
                     className="btn btn-danger"
                     type="button"
