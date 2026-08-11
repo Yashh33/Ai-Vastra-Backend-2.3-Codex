@@ -75,6 +75,9 @@ _MSG_GARMENT_MENU_INVALID = (
     "(Apna khud ka garment chahiye to 'custom' likhein)"
 )
 _MSG_GARMENT_CHOSEN_TEMPLATE = "{garment} select ho gaya âœ… Ab apne FABRIC ki photo bhejiye ðŸ“¸"
+_MSG_MULTIFABRIC_PROMPT = (
+    "Fabric #{n} of {total} bhejiye — {label} ke liye 📸 (Type 'reset' to start over)"
+)
 _MSG_ENHANCED_LOCKED = (
     "Custom garment design Enhanced plan mein milta hai â­ Interested ho to "
     "reply karein, hum aapko details bhejenge!"
@@ -195,6 +198,42 @@ def _get_shop_balance(supabase, shop_id: str) -> int:
     if not rows:
         return 0
     return int(rows[0].get("balance_after") or 0)
+
+
+def _get_shop_multifabric_enabled(supabase, shop_id: str) -> bool:
+    try:
+        result = (
+            supabase.table("shops")
+            .select("whatsapp_multifabric_enabled")
+            .eq("id", shop_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        print(f"[whatsapp_state] failed to load multifabric flag for shop {shop_id}: {exc}")
+        return False
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        return False
+    return bool(rows[0].get("whatsapp_multifabric_enabled") or False)
+
+
+def _load_fabric_slots(supabase, folder_id: str) -> list[dict]:
+    try:
+        result = (
+            supabase.table("garment_fabric_slots")
+            .select("label, apply_to, sort_order")
+            .eq("folder_id", folder_id)
+            .order("sort_order")
+            .limit(3)
+            .execute()
+        )
+    except Exception as exc:
+        print(f"[whatsapp_state] failed to load fabric slots for folder {folder_id}: {exc}")
+        return []
+
+    return getattr(result, "data", None) or []
 
 
 def _update_session(supabase, session_id: str, payload: dict) -> None:
@@ -455,6 +494,7 @@ def _reset_to_choosing_garment(supabase, session: dict, *, reply: str) -> None:
             "hero_image_id": None,
             "active_generation_id": None,
             "error_detail": None,
+            "pending_fabrics": None,
         },
     )
 
@@ -534,6 +574,113 @@ def _handle_fabric_image(
             },
         )
         send_text(phone, _MSG_FABRIC_RECEIVED)
+
+
+def _handle_collecting_fabrics(supabase, session: dict, msg: dict) -> None:
+    phone = session["phone_number"]
+    shop_id = session["shop_id"]
+    session_id = session["id"]
+    kind = msg.get("kind")
+
+    slots = _load_fabric_slots(supabase, session["folder_id"])
+    pending = session.get("pending_fabrics") or []
+    index = len(pending)
+
+    if index >= len(slots):
+        # Safety: somehow already have enough fabrics â€” treat collection as complete.
+        _update_session(
+            supabase,
+            session_id,
+            {
+                "state": "CHOOSING_MODE",
+                "pending_fabrics": pending,
+                "fabric_image_id": pending[0]["fabric_image_id"],
+                "active_generation_id": None,
+            },
+        )
+        send_text(phone, _MSG_CHOOSE_MODE)
+        return
+
+    current_slot = slots[index]
+
+    if kind != "image":
+        if kind == "text":
+            send_text(
+                phone,
+                _MSG_MULTIFABRIC_PROMPT.format(n=index + 1, total=len(slots), label=current_slot["label"]),
+            )
+        else:
+            send_text(phone, _MSG_ONLY_PHOTO)
+        _update_session(supabase, session_id, {})
+        return
+
+    media_id = msg.get("media_id")
+    if not media_id:
+        send_text(phone, _MSG_MEDIA_DOWNLOAD_FAILED)
+        _update_session(supabase, session_id, {})
+        return
+
+    try:
+        content, mime_type = download_media(media_id)
+    except WhatsAppTransportError as exc:
+        print(f"[whatsapp_state] multifabric media download failed: {exc}")
+        send_text(phone, _MSG_MEDIA_DOWNLOAD_FAILED)
+        _update_session(supabase, session_id, {})
+        return
+
+    if len(content) > _MAX_MEDIA_BYTES:
+        send_text(phone, _MSG_MEDIA_TOO_LARGE)
+        _update_session(supabase, session_id, {})
+        return
+
+    ts = int(time.time())
+    storage_path = f"{shop_id}/wa-{ts}-{uuid4().hex[:8]}.jpg"
+
+    _upload_bytes(
+        supabase,
+        bucket="fabric-images",
+        path=storage_path,
+        data=content,
+        content_type=mime_type or "image/jpeg",
+    )
+
+    fabric_payload = {
+        "shop_id": shop_id,
+        "storage_path": storage_path,
+        "original_filename": f"wa-fabric-{ts}",
+        "mime_type": mime_type or "image/jpeg",
+        "file_size_bytes": len(content),
+        "width": None,
+        "height": None,
+    }
+    fabric_result = supabase.table("fabric_images").insert(fabric_payload).execute()
+    fabric_rows = getattr(fabric_result, "data", None) or []
+    if not fabric_rows:
+        raise RuntimeError("Failed to save fabric image metadata")
+    fabric_image_id = str(fabric_rows[0]["id"])
+
+    pending = pending + [{"fabric_image_id": fabric_image_id, "apply_to": current_slot["apply_to"]}]
+    next_index = index + 1
+
+    if next_index < len(slots):
+        _update_session(supabase, session_id, {"pending_fabrics": pending})
+        send_text(
+            phone,
+            _MSG_MULTIFABRIC_PROMPT.format(n=next_index + 1, total=len(slots), label=slots[next_index]["label"]),
+        )
+        return
+
+    _update_session(
+        supabase,
+        session_id,
+        {
+            "state": "CHOOSING_MODE",
+            "pending_fabrics": pending,
+            "fabric_image_id": pending[0]["fabric_image_id"],
+            "active_generation_id": None,
+        },
+    )
+    send_text(phone, _MSG_CHOOSE_MODE)
 
 
 def _handle_garment_image(supabase, session: dict, msg: dict) -> None:
@@ -619,15 +766,28 @@ def create_generation_for_session(supabase, session: dict) -> None:
         _update_session(supabase, session["id"], {"state": "DELIVERED"})
         return
 
-    normalized_fabrics = [
-        {
-            "fabric_image_id": fabric_image_id,
-            "apply_to": "suit_full_body",
-            "fabric_code": "unknown",
-            "fabric_color": None,
-            "fabric_scale": None,
-        }
-    ]
+    pending_fabrics = session.get("pending_fabrics") or []
+    if pending_fabrics:
+        normalized_fabrics = [
+            {
+                "fabric_image_id": item["fabric_image_id"],
+                "apply_to": item["apply_to"],
+                "fabric_code": "unknown",
+                "fabric_color": None,
+                "fabric_scale": None,
+            }
+            for item in pending_fabrics
+        ]
+    else:
+        normalized_fabrics = [
+            {
+                "fabric_image_id": fabric_image_id,
+                "apply_to": "suit_full_body",
+                "fabric_code": "unknown",
+                "fabric_color": None,
+                "fabric_scale": None,
+            }
+        ]
 
     folder_result = (
         supabase.table("garment_types")
@@ -982,6 +1142,31 @@ def _dispatch(supabase, session: dict, msg: dict) -> None:
             _update_session(supabase, session_id, {})
             return
 
+        multifabric_enabled = _get_shop_multifabric_enabled(supabase, session["shop_id"])
+        fabric_slots = _load_fabric_slots(supabase, session["folder_id"]) if multifabric_enabled else []
+
+        if multifabric_enabled and fabric_slots:
+            settings = get_settings()
+            if _get_shop_balance(supabase, session["shop_id"]) < settings.CREDITS_PER_IMAGE:
+                send_text(phone, _MSG_NO_CREDITS)
+                _update_session(supabase, session_id, {})
+                return
+
+            _update_session(
+                supabase,
+                session_id,
+                {
+                    "state": "COLLECTING_FABRICS",
+                    "hero_image_id": hero_image_id,
+                    "pending_fabrics": [],
+                },
+            )
+            send_text(
+                phone,
+                _MSG_MULTIFABRIC_PROMPT.format(n=1, total=len(fabric_slots), label=fabric_slots[0]["label"]),
+            )
+            return
+
         _update_session(
             supabase,
             session_id,
@@ -999,6 +1184,10 @@ def _dispatch(supabase, session: dict, msg: dict) -> None:
         else:
             send_text(phone, _MSG_ONLY_PHOTO)
             _update_session(supabase, session_id, {})
+        return
+
+    if state == "COLLECTING_FABRICS":
+        _handle_collecting_fabrics(supabase, session, msg)
         return
 
     if state == "WAITING_GARMENT":
