@@ -342,9 +342,80 @@ def _resolve_shadow_hero_image(supabase, *, shop_id: str, folder_id: str, templa
     return str(rows[0]["id"])
 
 
+def _load_own_menu_templates(supabase, shop_id: str) -> list[dict]:
+    """A shop's own WhatsApp-menu garment types, if any are flagged. These
+    already have real hero_images rows in the shop, so no copy trick is
+    needed â€” unlike master templates, which are only borrowed by reference."""
+    try:
+        folder_result = (
+            supabase.table("garment_types")
+            .select("id, name, default_hero_image_id")
+            .eq("shop_id", shop_id)
+            .eq("is_active", True)
+            .eq("show_in_whatsapp_menu", True)
+            .order("name")
+            .execute()
+        )
+        folder_rows = getattr(folder_result, "data", None) or []
+        if not folder_rows:
+            return []
+
+        folder_ids = [str(row["id"]) for row in folder_rows]
+        hero_result = (
+            supabase.table("hero_images")
+            .select("id, folder_id, storage_path, mime_type, created_at")
+            .eq("shop_id", shop_id)
+            .in_("folder_id", folder_ids)
+            .order("created_at", desc=True)
+            .execute()
+        )
+        hero_rows = getattr(hero_result, "data", None) or []
+
+        heroes_by_id = {str(row["id"]): row for row in hero_rows}
+        latest_hero_by_folder: dict = {}
+        for row in hero_rows:
+            folder_id = str(row["folder_id"])
+            if folder_id not in latest_hero_by_folder:
+                latest_hero_by_folder[folder_id] = row
+
+        templates: list[dict] = []
+        for folder in folder_rows:
+            folder_id = str(folder["id"])
+            default_hero_id = folder.get("default_hero_image_id")
+            hero = heroes_by_id.get(str(default_hero_id)) if default_hero_id else None
+            if hero is None:
+                hero = latest_hero_by_folder.get(folder_id)
+            if hero is None:
+                # No hero image at all for this garment type â€” not selectable.
+                continue
+
+            templates.append(
+                {
+                    "folder_id": folder_id,
+                    "name": str(folder["name"]),
+                    "hero_image_id": str(hero["id"]),
+                    "hero_storage_path": str(hero["storage_path"]),
+                    "hero_mime_type": str(hero.get("mime_type") or "image/jpeg"),
+                    "is_own": True,
+                }
+            )
+
+        return templates
+    except Exception as exc:
+        print(f"[whatsapp_state] failed to load own menu templates for shop {shop_id}: {exc}")
+        return []
+
+
+def _get_menu_templates(supabase, session: dict) -> tuple[list[dict], bool]:
+    own = _load_own_menu_templates(supabase, session["shop_id"])
+    if own:
+        return own, True
+    return get_master_templates(supabase), False
+
+
 def _send_garment_menu(supabase, session: dict, *, extra_fields: Optional[dict] = None) -> None:
     phone = session["phone_number"]
-    templates = get_master_templates(supabase)
+    templates, _is_own = _get_menu_templates(supabase, session)
     rows = [{"id": t["folder_id"], "title": t["name"]} for t in templates]
 
     send_interactive_list(
@@ -1113,7 +1184,7 @@ def _dispatch(supabase, session: dict, msg: dict) -> None:
                 _update_session(supabase, session_id, {})
             return
 
-        templates = get_master_templates(supabase)
+        templates, _is_own = _get_menu_templates(supabase, session)
         template = None
 
         if kind == "interactive":
@@ -1129,18 +1200,28 @@ def _dispatch(supabase, session: dict, msg: dict) -> None:
             _update_session(supabase, session_id, {})
             return
 
-        try:
-            hero_image_id = _resolve_shadow_hero_image(
-                supabase,
-                shop_id=session["shop_id"],
-                folder_id=session["folder_id"],
-                template=template,
-            )
-        except Exception as exc:
-            print(f"[whatsapp_state] failed to resolve master hero image: {exc}")
-            send_text(phone, _MSG_TECH_ERROR)
-            _update_session(supabase, session_id, {})
-            return
+        folder_override: Optional[dict] = None
+
+        if template.get("is_own"):
+            # Own garment â€” hero image already lives in this shop, and slots
+            # / prompt context must come from the own garment's folder, not
+            # the generic WhatsApp container folder.
+            hero_image_id = template["hero_image_id"]
+            session["folder_id"] = template["folder_id"]
+            folder_override = {"folder_id": template["folder_id"]}
+        else:
+            try:
+                hero_image_id = _resolve_shadow_hero_image(
+                    supabase,
+                    shop_id=session["shop_id"],
+                    folder_id=session["folder_id"],
+                    template=template,
+                )
+            except Exception as exc:
+                print(f"[whatsapp_state] failed to resolve master hero image: {exc}")
+                send_text(phone, _MSG_TECH_ERROR)
+                _update_session(supabase, session_id, {})
+                return
 
         multifabric_enabled = _get_shop_multifabric_enabled(supabase, session["shop_id"])
         fabric_slots = _load_fabric_slots(supabase, session["folder_id"]) if multifabric_enabled else []
@@ -1152,26 +1233,24 @@ def _dispatch(supabase, session: dict, msg: dict) -> None:
                 _update_session(supabase, session_id, {})
                 return
 
-            _update_session(
-                supabase,
-                session_id,
-                {
-                    "state": "COLLECTING_FABRICS",
-                    "hero_image_id": hero_image_id,
-                    "pending_fabrics": [],
-                },
-            )
+            collecting_payload = {
+                "state": "COLLECTING_FABRICS",
+                "hero_image_id": hero_image_id,
+                "pending_fabrics": [],
+            }
+            if folder_override:
+                collecting_payload.update(folder_override)
+            _update_session(supabase, session_id, collecting_payload)
             send_text(
                 phone,
                 _MSG_MULTIFABRIC_PROMPT.format(n=1, total=len(fabric_slots), label=fabric_slots[0]["label"]),
             )
             return
 
-        _update_session(
-            supabase,
-            session_id,
-            {"state": "WAITING_FABRIC", "hero_image_id": hero_image_id},
-        )
+        waiting_payload = {"state": "WAITING_FABRIC", "hero_image_id": hero_image_id}
+        if folder_override:
+            waiting_payload.update(folder_override)
+        _update_session(supabase, session_id, waiting_payload)
         send_text(phone, _MSG_GARMENT_CHOSEN_TEMPLATE.format(garment=template["name"]))
         return
 
