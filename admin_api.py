@@ -40,6 +40,10 @@ class AdminGrantCreditsRequest(BaseModel):
     reason: str
 
 
+class AdminSetWhatsappMultifabricRequest(BaseModel):
+    enabled: bool
+
+
 class AdminCreateFolderRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
     prompt_template: str = ""
@@ -784,6 +788,34 @@ def grant_shop_credits(shop_id: str, body: AdminGrantCreditsRequest):
         "reason": reason,
         "balance_before": balances["balance_before"],
         "balance_after": balances["balance_after"],
+    }
+
+
+@router.post("/shops/{shop_id}/whatsapp-multifabric")
+def set_whatsapp_multifabric(shop_id: str, body: AdminSetWhatsappMultifabricRequest):
+    supabase = get_supabase_admin_client()
+
+    shop_check = (
+        supabase.table("shops")
+        .select("id")
+        .eq("id", shop_id)
+        .limit(1)
+        .execute()
+    )
+    shop_rows = getattr(shop_check, "data", None) or []
+    if not shop_rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Shop not found",
+        )
+
+    supabase.table("shops").update(
+        {"whatsapp_multifabric_enabled": body.enabled}
+    ).eq("id", shop_id).execute()
+
+    return {
+        "shop_id": shop_id,
+        "whatsapp_multifabric_enabled": body.enabled,
     }
 
 

@@ -60,6 +60,7 @@ export function AdminShopDetailPage() {
 
   const [processingSuspend, setProcessingSuspend] = useState(false);
   const [deletingShop, setDeletingShop] = useState(false);
+  const [togglingMultifabric, setTogglingMultifabric] = useState(false);
 
   const [activeTab, setActiveTab] = useState<"overview" | "garments">("overview");
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -256,6 +257,36 @@ export function AdminShopDetailPage() {
       setStatusText(`Credits update failed: ${err instanceof Error ? err.message : "Unknown error"}`);
     } finally {
       setGrantingCredits(false);
+    }
+  }
+
+  async function handleToggleMultifabric() {
+    if (!session || !shopId || !shop) return;
+
+    const nextEnabled = !Boolean(shop.whatsapp_multifabric_enabled);
+
+    setTogglingMultifabric(true);
+    try {
+      const result = await adminFetch<{
+        shop_id: string;
+        whatsapp_multifabric_enabled: boolean;
+      }>(session, `/admin/shops/${encodeURIComponent(shopId)}/whatsapp-multifabric`, {
+        method: "POST",
+        body: JSON.stringify({ enabled: nextEnabled }),
+      });
+
+      setShop((prev) =>
+        prev ? { ...prev, whatsapp_multifabric_enabled: result.whatsapp_multifabric_enabled } : prev
+      );
+      setStatusText(
+        result.whatsapp_multifabric_enabled
+          ? "WhatsApp multi-fabric enabled."
+          : "WhatsApp multi-fabric disabled."
+      );
+    } catch (err) {
+      setStatusText(`WhatsApp multi-fabric update failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      setTogglingMultifabric(false);
     }
   }
 
@@ -676,6 +707,25 @@ export function AdminShopDetailPage() {
 
           <button className="btn btn-dark" type="button" onClick={handleGrantCredits} disabled={grantingCredits}>
             {grantingCredits ? "Updating..." : "Update Credits"}
+          </button>
+        </section>
+
+        <section className="card stack">
+          <h2>WhatsApp Multi-Fabric</h2>
+          <p className="tiny muted">
+            Status: {shop?.whatsapp_multifabric_enabled ? "Enabled" : "Disabled"}
+          </p>
+          <button
+            className="btn btn-light"
+            type="button"
+            onClick={handleToggleMultifabric}
+            disabled={togglingMultifabric}
+          >
+            {togglingMultifabric
+              ? "Updating..."
+              : shop?.whatsapp_multifabric_enabled
+                ? "Disable"
+                : "Enable"}
           </button>
         </section>
 
