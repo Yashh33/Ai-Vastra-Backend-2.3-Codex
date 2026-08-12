@@ -57,9 +57,6 @@ class AdminSetWhatsappMenuRequest(BaseModel):
     enabled: bool
 
 
-_ALLOWED_FABRIC_SLOT_APPLY_TO = {"shirt", "pant", "suit_full_body", "suit_upper", "koti"}
-
-
 class AdminCreateFabricSlotRequest(BaseModel):
     label: str = Field(..., min_length=1, max_length=80)
     apply_to: str
@@ -1243,10 +1240,10 @@ def create_folder_fabric_slot(
         )
 
     apply_to = (body.apply_to or "").strip().lower()
-    if apply_to not in _ALLOWED_FABRIC_SLOT_APPLY_TO:
+    if not apply_to:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="apply_to must be one of: shirt, pant, suit_full_body, suit_upper, koti",
+            detail="apply_to is required",
         )
 
     existing_result = (
