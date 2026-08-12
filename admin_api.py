@@ -1046,16 +1046,14 @@ async def upload_shop_logo(shop_id: str, file: UploadFile = File(...)):
 
 
 @router.get("/shops/{shop_id}/folders")
-def list_shop_folders(shop_id: str):
+def list_shop_folders(shop_id: str, include_archived: bool = Query(default=False)):
     supabase = get_supabase_admin_client()
 
-    result = (
-        supabase.table("garment_types")
-        .select("*")
-        .eq("shop_id", shop_id)
-        .order("created_at", desc=True)
-        .execute()
-    )
+    query = supabase.table("garment_types").select("*").eq("shop_id", shop_id)
+    if not include_archived:
+        query = query.or_("is_active.is.null,is_active.eq.true")
+
+    result = query.order("created_at", desc=True).execute()
 
     return getattr(result, "data", None) or []
 
@@ -1103,16 +1101,69 @@ async def delete_folder(
 ):
     supabase = get_supabase_admin_client()
 
+    folder_check = (
+        supabase.table("garment_types")
+        .select("id")
+        .eq("id", folder_id)
+        .eq("shop_id", shop_id)
+        .limit(1)
+        .execute()
+    )
+    if not (getattr(folder_check, "data", None) or []):
+        raise HTTPException(status_code=404, detail="Folder not found")
+
+    generations_result = (
+        supabase.table("generations")
+        .select("id")
+        .eq("folder_id", folder_id)
+        .eq("shop_id", shop_id)
+        .execute()
+    )
+    generations_count = len(getattr(generations_result, "data", None) or [])
+
+    def _archive() -> dict:
+        supabase.table("garment_types").update({"is_active": False}).eq("id", folder_id).eq(
+            "shop_id", shop_id
+        ).execute()
+        return {"deleted": False, "archived": True, "generations": generations_count}
+
+    if generations_count > 0:
+        return _archive()
+
+    try:
+        result = (
+            supabase.table("garment_types")
+            .delete()
+            .eq("id", folder_id)
+            .eq("shop_id", shop_id)
+            .execute()
+        )
+    except Exception:
+        return _archive()
+
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Folder not found")
+    return {"deleted": folder_id, "archived": False}
+
+
+@router.patch("/shops/{shop_id}/folders/{folder_id}/restore")
+def restore_folder(
+    shop_id: str,
+    folder_id: str,
+    _: None = Depends(verify_admin_secret),
+):
+    supabase = get_supabase_admin_client()
+
     result = (
         supabase.table("garment_types")
-        .delete()
+        .update({"is_active": True})
         .eq("id", folder_id)
         .eq("shop_id", shop_id)
         .execute()
     )
     if not result.data:
         raise HTTPException(status_code=404, detail="Folder not found")
-    return {"deleted": folder_id}
+    return {"restored": folder_id}
 
 
 @router.patch("/shops/{shop_id}/folders/{folder_id}/default-hero")

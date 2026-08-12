@@ -19,6 +19,7 @@ export function AdminShopDetailPage() {
 
   const [shop, setShop] = useState<AdminShopRow | null>(null);
   const [folders, setFolders] = useState<AdminFolderRow[]>([]);
+  const [showArchived, setShowArchived] = useState(false);
   const [heroImages, setHeroImages] = useState<AdminHeroImageRow[]>([]);
   const [heroSignedUrls, setHeroSignedUrls] = useState<Record<string, string>>({});
   const [catalogImages, setCatalogImages] = useState<AdminCatalogImageRow[]>([]);
@@ -83,9 +84,11 @@ export function AdminShopDetailPage() {
     try {
       const [shopRow, folderRows] = await Promise.all([
         adminFetch<AdminShopRow>(session, `/admin/shops/${encodeURIComponent(shopId)}`, { method: "GET" }),
-        adminFetch<AdminFolderRow[]>(session, `/admin/shops/${encodeURIComponent(shopId)}/folders`, {
-          method: "GET",
-        }),
+        adminFetch<AdminFolderRow[]>(
+          session,
+          `/admin/shops/${encodeURIComponent(shopId)}/folders?include_archived=${showArchived}`,
+          { method: "GET" }
+        ),
       ]);
 
       setShop(shopRow);
@@ -175,7 +178,7 @@ export function AdminShopDetailPage() {
 
   useEffect(() => {
     void loadShopData();
-  }, [session, shopId]);
+  }, [session, shopId, showArchived]);
 
   useEffect(() => {
     if (!selectedFolderId) {
@@ -516,23 +519,46 @@ export function AdminShopDetailPage() {
     }
   }
 
-  async function handleDeleteFolder(folderId: string, folderName: string) {
+  async function handleArchiveFolder(folderId: string, folderName: string) {
     if (!session) return;
     const confirmed = window.confirm(
-      `Delete garment type "${folderName}"? This cannot be undone.`
+      `Archive garment type "${folderName}"? Types with no generation history are deleted outright; ` +
+        `types with history are archived and can be restored later.`
     );
     if (!confirmed) return;
     try {
-      await adminFetch(
-        session,
-        `/admin/shops/${shopId}/folders/${folderId}`,
-        { method: "DELETE" }
-      );
-      setStatusText(`Deleted "${folderName}".`);
+      const result = await adminFetch<{
+        deleted: string | false;
+        archived: boolean;
+        generations?: number;
+      }>(session, `/admin/shops/${shopId}/folders/${folderId}`, { method: "DELETE" });
+
+      if (result.archived) {
+        setStatusText(`Archived "${folderName}" (has ${result.generations ?? 0} generations in history).`);
+      } else {
+        setStatusText(`Deleted "${folderName}".`);
+      }
       await loadShopData();
     } catch (err) {
       setStatusText(
-        `Failed to delete: ${err instanceof Error ? err.message : "Unknown error"}`
+        `Failed to archive: ${err instanceof Error ? err.message : "Unknown error"}`
+      );
+    }
+  }
+
+  async function handleRestoreFolder(folderId: string, folderName: string) {
+    if (!session || !shopId) return;
+    try {
+      await adminFetch(
+        session,
+        `/admin/shops/${encodeURIComponent(shopId)}/folders/${encodeURIComponent(folderId)}/restore`,
+        { method: "PATCH" }
+      );
+      setStatusText(`Restored "${folderName}".`);
+      await loadShopData();
+    } catch (err) {
+      setStatusText(
+        `Failed to restore: ${err instanceof Error ? err.message : "Unknown error"}`
       );
     }
   }
@@ -823,26 +849,57 @@ export function AdminShopDetailPage() {
               </button>
             </div>
 
+            <label className="row tiny" style={{ margin: "0.1rem 0 0.3rem" }}>
+              <input
+                type="checkbox"
+                checked={showArchived}
+                onChange={(event) => setShowArchived(event.target.checked)}
+              />
+              Show archived
+            </label>
+
             {folders.length === 0 ? (
               <p className="tiny muted">No garment types yet. Click + to create one.</p>
             ) : (
               <ul className="gt-list">
-                {folders.map((folder) => (
-                  <li
-                    key={folder.id}
-                    className={
-                      folder.id === selectedFolderId
-                        ? "gt-list-item gt-list-item-active"
-                        : "gt-list-item"
-                    }
-                    onClick={() => setSelectedFolderId(folder.id)}
-                  >
-                    <span>{folder.name}</span>
-                    {folder.default_hero_image_id ? (
-                      <span className="gt-default-badge">Default set ✓</span>
-                    ) : null}
-                  </li>
-                ))}
+                {folders.map((folder) => {
+                  const archived = folder.is_active === false;
+                  return (
+                    <li
+                      key={folder.id}
+                      className={
+                        folder.id === selectedFolderId
+                          ? "gt-list-item gt-list-item-active"
+                          : "gt-list-item"
+                      }
+                      style={archived ? { opacity: 0.6 } : undefined}
+                      onClick={() => setSelectedFolderId(folder.id)}
+                    >
+                      <span>{folder.name}</span>
+                      {archived ? (
+                        <span className="tiny" style={{ color: "#92400e", fontWeight: 700 }}>
+                          Archived
+                        </span>
+                      ) : null}
+                      {folder.default_hero_image_id ? (
+                        <span className="gt-default-badge">Default set ✓</span>
+                      ) : null}
+                      {archived ? (
+                        <button
+                          type="button"
+                          className="btn btn-light"
+                          style={{ minHeight: "auto", padding: "0.2rem 0.5rem", fontSize: "0.75rem" }}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void handleRestoreFolder(folder.id, folder.name);
+                          }}
+                        >
+                          Restore
+                        </button>
+                      ) : null}
+                    </li>
+                  );
+                })}
               </ul>
             )}
           </div>
@@ -868,9 +925,9 @@ export function AdminShopDetailPage() {
                   <button
                     className="btn btn-danger"
                     type="button"
-                    onClick={() => handleDeleteFolder(selectedFolder.id, selectedFolder.name)}
+                    onClick={() => handleArchiveFolder(selectedFolder.id, selectedFolder.name)}
                   >
-                    Delete garment type
+                    Archive garment type
                   </button>
                 </div>
 
