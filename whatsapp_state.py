@@ -1223,10 +1223,9 @@ def _dispatch(supabase, session: dict, msg: dict) -> None:
                 _update_session(supabase, session_id, {})
                 return
 
-        multifabric_enabled = _get_shop_multifabric_enabled(supabase, session["shop_id"])
-        fabric_slots = _load_fabric_slots(supabase, session["folder_id"]) if multifabric_enabled else []
+        fabric_slots = _load_fabric_slots(supabase, session["folder_id"]) if template.get("is_own") else []
 
-        if multifabric_enabled and fabric_slots:
+        if template.get("is_own") and fabric_slots:
             settings = get_settings()
             if _get_shop_balance(supabase, session["shop_id"]) < settings.CREDITS_PER_IMAGE:
                 send_text(phone, _MSG_NO_CREDITS)
