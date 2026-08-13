@@ -45,27 +45,23 @@ def _build_task_intro(
     folder_name: str | None = None,
     fabric_scale: str | None = None,
 ) -> str:
-    folder_str = f" {folder_name.strip()}" if folder_name and folder_name.strip() else ""
-
     if len(fabric_assignments) <= 1:
-        target = _format_apply_to_label(
-            fabric_assignments[0].get("apply_to")
-            if fabric_assignments
-            else "suit_full_body"
-        )
         scale_line = (
             f"\n{FABRIC_SCALE_HINTS[fabric_scale]}"
             if fabric_scale and fabric_scale in FABRIC_SCALE_HINTS
             else ""
         )
-        return f"""Image 1: hero photograph — use for pose, identity, scene, \
-lighting, and garment cut.
-Image 2: fabric material reference — use for color, weave, \
-sheen, and texture quality.{scale_line}
+        return f"""Image 1: hero photograph — the EXACT garment to \
+reproduce (garment type, cut, length, collar, sleeves, closures, \
+construction) plus pose, identity, scene, and lighting.
+Image 2: fabric material reference — use ONLY for color, weave, \
+sheen, and texture.{scale_line}
 
 Generate a new photograph of the same person, in the same pose \
-and scene, wearing a{folder_str} {target} garment tailored from \
-the cloth shown in the fabric image.""".strip()
+and scene, wearing the SAME garment shown in Image 1 — identical \
+garment type and construction — re-tailored from the cloth in \
+Image 2. Do not change the garment type or invent a different \
+garment (for example, do not turn it into a suit).""".strip()
 
     mapping_lines = [
         f"- Fabric image {idx} -> "
@@ -82,6 +78,9 @@ lighting, and garment cut.
 Images 2..N: fabric material references — each assigned to a \
 garment target below.{scale_line}
 
+The garment type, cut, and construction must match Image 1 (the \
+hero) exactly; apply each fabric only to its assigned region.
+
 Generate a new photograph of the same person, in the same pose \
 and scene, wearing garments tailored from their assigned cloth.
 Fabric-to-garment mapping:
@@ -89,6 +88,11 @@ Fabric-to-garment mapping:
 
 
 BASE_GARMENT_FABRIC_PROMPT = """
+The output garment MUST be the same garment shown in the hero \
+image — same garment type, silhouette, length, collar, sleeves, \
+closures, and construction. Do NOT substitute, restyle, or \
+invent a different garment; only the fabric/material changes.
+
 The cloth from the fabric image has been cut and sewn into \
 the garment by a skilled tailor. Reconstruct how this cloth \
 would look as a finished, worn garment:
@@ -101,8 +105,6 @@ elbows, chest, and waist.
 - Pattern lines follow the garment's seams and contours; \
 they are not flat or perfectly grid-aligned across the \
 whole surface.
-- Garment silhouette, cut, lapels, buttons, collar, \
-and construction details remain exactly as in the hero image.
 - Person, face, body, pose, expression, camera angle, \
 framing, background, and scene remain exactly as in \
 the hero image.
@@ -177,8 +179,6 @@ Output: one photorealistic photograph.""".strip()
 
 
 def build_tryon_quick_prompt(folder_name: str | None = None) -> str:
-    folder_str = f" {folder_name.strip()}" if folder_name and folder_name.strip() else ""
-
     return f"""Image 1: Hero garment photograph — use for \
 garment cut, silhouette, lapel style, button placement, \
 collar, seams, and all construction details.
@@ -189,8 +189,10 @@ identity, face, body shape, body proportions, skin tone, \
 and pose.
 
 Generate a new photograph of the customer from Image 3 \
-wearing a{folder_str} garment with the cut and construction \
-of Image 1, tailored from the cloth shown in Image 2.
+wearing the SAME garment type shown in Image 1 (same cut, \
+silhouette, collar, sleeves, closures, construction), \
+tailored from the cloth in Image 2. Do not change the \
+garment type.
 
 The garment construction details (lapels, buttons, collar, \
 seams) must match Image 1 exactly. The fabric material \
