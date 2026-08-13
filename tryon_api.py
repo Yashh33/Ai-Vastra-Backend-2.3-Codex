@@ -54,6 +54,7 @@ class TryOnRequest(BaseModel):
 
 class TryOnQuickRequest(BaseModel):
     fabric_image_id: str = Field(..., min_length=1)
+    fabric_image_ids: Optional[list[str]] = Field(default=None)
     folder_id: str = Field(..., min_length=1)
     customer_photo_b64: str = Field(..., min_length=1)
     customer_photo_mime: str = Field(
@@ -595,22 +596,40 @@ def tryon_quick(
         )
     hero = hero_rows[0]
 
-    # Fetch fabric image storage path
-    fabric_result = (
-        supabase.table("fabric_images")
-        .select("id, storage_path, mime_type")
-        .eq("id", body.fabric_image_id.strip())
-        .eq("shop_id", shop_id)
-        .limit(1)
+    # Fetch this garment's fabric slots (multi-fabric garments, e.g. saree)
+    slots_result = (
+        supabase.table("garment_fabric_slots")
+        .select("id, sort_order")
+        .eq("folder_id", body.folder_id.strip())
+        .order("sort_order")
+        .limit(6)
         .execute()
     )
-    fabric_rows = getattr(fabric_result, "data", None) or []
-    if not fabric_rows:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Fabric image not found",
+    slot_rows = getattr(slots_result, "data", None) or []
+
+    if slot_rows and body.fabric_image_ids:
+        fabric_ids = [fid.strip() for fid in body.fabric_image_ids if fid and fid.strip()]
+    else:
+        fabric_ids = [body.fabric_image_id.strip()]
+
+    # Fetch fabric image storage paths, in the given order
+    fabric_images: list[dict] = []
+    for fabric_id in fabric_ids:
+        fabric_result = (
+            supabase.table("fabric_images")
+            .select("id, storage_path, mime_type")
+            .eq("id", fabric_id)
+            .eq("shop_id", shop_id)
+            .limit(1)
+            .execute()
         )
-    fabric = fabric_rows[0]
+        fabric_rows = getattr(fabric_result, "data", None) or []
+        if not fabric_rows:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Fabric image not found",
+            )
+        fabric_images.append(fabric_rows[0])
 
     # Download hero and fabric images from storage
     hero_bytes = _fetch_storage_bytes(
@@ -618,11 +637,13 @@ def tryon_quick(
         "hero-images",
         hero["storage_path"],
     )
-    fabric_bytes = _fetch_storage_bytes(
-        supabase,
-        "fabric-images",
-        fabric["storage_path"],
-    )
+    fabric_image_parts = [
+        (
+            _fetch_storage_bytes(supabase, "fabric-images", fabric["storage_path"]),
+            fabric.get("mime_type") or "image/jpeg",
+        )
+        for fabric in fabric_images
+    ]
 
     # Decode customer photo (never stored)
     customer_bytes = _decode_photo(body.customer_photo_b64)
@@ -633,12 +654,12 @@ def tryon_quick(
     else:
         prompt = build_tryon_quick_prompt(folder_name=folder_name)
 
-    # Call Gemini: hero first, fabric second, customer third
+    # Call Gemini: hero first, then fabrics in slot order, customer last
     return _call_gemini_tryon(
         prompt=prompt,
         image_parts=[
             (hero_bytes, hero.get("mime_type") or "image/jpeg"),
-            (fabric_bytes, fabric.get("mime_type") or "image/jpeg"),
+            *fabric_image_parts,
             (customer_bytes, body.customer_photo_mime),
         ],
     )

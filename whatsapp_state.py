@@ -938,8 +938,8 @@ def _start_consent_flow(supabase, session: dict) -> None:
 
 
 def _prepare_direct_tryon_assets(
-    supabase, shop_id: str, hero_image_id: str, fabric_image_id: str
-) -> tuple[bytes, str, bytes, str]:
+    supabase, shop_id: str, hero_image_id: str, fabric_image_ids: list[str]
+) -> tuple[bytes, str, list[tuple[bytes, str]]]:
     hero_result = (
         supabase.table("hero_images")
         .select("id, storage_path, mime_type")
@@ -953,27 +953,29 @@ def _prepare_direct_tryon_assets(
         raise RuntimeError("Hero image not found for direct try-on")
     hero = hero_rows[0]
 
-    fabric_result = (
-        supabase.table("fabric_images")
-        .select("id, storage_path, mime_type")
-        .eq("id", fabric_image_id)
-        .eq("shop_id", shop_id)
-        .limit(1)
-        .execute()
-    )
-    fabric_rows = getattr(fabric_result, "data", None) or []
-    if not fabric_rows:
-        raise RuntimeError("Fabric image not found for direct try-on")
-    fabric = fabric_rows[0]
+    fabric_parts: list[tuple[bytes, str]] = []
+    for fabric_image_id in fabric_image_ids:
+        fabric_result = (
+            supabase.table("fabric_images")
+            .select("id, storage_path, mime_type")
+            .eq("id", fabric_image_id)
+            .eq("shop_id", shop_id)
+            .limit(1)
+            .execute()
+        )
+        fabric_rows = getattr(fabric_result, "data", None) or []
+        if not fabric_rows:
+            raise RuntimeError("Fabric image not found for direct try-on")
+        fabric = fabric_rows[0]
+        fabric_bytes = _fetch_storage_bytes(supabase, "fabric-images", fabric["storage_path"])
+        fabric_parts.append((fabric_bytes, str(fabric.get("mime_type") or "image/jpeg")))
 
     hero_bytes = _fetch_storage_bytes(supabase, "hero-images", hero["storage_path"])
-    fabric_bytes = _fetch_storage_bytes(supabase, "fabric-images", fabric["storage_path"])
 
     return (
         hero_bytes,
         str(hero.get("mime_type") or "image/jpeg"),
-        fabric_bytes,
-        str(fabric.get("mime_type") or "image/jpeg"),
+        fabric_parts,
     )
 
 
@@ -1018,11 +1020,21 @@ def run_tryon_for_session(
             folder_rows = getattr(folder_result, "data", None) or []
             folder_name = folder_rows[0].get("name") if folder_rows else None
 
-            hero_bytes, hero_mime, fabric_bytes, fabric_mime = _prepare_direct_tryon_assets(
-                supabase, shop_id, session["hero_image_id"], session["fabric_image_id"]
+            pending_fabrics = session.get("pending_fabrics") or []
+            fabric_image_ids = (
+                [item["fabric_image_id"] for item in pending_fabrics]
+                if pending_fabrics
+                else [session["fabric_image_id"]]
+            )
+
+            hero_bytes, hero_mime, fabric_parts = _prepare_direct_tryon_assets(
+                supabase, shop_id, session["hero_image_id"], fabric_image_ids
             )
             hero_bytes, hero_mime = _downscale_image_if_needed(hero_bytes, hero_mime)
-            fabric_bytes, fabric_mime = _downscale_image_if_needed(fabric_bytes, fabric_mime)
+            fabric_parts = [
+                _downscale_image_if_needed(fabric_bytes, fabric_mime)
+                for fabric_bytes, fabric_mime in fabric_parts
+            ]
 
             balance_before = _get_shop_balance(supabase, shop_id)
             if balance_before < settings.CREDITS_PER_IMAGE:
@@ -1033,7 +1045,7 @@ def run_tryon_for_session(
             prompt = build_tryon_quick_prompt(folder_name=folder_name)
             image_parts = [
                 (hero_bytes, hero_mime),
-                (fabric_bytes, fabric_mime),
+                *fabric_parts,
                 (customer_bytes, customer_mime),
             ]
         else:
