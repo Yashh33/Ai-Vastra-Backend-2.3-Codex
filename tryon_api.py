@@ -485,11 +485,13 @@ def tryon(
 
     # Fetch folder name for prompt context
     folder_name: Optional[str] = None
+    folder_use_custom_prompt = False
+    folder_custom_tryon_prompt: Optional[str] = None
     folder_id = gen.get("folder_id")
     if folder_id:
         folder_result = (
             supabase.table("garment_types")
-            .select("name")
+            .select("name, use_custom_prompt, custom_tryon_prompt")
             .eq("id", folder_id)
             .limit(1)
             .execute()
@@ -497,6 +499,8 @@ def tryon(
         folder_rows = getattr(folder_result, "data", None) or []
         if folder_rows:
             folder_name = folder_rows[0].get("name")
+            folder_use_custom_prompt = bool(folder_rows[0].get("use_custom_prompt"))
+            folder_custom_tryon_prompt = folder_rows[0].get("custom_tryon_prompt")
 
     # Download garment image (Stage 1 output)
     garment_bytes = _fetch_storage_bytes(
@@ -509,7 +513,10 @@ def tryon(
     customer_bytes = _decode_photo(body.customer_photo_b64)
 
     # Build prompt
-    prompt = build_tryon_prompt(folder_name=folder_name)
+    if folder_use_custom_prompt and folder_custom_tryon_prompt and folder_custom_tryon_prompt.strip():
+        prompt = folder_custom_tryon_prompt
+    else:
+        prompt = build_tryon_prompt(folder_name=folder_name)
 
     # Call Gemini: customer first, then garment
     return _call_gemini_tryon(
@@ -547,7 +554,7 @@ def tryon_quick(
     # Fetch folder -> default hero image
     folder_result = (
         supabase.table("garment_types")
-        .select("id, name, default_hero_image_id")
+        .select("id, name, default_hero_image_id, use_custom_prompt, custom_tryon_prompt")
         .eq("id", body.folder_id.strip())
         .eq("shop_id", shop_id)
         .limit(1)
@@ -562,6 +569,8 @@ def tryon_quick(
     folder = folder_rows[0]
     folder_name = folder.get("name")
     default_hero_id = folder.get("default_hero_image_id")
+    folder_use_custom_prompt = bool(folder.get("use_custom_prompt"))
+    folder_custom_tryon_prompt = folder.get("custom_tryon_prompt")
 
     if not default_hero_id:
         raise HTTPException(
@@ -619,7 +628,10 @@ def tryon_quick(
     customer_bytes = _decode_photo(body.customer_photo_b64)
 
     # Build combined prompt
-    prompt = build_tryon_quick_prompt(folder_name=folder_name)
+    if folder_use_custom_prompt and folder_custom_tryon_prompt and folder_custom_tryon_prompt.strip():
+        prompt = folder_custom_tryon_prompt
+    else:
+        prompt = build_tryon_quick_prompt(folder_name=folder_name)
 
     # Call Gemini: hero first, fabric second, customer third
     return _call_gemini_tryon(
