@@ -226,7 +226,7 @@ def _load_fabric_slots(supabase, folder_id: str) -> list[dict]:
             .select("label, apply_to, sort_order")
             .eq("folder_id", folder_id)
             .order("sort_order")
-            .limit(3)
+            .limit(6)
             .execute()
         )
     except Exception as exc:
