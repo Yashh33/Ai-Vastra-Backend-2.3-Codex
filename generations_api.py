@@ -492,7 +492,7 @@ def _load_folder_prompt_context_for_hero_image(
     try:
         folder_result = (
             supabase.table("garment_types")
-            .select("id, name, prompt_template")
+            .select("id, name, prompt_template, use_custom_prompt, custom_look_prompt")
             .eq("id", folder_id)
             .eq("shop_id", shop_id)
             .limit(1)
@@ -904,12 +904,16 @@ def create_generation(
     if normalized_fabrics:
         fabric_scale = normalized_fabrics[0].get("fabric_scale")
 
-    prompt_used = build_generation_prompt(
-        folder_name=folder_context.get("name"),
-        folder_prompt_template=folder_context.get("prompt_template"),
-        fabric_assignments=normalized_fabrics,
-        fabric_scale=fabric_scale,
-    )
+    custom_look_prompt = folder_context.get("custom_look_prompt")
+    if folder_context.get("use_custom_prompt") and custom_look_prompt and custom_look_prompt.strip():
+        prompt_used = custom_look_prompt
+    else:
+        prompt_used = build_generation_prompt(
+            folder_name=folder_context.get("name"),
+            folder_prompt_template=folder_context.get("prompt_template"),
+            fabric_assignments=normalized_fabrics,
+            fabric_scale=fabric_scale,
+        )
 
     try:
         result = (

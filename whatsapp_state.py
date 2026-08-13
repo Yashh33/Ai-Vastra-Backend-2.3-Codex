@@ -862,7 +862,7 @@ def create_generation_for_session(supabase, session: dict) -> None:
 
     folder_result = (
         supabase.table("garment_types")
-        .select("id, name, prompt_template")
+        .select("id, name, prompt_template, use_custom_prompt, custom_look_prompt")
         .eq("id", session["folder_id"])
         .eq("shop_id", shop_id)
         .limit(1)
@@ -873,12 +873,16 @@ def create_generation_for_session(supabase, session: dict) -> None:
         raise RuntimeError("WhatsApp folder not found")
     folder_context = folder_rows[0]
 
-    prompt_used = build_generation_prompt(
-        folder_name=folder_context.get("name"),
-        folder_prompt_template=folder_context.get("prompt_template"),
-        fabric_assignments=normalized_fabrics,
-        fabric_scale=None,
-    )
+    custom_look_prompt = folder_context.get("custom_look_prompt")
+    if folder_context.get("use_custom_prompt") and custom_look_prompt and custom_look_prompt.strip():
+        prompt_used = custom_look_prompt
+    else:
+        prompt_used = build_generation_prompt(
+            folder_name=folder_context.get("name"),
+            folder_prompt_template=folder_context.get("prompt_template"),
+            fabric_assignments=normalized_fabrics,
+            fabric_scale=None,
+        )
 
     result = (
         supabase.rpc(
