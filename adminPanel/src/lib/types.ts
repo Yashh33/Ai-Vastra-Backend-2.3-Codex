@@ -46,6 +46,10 @@ export type AdminFolderRow = {
   created_at: string;
   updated_at: string;
   show_in_whatsapp_menu?: boolean;
+  use_custom_prompt?: boolean;
+  custom_look_prompt?: string | null;
+  custom_tryon_prompt?: string | null;
+  category?: string;
 };
 
 export type AdminHeroImageRow = {

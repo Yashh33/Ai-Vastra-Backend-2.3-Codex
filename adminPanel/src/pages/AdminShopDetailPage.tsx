@@ -60,6 +60,12 @@ export function AdminShopDetailPage() {
   const [deletingSlotId, setDeletingSlotId] = useState<string | null>(null);
   const [togglingWhatsappMenu, setTogglingWhatsappMenu] = useState(false);
 
+  const [editCategory, setEditCategory] = useState("unisex");
+  const [editUseCustomPrompt, setEditUseCustomPrompt] = useState(false);
+  const [editLookPrompt, setEditLookPrompt] = useState("");
+  const [editTryonPrompt, setEditTryonPrompt] = useState("");
+  const [savingCustomPrompt, setSavingCustomPrompt] = useState(false);
+
   const [processingSuspend, setProcessingSuspend] = useState(false);
   const [deletingShop, setDeletingShop] = useState(false);
   const [togglingMultifabric, setTogglingMultifabric] = useState(false);
@@ -76,6 +82,16 @@ export function AdminShopDetailPage() {
     () => folders.find((folder) => folder.id === selectedFolderId) || null,
     [folders, selectedFolderId]
   );
+
+  const imageOrderLines = useMemo(() => {
+    const sortedSlots = [...fabricSlots].sort((a, b) => a.sort_order - b.sort_order);
+    const lines = ["Image 1 → Hero (garment reference)"];
+    sortedSlots.forEach((slot, index) => {
+      lines.push(`Image ${index + 2} → ${slot.label} (slot)`);
+    });
+    lines.push(`Image ${sortedSlots.length + 2} → Person (only on TRY-ON)`);
+    return lines;
+  }, [fabricSlots]);
 
   async function loadShopData() {
     if (!session || !shopId) return;
@@ -199,6 +215,14 @@ export function AdminShopDetailPage() {
       setSelectedFolderId(folders[0].id);
     }
   }, [folders]);
+
+  useEffect(() => {
+    const folder = folders.find((item) => item.id === selectedFolderId) || null;
+    setEditCategory(folder?.category || "unisex");
+    setEditUseCustomPrompt(Boolean(folder?.use_custom_prompt));
+    setEditLookPrompt(folder?.custom_look_prompt || "");
+    setEditTryonPrompt(folder?.custom_tryon_prompt || "");
+  }, [selectedFolderId]);
 
   useEffect(() => {
     if (showCreateModal) {
@@ -560,6 +584,56 @@ export function AdminShopDetailPage() {
       setStatusText(
         `Failed to restore: ${err instanceof Error ? err.message : "Unknown error"}`
       );
+    }
+  }
+
+  async function handleSaveCustomPrompt(folderId: string) {
+    if (!session || !shopId) return;
+
+    if (editUseCustomPrompt && (!editLookPrompt.trim() || !editTryonPrompt.trim())) {
+      setStatusText("Both look and try-on prompts are required when custom prompt is enabled.");
+      return;
+    }
+
+    setSavingCustomPrompt(true);
+    try {
+      const payload = {
+        use_custom_prompt: editUseCustomPrompt,
+        custom_look_prompt: editLookPrompt,
+        custom_tryon_prompt: editTryonPrompt,
+        category: editCategory,
+      };
+      const updated = await adminFetch<{
+        use_custom_prompt: boolean;
+        custom_look_prompt: string | null;
+        custom_tryon_prompt: string | null;
+        category: string;
+      }>(
+        session,
+        `/admin/shops/${encodeURIComponent(shopId)}/folders/${encodeURIComponent(folderId)}/custom-prompt`,
+        { method: "PATCH", body: JSON.stringify(payload) }
+      );
+
+      setFolders((prev) =>
+        prev.map((folder) =>
+          folder.id === folderId
+            ? {
+                ...folder,
+                use_custom_prompt: updated.use_custom_prompt,
+                custom_look_prompt: updated.custom_look_prompt,
+                custom_tryon_prompt: updated.custom_tryon_prompt,
+                category: updated.category,
+              }
+            : folder
+        )
+      );
+      setStatusText("Prompt & category saved.");
+    } catch (err) {
+      setStatusText(
+        `Failed to save prompt & category: ${err instanceof Error ? err.message : "Unknown error"}`
+      );
+    } finally {
+      setSavingCustomPrompt(false);
     }
   }
 
@@ -928,6 +1002,70 @@ export function AdminShopDetailPage() {
                     onClick={() => handleArchiveFolder(selectedFolder.id, selectedFolder.name)}
                   >
                     Archive garment type
+                  </button>
+                </div>
+
+                <div className="stack">
+                  <h3>Prompt & Category</h3>
+                  <div className="grid-2">
+                    <label className="field">
+                      <span>Category</span>
+                      <select value={editCategory} onChange={(event) => setEditCategory(event.target.value)}>
+                        <option value="men">Men</option>
+                        <option value="women">Women</option>
+                        <option value="unisex">Unisex</option>
+                      </select>
+                    </label>
+                  </div>
+
+                  <label className="row tiny">
+                    <input
+                      type="checkbox"
+                      checked={editUseCustomPrompt}
+                      onChange={(event) => setEditUseCustomPrompt(event.target.checked)}
+                    />
+                    Use custom prompt
+                  </label>
+
+                  {editUseCustomPrompt ? (
+                    <div className="grid-2">
+                      <label className="field">
+                        <span>Look prompt (used for LOOK generation)</span>
+                        <textarea
+                          value={editLookPrompt}
+                          onChange={(event) => setEditLookPrompt(event.target.value)}
+                        />
+                      </label>
+                      <label className="field">
+                        <span>Try-on prompt (used for TRY-ON)</span>
+                        <textarea
+                          value={editTryonPrompt}
+                          onChange={(event) => setEditTryonPrompt(event.target.value)}
+                        />
+                      </label>
+                    </div>
+                  ) : (
+                    <p className="tiny muted">
+                      Custom prompt is off — the generic prompt engine is used for this garment type.
+                    </p>
+                  )}
+
+                  <div className="stack">
+                    <p className="tiny muted">Image order Gemini receives:</p>
+                    <ul className="hero-list">
+                      {imageOrderLines.map((line) => (
+                        <li key={line}>{line}</li>
+                      ))}
+                    </ul>
+                  </div>
+
+                  <button
+                    className="btn btn-dark"
+                    type="button"
+                    disabled={savingCustomPrompt}
+                    onClick={() => void handleSaveCustomPrompt(selectedFolder.id)}
+                  >
+                    {savingCustomPrompt ? "Saving..." : "Save Prompt & Category"}
                   </button>
                 </div>
 

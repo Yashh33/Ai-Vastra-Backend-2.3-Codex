@@ -47,6 +47,17 @@ class AdminSetWhatsappMultifabricRequest(BaseModel):
 class AdminCreateFolderRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
     prompt_template: str = ""
+    use_custom_prompt: bool = False
+    custom_look_prompt: Optional[str] = None
+    custom_tryon_prompt: Optional[str] = None
+    category: str = "unisex"
+
+
+class AdminUpdateCustomPromptRequest(BaseModel):
+    use_custom_prompt: bool
+    custom_look_prompt: Optional[str] = None
+    custom_tryon_prompt: Optional[str] = None
+    category: str
 
 
 class AdminUpdateDefaultHeroRequest(BaseModel):
@@ -1066,6 +1077,10 @@ def create_shop_folder(shop_id: str, body: AdminCreateFolderRequest):
         "shop_id": shop_id,
         "name": _clean_text(body.name, "name"),
         "prompt_template": (body.prompt_template or "").strip(),
+        "use_custom_prompt": body.use_custom_prompt,
+        "custom_look_prompt": body.custom_look_prompt,
+        "custom_tryon_prompt": body.custom_tryon_prompt,
+        "category": (body.category or "unisex").strip().lower(),
     }
 
     try:
@@ -1164,6 +1179,54 @@ def restore_folder(
     if not result.data:
         raise HTTPException(status_code=404, detail="Folder not found")
     return {"restored": folder_id}
+
+
+_ALLOWED_GARMENT_CATEGORIES = {"men", "women", "unisex"}
+
+
+@router.patch("/shops/{shop_id}/folders/{folder_id}/custom-prompt")
+def update_folder_custom_prompt(
+    shop_id: str,
+    folder_id: str,
+    body: AdminUpdateCustomPromptRequest,
+    _: None = Depends(verify_admin_secret),
+):
+    supabase = get_supabase_admin_client()
+
+    category = (body.category or "").strip().lower()
+    if category not in _ALLOWED_GARMENT_CATEGORIES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="category must be one of: men, women, unisex",
+        )
+
+    look_prompt = body.custom_look_prompt
+    tryon_prompt = body.custom_tryon_prompt
+
+    if body.use_custom_prompt:
+        if not (look_prompt or "").strip() or not (tryon_prompt or "").strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Both look and try-on prompts are required when custom prompt is enabled.",
+            )
+
+    payload = {
+        "use_custom_prompt": body.use_custom_prompt,
+        "custom_look_prompt": look_prompt,
+        "custom_tryon_prompt": tryon_prompt,
+        "category": category,
+    }
+
+    result = (
+        supabase.table("garment_types")
+        .update(payload)
+        .eq("id", folder_id)
+        .eq("shop_id", shop_id)
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Folder not found")
+    return result.data[0]
 
 
 @router.patch("/shops/{shop_id}/folders/{folder_id}/default-hero")
