@@ -985,6 +985,78 @@ def _prepare_direct_tryon_assets(
     )
 
 
+def _record_tryon_generation(
+    supabase,
+    *,
+    session: dict,
+    is_direct: bool,
+    source_generation_id: Optional[str],
+    result_bytes: bytes,
+    result_mime: str,
+    credits_used: int,
+) -> Optional[str]:
+    """Record a generations row for a WhatsApp try-on OUTPUT image, mirroring
+    the LOOK path, so the try-on is discoverable (TV screen, history) by
+    output_path. The customer's input selfie is never stored — only this
+    generated result image."""
+    shop_id = session["shop_id"]
+
+    if is_direct:
+        hero_image_id = session.get("hero_image_id")
+        folder_id = session.get("folder_id")
+        pending_fabrics = session.get("pending_fabrics") or []
+        fabric_image_id = (
+            pending_fabrics[0]["fabric_image_id"]
+            if pending_fabrics
+            else session.get("fabric_image_id")
+        )
+    else:
+        source_result = (
+            supabase.table("generations")
+            .select("hero_image_id, fabric_image_id, folder_id")
+            .eq("id", source_generation_id)
+            .eq("shop_id", shop_id)
+            .limit(1)
+            .execute()
+        )
+        source_rows = getattr(source_result, "data", None) or []
+        source = source_rows[0] if source_rows else {}
+        hero_image_id = source.get("hero_image_id")
+        folder_id = source.get("folder_id")
+        fabric_image_id = source.get("fabric_image_id")
+
+    new_generation_id = str(uuid4())
+    ext = "png" if "png" in (result_mime or "").lower() else "jpg"
+    output_path = f"{shop_id}/{new_generation_id}/output_v{int(time.time())}.{ext}"
+
+    _upload_bytes(
+        supabase,
+        bucket="generated-outputs",
+        path=output_path,
+        data=result_bytes,
+        content_type=result_mime or "image/jpeg",
+    )
+
+    now_iso = _utc_now_iso()
+    supabase.table("generations").insert(
+        {
+            "id": new_generation_id,
+            "shop_id": shop_id,
+            "hero_image_id": hero_image_id,
+            "fabric_image_id": fabric_image_id,
+            "folder_id": folder_id,
+            "status": "done",
+            "output_path": output_path,
+            "credits_used": credits_used,
+            "created_at": now_iso,
+            "started_at": now_iso,
+            "completed_at": now_iso,
+        }
+    ).execute()
+
+    return new_generation_id
+
+
 def run_tryon_for_session(
     supabase, session: dict, media_id: Optional[str], mime_type: Optional[str]
 ) -> None:
@@ -1074,13 +1146,27 @@ def run_tryon_for_session(
 
         result_media_id = upload_media(result_bytes, result.result_mime)
         send_image_by_media_id(phone, result_media_id, caption=_MSG_TRYON_DELIVERED)
+
+        tryon_generation_id: Optional[str] = None
+        try:
+            tryon_generation_id = _record_tryon_generation(
+                supabase,
+                session=session,
+                is_direct=is_direct,
+                source_generation_id=generation_id,
+                result_bytes=result_bytes,
+                result_mime=result.result_mime,
+                credits_used=settings.CREDITS_PER_IMAGE if is_direct else 0,
+            )
+        except Exception as exc:
+            print(f"[whatsapp_state] failed to record generations row for tryon session {session_id}: {exc}")
     except Exception as exc:
         print(f"[whatsapp_state] tryon failed for session {session_id}: {exc}")
         send_text(phone, _MSG_TRYON_FAILED)
         _update_session(supabase, session_id, {"state": "WAITING_CUSTOMER_PHOTO"})
         return
 
-    update_payload = {"state": "DELIVERED", "active_generation_id": None}
+    update_payload = {"state": "DELIVERED", "active_generation_id": tryon_generation_id}
 
     if is_direct:
         new_balance = (balance_before or 0) - settings.CREDITS_PER_IMAGE
