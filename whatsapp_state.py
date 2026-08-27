@@ -175,6 +175,10 @@ _MSG_JOIN_SUCCESS_TEMPLATE = (
     "credits se banenge."
 )
 
+_MSG_TV_PUSHED = "Bade screen par bhej diya 📺✨"
+_MSG_TV_NONE = "Pehle ek look banaiye, phir TV likhein 🙂"
+_MSG_TV_CLEARED = "Screen wapas catalog par aa gaya ✅"
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -1163,6 +1167,75 @@ def _handle_join_command(supabase, session: dict, code: str) -> None:
     )
 
 
+def _resolve_latest_done_generation_id(supabase, shop_id: str, session: dict) -> Optional[str]:
+    candidate = session.get("active_generation_id")
+    if candidate:
+        candidate_result = (
+            supabase.table("generations")
+            .select("id, status")
+            .eq("id", candidate)
+            .eq("shop_id", shop_id)
+            .limit(1)
+            .execute()
+        )
+        candidate_rows = getattr(candidate_result, "data", None) or []
+        if candidate_rows and candidate_rows[0].get("status") == "done":
+            return str(candidate_rows[0]["id"])
+
+    result = (
+        supabase.table("generations")
+        .select("id")
+        .eq("shop_id", shop_id)
+        .eq("status", "done")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    rows = getattr(result, "data", None) or []
+    if rows:
+        return str(rows[0]["id"])
+    return None
+
+
+def _handle_tv_command(supabase, session: dict) -> None:
+    phone = session["phone_number"]
+    shop_id = session["shop_id"]
+
+    generation_id = _resolve_latest_done_generation_id(supabase, shop_id, session)
+    if not generation_id:
+        send_text(phone, _MSG_TV_NONE)
+        return
+
+    supabase.table("generations").update({"show_on_screen": True}).eq(
+        "id", generation_id
+    ).eq("shop_id", shop_id).execute()
+
+    supabase.table("shop_screen_state").upsert(
+        {
+            "shop_id": shop_id,
+            "live_generation_id": generation_id,
+            "updated_at": _utc_now_iso(),
+        }
+    ).execute()
+
+    send_text(phone, _MSG_TV_PUSHED)
+
+
+def _handle_next_command(supabase, session: dict) -> None:
+    phone = session["phone_number"]
+    shop_id = session["shop_id"]
+
+    supabase.table("shop_screen_state").upsert(
+        {
+            "shop_id": shop_id,
+            "live_generation_id": None,
+            "updated_at": _utc_now_iso(),
+        }
+    ).execute()
+
+    send_text(phone, _MSG_TV_CLEARED)
+
+
 def _dispatch(supabase, session: dict, msg: dict) -> None:
     phone = session["phone_number"]
     session_id = session["id"]
@@ -1180,6 +1253,14 @@ def _dispatch(supabase, session: dict, msg: dict) -> None:
 
     if kind == "text" and text.lower() == "team":
         _handle_team_command(supabase, session)
+        return
+
+    if kind == "text" and text.lower() == "tv":
+        _handle_tv_command(supabase, session)
+        return
+
+    if kind == "text" and text.lower() == "next":
+        _handle_next_command(supabase, session)
         return
 
     if kind == "text":
