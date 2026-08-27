@@ -910,7 +910,13 @@ def create_generation_for_session(supabase, session: dict) -> None:
 
     (
         supabase.table("generations")
-        .update({"prompt_used": prompt_used, "fabric_image_id": fabric_image_id})
+        .update(
+            {
+                "prompt_used": prompt_used,
+                "fabric_image_id": fabric_image_id,
+                "generation_type": "look",
+            }
+        )
         .eq("id", generation_id)
         .eq("shop_id", shop_id)
         .execute()
@@ -1046,6 +1052,7 @@ def _record_tryon_generation(
             "fabric_image_id": fabric_image_id,
             "folder_id": folder_id,
             "status": "done",
+            "generation_type": "tryon",
             "output_path": output_path,
             "credits_used": credits_used,
             "created_at": now_iso,
