@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from config import get_settings
 from payments_api import CREDIT_PACKS, create_payment_link_for_shop
-from prompting import build_generation_prompt, build_tryon_prompt, build_tryon_quick_prompt
+from prompting import DEFAULT_LOOK_PROMPT, DEFAULT_TRYON_PROMPT, fill_prompt_placeholders
 from supabase_client import get_supabase_admin_client
 from tryon_api import (
     _call_gemini_tryon,
@@ -868,7 +868,7 @@ def create_generation_for_session(supabase, session: dict) -> None:
 
     folder_result = (
         supabase.table("garment_types")
-        .select("id, name, prompt_template, use_custom_prompt, custom_look_prompt")
+        .select("id, name, look_prompt")
         .eq("id", session["folder_id"])
         .eq("shop_id", shop_id)
         .limit(1)
@@ -879,16 +879,20 @@ def create_generation_for_session(supabase, session: dict) -> None:
         raise RuntimeError("WhatsApp folder not found")
     folder_context = folder_rows[0]
 
-    custom_look_prompt = folder_context.get("custom_look_prompt")
-    if folder_context.get("use_custom_prompt") and custom_look_prompt and custom_look_prompt.strip():
-        prompt_used = custom_look_prompt
-    else:
-        prompt_used = build_generation_prompt(
-            folder_name=folder_context.get("name"),
-            folder_prompt_template=folder_context.get("prompt_template"),
-            fabric_assignments=normalized_fabrics,
-            fabric_scale=None,
+    look_prompt = folder_context.get("look_prompt")
+    if not look_prompt or not look_prompt.strip():
+        print(
+            f"[whatsapp_state] WARNING: garment {folder_context.get('id')} has no "
+            "look_prompt configured; using fallback prompt"
         )
+        look_prompt = DEFAULT_LOOK_PROMPT
+
+    prompt_used = fill_prompt_placeholders(
+        look_prompt,
+        garment_name=folder_context.get("name"),
+        fabric_assignments=normalized_fabrics,
+        image_count=1 + len(normalized_fabrics),
+    )
 
     result = (
         supabase.rpc(
@@ -915,6 +919,7 @@ def create_generation_for_session(supabase, session: dict) -> None:
                 "prompt_used": prompt_used,
                 "fabric_image_id": fabric_image_id,
                 "generation_type": "look",
+                "model_used": settings.GEMINI_IMAGE_MODEL_ID,
             }
         )
         .eq("id", generation_id)
@@ -1000,6 +1005,7 @@ def _record_tryon_generation(
     result_bytes: bytes,
     result_mime: str,
     credits_used: int,
+    prompt_used: str,
 ) -> Optional[str]:
     """Record a generations row for a WhatsApp try-on OUTPUT image, mirroring
     the LOOK path, so the try-on is discoverable (TV screen, history) by
@@ -1053,6 +1059,8 @@ def _record_tryon_generation(
             "folder_id": folder_id,
             "status": "done",
             "generation_type": "tryon",
+            "model_used": get_settings().GEMINI_IMAGE_MODEL_ID,
+            "prompt_used": prompt_used,
             "output_path": output_path,
             "credits_used": credits_used,
             "created_at": now_iso,
@@ -1096,20 +1104,26 @@ def run_tryon_for_session(
         if is_direct:
             folder_result = (
                 supabase.table("garment_types")
-                .select("id, name")
+                .select("id, name, tryon_prompt")
                 .eq("id", session["folder_id"])
                 .eq("shop_id", shop_id)
                 .limit(1)
                 .execute()
             )
             folder_rows = getattr(folder_result, "data", None) or []
-            folder_name = folder_rows[0].get("name") if folder_rows else None
+            folder_row = folder_rows[0] if folder_rows else {}
+            folder_name = folder_row.get("name")
 
             pending_fabrics = session.get("pending_fabrics") or []
             fabric_image_ids = (
                 [item["fabric_image_id"] for item in pending_fabrics]
                 if pending_fabrics
                 else [session["fabric_image_id"]]
+            )
+            fabric_assignments = (
+                [{"apply_to": item["apply_to"]} for item in pending_fabrics]
+                if pending_fabrics
+                else [{"apply_to": "suit_full_body"}]
             )
 
             hero_bytes, hero_mime, fabric_parts = _prepare_direct_tryon_assets(
@@ -1127,17 +1141,44 @@ def run_tryon_for_session(
                 _update_session(supabase, session_id, {"state": "DELIVERED"})
                 return
 
-            prompt = build_tryon_quick_prompt(folder_name=folder_name)
+            tryon_prompt = folder_row.get("tryon_prompt")
+            if not tryon_prompt or not tryon_prompt.strip():
+                print(
+                    f"[whatsapp_state] WARNING: garment {folder_row.get('id')} has no "
+                    "tryon_prompt configured; using fallback prompt"
+                )
+                tryon_prompt = DEFAULT_TRYON_PROMPT
+
+            prompt = fill_prompt_placeholders(
+                tryon_prompt,
+                garment_name=folder_name,
+                fabric_assignments=fabric_assignments,
+                image_count=1 + len(fabric_image_ids) + 1,
+            )
             image_parts = [
                 (hero_bytes, hero_mime),
                 *fabric_parts,
                 (customer_bytes, customer_mime),
             ]
         else:
-            garment_bytes, folder_name = _prepare_tryon_assets_sync(supabase, shop_id, generation_id)
+            garment_bytes, folder_name, tryon_prompt = _prepare_tryon_assets_sync(
+                supabase, shop_id, generation_id
+            )
             garment_bytes, garment_mime = _downscale_image_if_needed(garment_bytes, "image/jpeg")
 
-            prompt = build_tryon_prompt(folder_name=folder_name)
+            if not tryon_prompt or not tryon_prompt.strip():
+                print(
+                    f"[whatsapp_state] WARNING: generation {generation_id}'s garment has no "
+                    "tryon_prompt configured; using fallback prompt"
+                )
+                tryon_prompt = DEFAULT_TRYON_PROMPT
+
+            prompt = fill_prompt_placeholders(
+                tryon_prompt,
+                garment_name=folder_name,
+                fabric_assignments=None,
+                image_count=2,
+            )
             image_parts = [
                 (customer_bytes, customer_mime),
                 (garment_bytes, garment_mime),
@@ -1164,6 +1205,7 @@ def run_tryon_for_session(
                 result_bytes=result_bytes,
                 result_mime=result.result_mime,
                 credits_used=settings.CREDITS_PER_IMAGE if is_direct else 0,
+                prompt_used=prompt,
             )
         except Exception as exc:
             print(f"[whatsapp_state] failed to record generations row for tryon session {session_id}: {exc}")

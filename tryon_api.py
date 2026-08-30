@@ -20,11 +20,7 @@ from pydantic import BaseModel, Field
 
 from auth_deps import CurrentShopContext, get_current_shop_context
 from config import get_settings
-from prompting import (
-    build_tryon_multi_quick_prompt,
-    build_tryon_prompt,
-    build_tryon_quick_prompt,
-)
+from prompting import DEFAULT_TRYON_PROMPT, fill_prompt_placeholders
 from supabase_client import get_supabase_admin_client
 
 from google import genai
@@ -169,6 +165,30 @@ def _log_tryon_consent(supabase, shop_id: str) -> None:
         pass
 
 
+def _resolve_tryon_prompt(
+    tryon_prompt: Optional[str],
+    *,
+    garment_name: Optional[str],
+    fabric_assignments: Optional[list[dict]] = None,
+    image_count: int,
+    context: str = "",
+) -> str:
+    """Fill a garment's stored tryon_prompt with the dynamic placeholders,
+    falling back to a minimal safe prompt (with a warning) if none is
+    configured for this garment."""
+    if not tryon_prompt or not tryon_prompt.strip():
+        suffix = f" ({context})" if context else ""
+        print(f"[tryon_api] WARNING: garment{suffix} has no tryon_prompt configured; using fallback prompt")
+        tryon_prompt = DEFAULT_TRYON_PROMPT
+
+    return fill_prompt_placeholders(
+        tryon_prompt,
+        garment_name=garment_name,
+        fabric_assignments=fabric_assignments,
+        image_count=image_count,
+    )
+
+
 def _call_gemini_tryon(
     prompt: str,
     image_parts: list[tuple[bytes, str]],
@@ -238,7 +258,7 @@ async def _call_gemini_tryon_async(
 
 def _prepare_tryon_assets_sync(
     supabase, shop_id: str, generation_id: str
-) -> Tuple[bytes, Optional[str]]:
+) -> Tuple[bytes, Optional[str], Optional[str]]:
     """Blocking DB + storage prep phase for /tryon/v2. Runs off the event loop."""
     gen_result = (
         supabase.table("generations")
@@ -263,11 +283,12 @@ def _prepare_tryon_assets_sync(
         )
 
     folder_name: Optional[str] = None
+    tryon_prompt: Optional[str] = None
     folder_id = gen.get("folder_id")
     if folder_id:
         folder_result = (
             supabase.table("garment_types")
-            .select("name")
+            .select("name, tryon_prompt")
             .eq("id", folder_id)
             .limit(1)
             .execute()
@@ -275,6 +296,7 @@ def _prepare_tryon_assets_sync(
         folder_rows = getattr(folder_result, "data", None) or []
         if folder_rows:
             folder_name = folder_rows[0].get("name")
+            tryon_prompt = folder_rows[0].get("tryon_prompt")
 
     garment_bytes = _fetch_storage_bytes(
         supabase,
@@ -282,16 +304,16 @@ def _prepare_tryon_assets_sync(
         gen["output_path"],
     )
 
-    return garment_bytes, folder_name
+    return garment_bytes, folder_name, tryon_prompt
 
 
 def _prepare_tryon_quick_assets_sync(
     supabase, shop_id: str, folder_id: str, fabric_image_id: str
-) -> Tuple[bytes, str, bytes, str, Optional[str]]:
+) -> Tuple[bytes, str, bytes, str, Optional[str], Optional[str]]:
     """Blocking DB + storage prep phase for /tryon/quick/v2. Runs off the event loop."""
     folder_result = (
         supabase.table("garment_types")
-        .select("id, name, default_hero_image_id")
+        .select("id, name, default_hero_image_id, tryon_prompt")
         .eq("id", folder_id)
         .eq("shop_id", shop_id)
         .limit(1)
@@ -306,6 +328,7 @@ def _prepare_tryon_quick_assets_sync(
     folder = folder_rows[0]
     folder_name = folder.get("name")
     default_hero_id = folder.get("default_hero_image_id")
+    tryon_prompt = folder.get("tryon_prompt")
 
     if not default_hero_id:
         raise HTTPException(
@@ -362,6 +385,7 @@ def _prepare_tryon_quick_assets_sync(
         fabric_bytes,
         str(fabric.get("mime_type") or "image/jpeg"),
         folder_name,
+        tryon_prompt,
     )
 
 
@@ -371,11 +395,11 @@ def _prepare_tryon_multi_assets_sync(
     hero_image_id: str,
     folder_id: str,
     fabric_image_ids: list[str],
-) -> Tuple[bytes, str, list[Tuple[bytes, str]], Optional[str]]:
+) -> Tuple[bytes, str, list[Tuple[bytes, str]], Optional[str], Optional[str]]:
     """Blocking DB + storage prep phase for /tryon/multi/v2. Runs off the event loop."""
     folder_result = (
         supabase.table("garment_types")
-        .select("id, name")
+        .select("id, name, tryon_prompt")
         .eq("id", folder_id)
         .eq("shop_id", shop_id)
         .limit(1)
@@ -388,6 +412,7 @@ def _prepare_tryon_multi_assets_sync(
             detail="Garment type not found",
         )
     folder_name = folder_rows[0].get("name")
+    tryon_prompt = folder_rows[0].get("tryon_prompt")
 
     hero_result = (
         supabase.table("hero_images")
@@ -437,7 +462,7 @@ def _prepare_tryon_multi_assets_sync(
             (fabric_bytes, str(fabric.get("mime_type") or "image/jpeg"))
         )
 
-    return hero_bytes, hero_mime, fabric_assets, folder_name
+    return hero_bytes, hero_mime, fabric_assets, folder_name, tryon_prompt
 
 
 @router.post("/", response_model=TryOnResponse)
@@ -484,15 +509,14 @@ def tryon(
             detail="Generation is not ready yet",
         )
 
-    # Fetch folder name for prompt context
+    # Fetch folder name + tryon prompt for prompt context
     folder_name: Optional[str] = None
-    folder_use_custom_prompt = False
-    folder_custom_tryon_prompt: Optional[str] = None
+    folder_tryon_prompt: Optional[str] = None
     folder_id = gen.get("folder_id")
     if folder_id:
         folder_result = (
             supabase.table("garment_types")
-            .select("name, use_custom_prompt, custom_tryon_prompt")
+            .select("name, tryon_prompt")
             .eq("id", folder_id)
             .limit(1)
             .execute()
@@ -500,8 +524,7 @@ def tryon(
         folder_rows = getattr(folder_result, "data", None) or []
         if folder_rows:
             folder_name = folder_rows[0].get("name")
-            folder_use_custom_prompt = bool(folder_rows[0].get("use_custom_prompt"))
-            folder_custom_tryon_prompt = folder_rows[0].get("custom_tryon_prompt")
+            folder_tryon_prompt = folder_rows[0].get("tryon_prompt")
 
     # Download garment image (Stage 1 output)
     garment_bytes = _fetch_storage_bytes(
@@ -514,10 +537,13 @@ def tryon(
     customer_bytes = _decode_photo(body.customer_photo_b64)
 
     # Build prompt
-    if folder_use_custom_prompt and folder_custom_tryon_prompt and folder_custom_tryon_prompt.strip():
-        prompt = folder_custom_tryon_prompt
-    else:
-        prompt = build_tryon_prompt(folder_name=folder_name)
+    prompt = _resolve_tryon_prompt(
+        folder_tryon_prompt,
+        garment_name=folder_name,
+        fabric_assignments=None,
+        image_count=2,
+        context=f"folder {folder_id}" if folder_id else "",
+    )
 
     # Call Gemini: customer first, then garment
     return _call_gemini_tryon(
@@ -555,7 +581,7 @@ def tryon_quick(
     # Fetch folder -> default hero image
     folder_result = (
         supabase.table("garment_types")
-        .select("id, name, default_hero_image_id, use_custom_prompt, custom_tryon_prompt")
+        .select("id, name, default_hero_image_id, tryon_prompt")
         .eq("id", body.folder_id.strip())
         .eq("shop_id", shop_id)
         .limit(1)
@@ -570,8 +596,7 @@ def tryon_quick(
     folder = folder_rows[0]
     folder_name = folder.get("name")
     default_hero_id = folder.get("default_hero_image_id")
-    folder_use_custom_prompt = bool(folder.get("use_custom_prompt"))
-    folder_custom_tryon_prompt = folder.get("custom_tryon_prompt")
+    folder_tryon_prompt = folder.get("tryon_prompt")
 
     if not default_hero_id:
         raise HTTPException(
@@ -599,7 +624,7 @@ def tryon_quick(
     # Fetch this garment's fabric slots (multi-fabric garments, e.g. saree)
     slots_result = (
         supabase.table("garment_fabric_slots")
-        .select("id, sort_order")
+        .select("id, apply_to, sort_order")
         .eq("folder_id", body.folder_id.strip())
         .order("sort_order")
         .limit(6)
@@ -609,8 +634,12 @@ def tryon_quick(
 
     if slot_rows and body.fabric_image_ids:
         fabric_ids = [fid.strip() for fid in body.fabric_image_ids if fid and fid.strip()]
+        fabric_assignments = [
+            {"apply_to": slot.get("apply_to", "unknown")} for slot in slot_rows[: len(fabric_ids)]
+        ]
     else:
         fabric_ids = [body.fabric_image_id.strip()]
+        fabric_assignments = [{"apply_to": "suit_full_body"}]
 
     # Fetch fabric image storage paths, in the given order
     fabric_images: list[dict] = []
@@ -649,10 +678,13 @@ def tryon_quick(
     customer_bytes = _decode_photo(body.customer_photo_b64)
 
     # Build combined prompt
-    if folder_use_custom_prompt and folder_custom_tryon_prompt and folder_custom_tryon_prompt.strip():
-        prompt = folder_custom_tryon_prompt
-    else:
-        prompt = build_tryon_quick_prompt(folder_name=folder_name)
+    prompt = _resolve_tryon_prompt(
+        folder_tryon_prompt,
+        garment_name=folder_name,
+        fabric_assignments=fabric_assignments,
+        image_count=1 + len(fabric_ids) + 1,
+        context=f"folder {body.folder_id.strip()}",
+    )
 
     # Call Gemini: hero first, then fabrics in slot order, customer last
     return _call_gemini_tryon(
@@ -686,7 +718,7 @@ async def tryon_v2(
         )
     background_tasks.add_task(_log_tryon_consent, supabase, current.shop_id)
 
-    garment_bytes, folder_name = await anyio.to_thread.run_sync(
+    garment_bytes, folder_name, folder_tryon_prompt = await anyio.to_thread.run_sync(
         _prepare_tryon_assets_sync,
         supabase,
         current.shop_id,
@@ -699,7 +731,13 @@ async def tryon_v2(
     customer_bytes, customer_mime = _downscale_image_if_needed(customer_bytes, customer_mime)
     garment_bytes, garment_mime = _downscale_image_if_needed(garment_bytes, "image/jpeg")
 
-    prompt = build_tryon_prompt(folder_name=folder_name)
+    prompt = _resolve_tryon_prompt(
+        folder_tryon_prompt,
+        garment_name=folder_name,
+        fabric_assignments=None,
+        image_count=2,
+        context=f"generation {generation_id.strip()}",
+    )
 
     image_bytes, result_mime = await _call_gemini_tryon_async(
         prompt=prompt,
@@ -740,6 +778,7 @@ async def tryon_quick_v2(
         fabric_bytes,
         fabric_mime,
         folder_name,
+        folder_tryon_prompt,
     ) = await anyio.to_thread.run_sync(
         _prepare_tryon_quick_assets_sync,
         supabase,
@@ -755,7 +794,13 @@ async def tryon_quick_v2(
     fabric_bytes, fabric_mime = _downscale_image_if_needed(fabric_bytes, fabric_mime)
     customer_bytes, customer_mime = _downscale_image_if_needed(customer_bytes, customer_mime)
 
-    prompt = build_tryon_quick_prompt(folder_name=folder_name)
+    prompt = _resolve_tryon_prompt(
+        folder_tryon_prompt,
+        garment_name=folder_name,
+        fabric_assignments=[{"apply_to": "suit_full_body"}],
+        image_count=3,
+        context=f"folder {folder_id.strip()}",
+    )
 
     image_bytes, result_mime = await _call_gemini_tryon_async(
         prompt=prompt,
@@ -822,6 +867,7 @@ async def tryon_multi_v2(
         hero_mime,
         fabric_assets,
         folder_name,
+        folder_tryon_prompt,
     ) = await anyio.to_thread.run_sync(
         _prepare_tryon_multi_assets_sync,
         supabase,
@@ -846,9 +892,12 @@ async def tryon_multi_v2(
         for idx, (_, apply_to) in enumerate(fabric_pairs)
     ]
 
-    prompt = build_tryon_multi_quick_prompt(
+    prompt = _resolve_tryon_prompt(
+        folder_tryon_prompt,
+        garment_name=folder_name,
         fabric_assignments=fabric_assignments,
-        folder_name=folder_name,
+        image_count=1 + len(fabric_pairs) + 1,
+        context=f"folder {folder_id.strip()}",
     )
 
     image_parts = [(hero_bytes, hero_mime), *fabric_assets, (customer_bytes, customer_mime)]

@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 from auth_deps import CurrentShopContext, get_current_shop_context
 from config import get_settings
-from prompting import build_generation_prompt
+from prompting import DEFAULT_LOOK_PROMPT, fill_prompt_placeholders
 from supabase_client import get_supabase_admin_client
 
 router = APIRouter(prefix="/generations", tags=["Generations"])
@@ -492,7 +492,7 @@ def _load_folder_prompt_context_for_hero_image(
     try:
         folder_result = (
             supabase.table("garment_types")
-            .select("id, name, prompt_template, use_custom_prompt, custom_look_prompt")
+            .select("id, name, look_prompt")
             .eq("id", folder_id)
             .eq("shop_id", shop_id)
             .limit(1)
@@ -501,7 +501,7 @@ def _load_folder_prompt_context_for_hero_image(
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to fetch folder prompt template",
+            detail="Failed to fetch folder prompt",
         ) from exc
 
     folder_rows = getattr(folder_result, "data", None) or []
@@ -900,20 +900,21 @@ def create_generation(
         shop_id=current.shop_id,
         hero_image_id=hero_image_id,
     )
-    fabric_scale = None
-    if normalized_fabrics:
-        fabric_scale = normalized_fabrics[0].get("fabric_scale")
-
-    custom_look_prompt = folder_context.get("custom_look_prompt")
-    if folder_context.get("use_custom_prompt") and custom_look_prompt and custom_look_prompt.strip():
-        prompt_used = custom_look_prompt
-    else:
-        prompt_used = build_generation_prompt(
-            folder_name=folder_context.get("name"),
-            folder_prompt_template=folder_context.get("prompt_template"),
-            fabric_assignments=normalized_fabrics,
-            fabric_scale=fabric_scale,
+    image_count = 1 + len(normalized_fabrics)
+    look_prompt = folder_context.get("look_prompt")
+    if not look_prompt or not look_prompt.strip():
+        print(
+            f"[generations_api] WARNING: garment {folder_context.get('id')} has no "
+            "look_prompt configured; using fallback prompt"
         )
+        look_prompt = DEFAULT_LOOK_PROMPT
+
+    prompt_used = fill_prompt_placeholders(
+        look_prompt,
+        garment_name=folder_context.get("name"),
+        fabric_assignments=normalized_fabrics,
+        image_count=image_count,
+    )
 
     try:
         result = (
@@ -995,6 +996,8 @@ def create_generation(
                     "prompt_used": prompt_used,
                     # Keep legacy column populated for backward compatibility.
                     "fabric_image_id": primary_fabric_image_id,
+                    "generation_type": "look",
+                    "model_used": settings.GEMINI_IMAGE_MODEL_ID,
                 }
             )
             .eq("id", generation_id)
