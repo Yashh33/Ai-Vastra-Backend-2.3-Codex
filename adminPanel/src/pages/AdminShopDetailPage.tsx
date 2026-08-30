@@ -10,6 +10,7 @@ import type {
   AdminHeroImageRow,
   AdminSetDefaultHeroRequest,
   AdminShopRow,
+  GenerationInspect,
 } from "../lib/types";
 
 export function AdminShopDetailPage() {
@@ -70,8 +71,13 @@ export function AdminShopDetailPage() {
   const [deletingShop, setDeletingShop] = useState(false);
   const [togglingMultifabric, setTogglingMultifabric] = useState(false);
 
-  const [activeTab, setActiveTab] = useState<"overview" | "garments">("overview");
+  const [activeTab, setActiveTab] = useState<"overview" | "garments" | "generations">("overview");
   const [showCreateModal, setShowCreateModal] = useState(false);
+
+  const [generations, setGenerations] = useState<GenerationInspect[]>([]);
+  const [loadingGenerations, setLoadingGenerations] = useState(false);
+  const [generationsFilterFolderId, setGenerationsFilterFolderId] = useState("");
+  const [expandedGenerationId, setExpandedGenerationId] = useState<string | null>(null);
 
   const canUploadHero = useMemo(() => !!selectedFolderId && !!heroFile, [selectedFolderId, heroFile]);
   const canUploadCatalog = useMemo(
@@ -192,9 +198,37 @@ export function AdminShopDetailPage() {
     }
   }
 
+  async function loadGenerations() {
+    if (!session || !shopId) return;
+
+    setLoadingGenerations(true);
+    try {
+      const query = generationsFilterFolderId
+        ? `&garment_type_id=${encodeURIComponent(generationsFilterFolderId)}`
+        : "";
+      const rows = await adminFetch<GenerationInspect[]>(
+        session,
+        `/admin/shops/${encodeURIComponent(shopId)}/generations?limit=30${query}`,
+        { method: "GET" }
+      );
+      setGenerations(rows);
+    } catch (err) {
+      setGenerations([]);
+      setStatusText(`Failed to load generations: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      setLoadingGenerations(false);
+    }
+  }
+
   useEffect(() => {
     void loadShopData();
   }, [session, shopId, showArchived]);
+
+  useEffect(() => {
+    if (activeTab === "generations") {
+      void loadGenerations();
+    }
+  }, [activeTab, generationsFilterFolderId, session, shopId]);
 
   useEffect(() => {
     if (!selectedFolderId) {
@@ -764,6 +798,12 @@ export function AdminShopDetailPage() {
           >
             Garment Types
           </button>
+          <button
+            className={activeTab === "generations" ? "tab tab-active" : "tab"}
+            onClick={() => setActiveTab("generations")}
+          >
+            Generations
+          </button>
         </div>
 
         {activeTab === "overview" && (
@@ -1267,6 +1307,123 @@ export function AdminShopDetailPage() {
             )}
           </div>
         </div>
+        )}
+
+        {activeTab === "generations" && (
+        <section className="card stack">
+          <div className="row" style={{ justifyContent: "space-between" }}>
+            <h2>Generations</h2>
+            <div className="row">
+              <label className="field" style={{ minWidth: "220px" }}>
+                <span>Garment type</span>
+                <select
+                  value={generationsFilterFolderId}
+                  onChange={(event) => setGenerationsFilterFolderId(event.target.value)}
+                >
+                  <option value="">All garment types</option>
+                  {folders.map((folder) => (
+                    <option key={folder.id} value={folder.id}>
+                      {folder.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button className="btn btn-light" onClick={loadGenerations} disabled={loadingGenerations}>
+                {loadingGenerations ? "Loading..." : "Refresh"}
+              </button>
+            </div>
+          </div>
+
+          {generations.length === 0 ? (
+            <div className="empty-box">
+              {loadingGenerations ? "Loading generations..." : "No generations found."}
+            </div>
+          ) : (
+            <ul className="hero-list">
+              {generations.map((gen) => {
+                const expanded = expandedGenerationId === gen.id;
+                return (
+                  <li key={gen.id}>
+                    <div
+                      className="row"
+                      style={{ cursor: "pointer" }}
+                      onClick={() => setExpandedGenerationId(expanded ? null : gen.id)}
+                    >
+                      {gen.output_signed_url ? (
+                        <img src={gen.output_signed_url} alt="Generation output" className="gt-hero-thumb" />
+                      ) : (
+                        <div className="empty-box gt-hero-thumb-placeholder">No image</div>
+                      )}
+                      <div className="stack grow">
+                        <span>{gen.garment_name || "(unknown garment)"}</span>
+                        <span className="tiny muted">
+                          {gen.model_used || "unknown model"} ·{" "}
+                          {new Date(gen.created_at).toLocaleString()}
+                        </span>
+                      </div>
+                      <span
+                        className="tiny"
+                        style={{
+                          background: gen.generation_type === "tryon" ? "#fde68a" : "#bbf7d0",
+                          color: "#111827",
+                          borderRadius: "6px",
+                          padding: "2px 8px",
+                          fontWeight: 700,
+                          flexShrink: 0,
+                        }}
+                      >
+                        {gen.generation_type === "tryon" ? "TRY-ON" : "LOOK"}
+                      </span>
+                    </div>
+
+                    {expanded ? (
+                      <div className="stack" style={{ marginTop: "0.5rem", paddingLeft: "0.25rem" }}>
+                        <div className="row">
+                          <div className="stack">
+                            <span className="tiny muted">Hero input</span>
+                            {gen.hero_signed_url ? (
+                              <img src={gen.hero_signed_url} alt="Hero input" className="gt-hero-thumb" />
+                            ) : (
+                              <div className="empty-box gt-hero-thumb-placeholder">None</div>
+                            )}
+                          </div>
+                          <div className="stack">
+                            <span className="tiny muted">Fabric input</span>
+                            {gen.fabric_signed_url ? (
+                              <img src={gen.fabric_signed_url} alt="Fabric input" className="gt-hero-thumb" />
+                            ) : (
+                              <div className="empty-box gt-hero-thumb-placeholder">None</div>
+                            )}
+                          </div>
+                        </div>
+                        <p className="tiny muted">
+                          Type: {gen.generation_type || "-"} · Model: {gen.model_used || "-"} · Status: {gen.status}
+                        </p>
+                        <div className="stack">
+                          <span className="tiny muted">Prompt used:</span>
+                          <pre
+                            style={{
+                              maxHeight: "260px",
+                              overflowY: "auto",
+                              whiteSpace: "pre-wrap",
+                              background: "#f9fafb",
+                              border: "1px solid #e5e7eb",
+                              borderRadius: "8px",
+                              padding: "0.6rem",
+                              fontSize: "0.8rem",
+                            }}
+                          >
+                            {gen.prompt_used || "(no prompt recorded)"}
+                          </pre>
+                        </div>
+                      </div>
+                    ) : null}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </section>
         )}
 
         {showCreateModal && (

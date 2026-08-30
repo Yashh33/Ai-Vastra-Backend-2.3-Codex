@@ -1500,6 +1500,104 @@ def _create_hero_image_signed_url(supabase, storage_path: str) -> Optional[str]:
         return None
 
 
+def _create_bucket_signed_url(supabase, bucket: str, storage_path: Optional[str]) -> Optional[str]:
+    try:
+        cleaned_path = (storage_path or "").strip()
+        if not cleaned_path:
+            return None
+
+        signed = supabase.storage.from_(bucket).create_signed_url(cleaned_path, 3600)
+
+        signed_url = _extract_signed_url(signed)
+        if not signed_url:
+            return None
+
+        if signed_url.startswith("/"):
+            signed_url = f"{get_settings().SUPABASE_URL}{signed_url}"
+
+        return signed_url
+    except Exception:
+        return None
+
+
+@router.get("/shops/{shop_id}/generations")
+def list_shop_generations(
+    shop_id: str,
+    limit: int = Query(default=30, ge=1, le=100),
+    garment_type_id: Optional[str] = Query(default=None),
+):
+    supabase = get_supabase_admin_client()
+
+    query = (
+        supabase.table("generations")
+        .select(
+            "id, status, generation_type, model_used, prompt_used, "
+            "hero_image_id, fabric_image_id, folder_id, output_path, created_at"
+        )
+        .eq("shop_id", shop_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+    )
+    if garment_type_id and garment_type_id.strip():
+        query = query.eq("folder_id", garment_type_id.strip())
+
+    result = query.execute()
+    rows = getattr(result, "data", None) or []
+
+    folder_ids = sorted({row["folder_id"] for row in rows if row.get("folder_id")})
+    folder_names: dict = {}
+    if folder_ids:
+        folder_result = (
+            supabase.table("garment_types").select("id, name").in_("id", folder_ids).execute()
+        )
+        for folder_row in getattr(folder_result, "data", None) or []:
+            folder_names[str(folder_row["id"])] = folder_row.get("name")
+
+    hero_ids = sorted({row["hero_image_id"] for row in rows if row.get("hero_image_id")})
+    hero_paths: dict = {}
+    if hero_ids:
+        hero_result = (
+            supabase.table("hero_images").select("id, storage_path").in_("id", hero_ids).execute()
+        )
+        for hero_row in getattr(hero_result, "data", None) or []:
+            hero_paths[str(hero_row["id"])] = hero_row.get("storage_path")
+
+    fabric_ids = sorted({row["fabric_image_id"] for row in rows if row.get("fabric_image_id")})
+    fabric_paths: dict = {}
+    if fabric_ids:
+        fabric_result = (
+            supabase.table("fabric_images")
+            .select("id, storage_path")
+            .in_("id", fabric_ids)
+            .execute()
+        )
+        for fabric_row in getattr(fabric_result, "data", None) or []:
+            fabric_paths[str(fabric_row["id"])] = fabric_row.get("storage_path")
+
+    for row in rows:
+        folder_id = row.get("folder_id")
+        row["garment_name"] = folder_names.get(str(folder_id)) if folder_id else None
+        row["output_signed_url"] = _create_bucket_signed_url(
+            supabase, "generated-outputs", row.get("output_path")
+        )
+
+        hero_id = row.get("hero_image_id")
+        row["hero_signed_url"] = (
+            _create_bucket_signed_url(supabase, "hero-images", hero_paths.get(str(hero_id)))
+            if hero_id
+            else None
+        )
+
+        fabric_id = row.get("fabric_image_id")
+        row["fabric_signed_url"] = (
+            _create_bucket_signed_url(supabase, "fabric-images", fabric_paths.get(str(fabric_id)))
+            if fabric_id
+            else None
+        )
+
+    return rows
+
+
 @router.get("/shops/{shop_id}/hero-images")
 def list_shop_hero_images(
     shop_id: str,

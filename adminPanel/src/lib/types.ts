@@ -92,3 +92,20 @@ export type AdminFabricSlotRow = {
   created_at?: string;
 };
 
+export type GenerationInspect = {
+  id: string;
+  status: string;
+  generation_type: string | null;
+  model_used: string | null;
+  prompt_used: string | null;
+  hero_image_id: string | null;
+  fabric_image_id: string | null;
+  folder_id: string | null;
+  output_path: string | null;
+  created_at: string;
+  garment_name: string | null;
+  output_signed_url: string | null;
+  hero_signed_url: string | null;
+  fabric_signed_url: string | null;
+};
+
