@@ -53,11 +53,11 @@ class AdminCreateFolderRequest(BaseModel):
     category: str = "unisex"
 
 
-class AdminUpdateCustomPromptRequest(BaseModel):
-    use_custom_prompt: bool
-    custom_look_prompt: Optional[str] = None
-    custom_tryon_prompt: Optional[str] = None
+class AdminUpdateGarmentPromptRequest(BaseModel):
+    look_prompt: str
+    tryon_prompt: str
     category: str
+    note: Optional[str] = None
 
 
 class AdminUpdateDefaultHeroRequest(BaseModel):
@@ -1184,11 +1184,11 @@ def restore_folder(
 _ALLOWED_GARMENT_CATEGORIES = {"men", "women", "unisex"}
 
 
-@router.patch("/shops/{shop_id}/folders/{folder_id}/custom-prompt")
-def update_folder_custom_prompt(
+@router.patch("/shops/{shop_id}/folders/{folder_id}/prompt")
+def update_folder_prompt(
     shop_id: str,
     folder_id: str,
-    body: AdminUpdateCustomPromptRequest,
+    body: AdminUpdateGarmentPromptRequest,
     _: None = Depends(verify_admin_secret),
 ):
     supabase = get_supabase_admin_client()
@@ -1200,32 +1200,110 @@ def update_folder_custom_prompt(
             detail="category must be one of: men, women, unisex",
         )
 
-    look_prompt = body.custom_look_prompt
-    tryon_prompt = body.custom_tryon_prompt
-
-    if body.use_custom_prompt:
-        if not (look_prompt or "").strip() or not (tryon_prompt or "").strip():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Both look and try-on prompts are required when custom prompt is enabled.",
-            )
-
-    payload = {
-        "use_custom_prompt": body.use_custom_prompt,
-        "custom_look_prompt": look_prompt,
-        "custom_tryon_prompt": tryon_prompt,
-        "category": category,
-    }
+    look_prompt = (body.look_prompt or "").strip()
+    tryon_prompt = (body.tryon_prompt or "").strip()
+    if not look_prompt or not tryon_prompt:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Both look and try-on prompts are required.",
+        )
 
     result = (
         supabase.table("garment_types")
-        .update(payload)
+        .update(
+            {
+                "look_prompt": look_prompt,
+                "tryon_prompt": tryon_prompt,
+                "category": category,
+            }
+        )
         .eq("id", folder_id)
         .eq("shop_id", shop_id)
         .execute()
     )
     if not result.data:
         raise HTTPException(status_code=404, detail="Folder not found")
+
+    note = (body.note or "").strip() or None
+    try:
+        supabase.table("garment_prompt_versions").insert(
+            {
+                "garment_type_id": folder_id,
+                "shop_id": shop_id,
+                "look_prompt": look_prompt,
+                "tryon_prompt": tryon_prompt,
+                "note": note,
+            }
+        ).execute()
+    except Exception as exc:
+        print(f"[admin_api] WARNING: failed to record prompt version for folder {folder_id}: {exc}")
+
+    return result.data[0]
+
+
+@router.get("/shops/{shop_id}/folders/{folder_id}/prompt-versions")
+def list_folder_prompt_versions(shop_id: str, folder_id: str):
+    supabase = get_supabase_admin_client()
+
+    result = (
+        supabase.table("garment_prompt_versions")
+        .select("id, garment_type_id, shop_id, look_prompt, tryon_prompt, note, created_at")
+        .eq("garment_type_id", folder_id)
+        .eq("shop_id", shop_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return getattr(result, "data", None) or []
+
+
+@router.post("/shops/{shop_id}/folders/{folder_id}/prompt-versions/{version_id}/revert")
+def revert_folder_prompt_version(
+    shop_id: str,
+    folder_id: str,
+    version_id: str,
+    _: None = Depends(verify_admin_secret),
+):
+    supabase = get_supabase_admin_client()
+
+    version_result = (
+        supabase.table("garment_prompt_versions")
+        .select("look_prompt, tryon_prompt")
+        .eq("id", version_id)
+        .eq("garment_type_id", folder_id)
+        .eq("shop_id", shop_id)
+        .limit(1)
+        .execute()
+    )
+    version_rows = getattr(version_result, "data", None) or []
+    if not version_rows:
+        raise HTTPException(status_code=404, detail="Prompt version not found")
+
+    look_prompt = version_rows[0].get("look_prompt") or ""
+    tryon_prompt = version_rows[0].get("tryon_prompt") or ""
+
+    result = (
+        supabase.table("garment_types")
+        .update({"look_prompt": look_prompt, "tryon_prompt": tryon_prompt})
+        .eq("id", folder_id)
+        .eq("shop_id", shop_id)
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Folder not found")
+
+    try:
+        supabase.table("garment_prompt_versions").insert(
+            {
+                "garment_type_id": folder_id,
+                "shop_id": shop_id,
+                "look_prompt": look_prompt,
+                "tryon_prompt": tryon_prompt,
+                "note": f"Reverted to version {version_id}",
+            }
+        ).execute()
+    except Exception as exc:
+        print(f"[admin_api] WARNING: failed to record revert version for folder {folder_id}: {exc}")
+
     return result.data[0]
 
 

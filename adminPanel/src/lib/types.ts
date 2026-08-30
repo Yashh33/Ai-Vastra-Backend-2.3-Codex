@@ -46,10 +46,19 @@ export type AdminFolderRow = {
   created_at: string;
   updated_at: string;
   show_in_whatsapp_menu?: boolean;
-  use_custom_prompt?: boolean;
-  custom_look_prompt?: string | null;
-  custom_tryon_prompt?: string | null;
+  look_prompt?: string | null;
+  tryon_prompt?: string | null;
   category?: string;
+};
+
+export type PromptVersion = {
+  id: string;
+  garment_type_id: string;
+  shop_id: string;
+  look_prompt: string | null;
+  tryon_prompt: string | null;
+  note: string | null;
+  created_at: string;
 };
 
 export type AdminHeroImageRow = {

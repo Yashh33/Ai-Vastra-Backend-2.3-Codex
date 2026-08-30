@@ -11,6 +11,7 @@ import type {
   AdminSetDefaultHeroRequest,
   AdminShopRow,
   GenerationInspect,
+  PromptVersion,
 } from "../lib/types";
 
 export function AdminShopDetailPage() {
@@ -62,10 +63,15 @@ export function AdminShopDetailPage() {
   const [togglingWhatsappMenu, setTogglingWhatsappMenu] = useState(false);
 
   const [editCategory, setEditCategory] = useState("unisex");
-  const [editUseCustomPrompt, setEditUseCustomPrompt] = useState(false);
   const [editLookPrompt, setEditLookPrompt] = useState("");
   const [editTryonPrompt, setEditTryonPrompt] = useState("");
-  const [savingCustomPrompt, setSavingCustomPrompt] = useState(false);
+  const [editPromptNote, setEditPromptNote] = useState("");
+  const [savingPrompt, setSavingPrompt] = useState(false);
+
+  const [showPromptHistory, setShowPromptHistory] = useState(false);
+  const [promptVersions, setPromptVersions] = useState<PromptVersion[]>([]);
+  const [loadingPromptVersions, setLoadingPromptVersions] = useState(false);
+  const [revertingVersionId, setRevertingVersionId] = useState<string | null>(null);
 
   const [processingSuspend, setProcessingSuspend] = useState(false);
   const [deletingShop, setDeletingShop] = useState(false);
@@ -253,9 +259,11 @@ export function AdminShopDetailPage() {
   useEffect(() => {
     const folder = folders.find((item) => item.id === selectedFolderId) || null;
     setEditCategory(folder?.category || "unisex");
-    setEditUseCustomPrompt(Boolean(folder?.use_custom_prompt));
-    setEditLookPrompt(folder?.custom_look_prompt || "");
-    setEditTryonPrompt(folder?.custom_tryon_prompt || "");
+    setEditLookPrompt(folder?.look_prompt || "");
+    setEditTryonPrompt(folder?.tryon_prompt || "");
+    setEditPromptNote("");
+    setShowPromptHistory(false);
+    setPromptVersions([]);
   }, [selectedFolderId]);
 
   useEffect(() => {
@@ -621,30 +629,29 @@ export function AdminShopDetailPage() {
     }
   }
 
-  async function handleSaveCustomPrompt(folderId: string) {
+  async function handleSavePrompt(folderId: string) {
     if (!session || !shopId) return;
 
-    if (editUseCustomPrompt && (!editLookPrompt.trim() || !editTryonPrompt.trim())) {
-      setStatusText("Both look and try-on prompts are required when custom prompt is enabled.");
+    if (!editLookPrompt.trim() || !editTryonPrompt.trim()) {
+      setStatusText("Both look and try-on prompts are required.");
       return;
     }
 
-    setSavingCustomPrompt(true);
+    setSavingPrompt(true);
     try {
       const payload = {
-        use_custom_prompt: editUseCustomPrompt,
-        custom_look_prompt: editLookPrompt,
-        custom_tryon_prompt: editTryonPrompt,
+        look_prompt: editLookPrompt,
+        tryon_prompt: editTryonPrompt,
         category: editCategory,
+        note: editPromptNote.trim() || undefined,
       };
       const updated = await adminFetch<{
-        use_custom_prompt: boolean;
-        custom_look_prompt: string | null;
-        custom_tryon_prompt: string | null;
+        look_prompt: string;
+        tryon_prompt: string;
         category: string;
       }>(
         session,
-        `/admin/shops/${encodeURIComponent(shopId)}/folders/${encodeURIComponent(folderId)}/custom-prompt`,
+        `/admin/shops/${encodeURIComponent(shopId)}/folders/${encodeURIComponent(folderId)}/prompt`,
         { method: "PATCH", body: JSON.stringify(payload) }
       );
 
@@ -653,21 +660,72 @@ export function AdminShopDetailPage() {
           folder.id === folderId
             ? {
                 ...folder,
-                use_custom_prompt: updated.use_custom_prompt,
-                custom_look_prompt: updated.custom_look_prompt,
-                custom_tryon_prompt: updated.custom_tryon_prompt,
+                look_prompt: updated.look_prompt,
+                tryon_prompt: updated.tryon_prompt,
                 category: updated.category,
               }
             : folder
         )
       );
-      setStatusText("Prompt & category saved.");
+      setEditPromptNote("");
+      setStatusText("Prompt saved (new version recorded).");
+      if (showPromptHistory) {
+        await loadPromptVersions(folderId);
+      }
     } catch (err) {
-      setStatusText(
-        `Failed to save prompt & category: ${err instanceof Error ? err.message : "Unknown error"}`
-      );
+      setStatusText(`Failed to save prompt: ${err instanceof Error ? err.message : "Unknown error"}`);
     } finally {
-      setSavingCustomPrompt(false);
+      setSavingPrompt(false);
+    }
+  }
+
+  async function loadPromptVersions(folderId: string) {
+    if (!session || !shopId || !folderId) {
+      setPromptVersions([]);
+      return;
+    }
+
+    setLoadingPromptVersions(true);
+    try {
+      const rows = await adminFetch<PromptVersion[]>(
+        session,
+        `/admin/shops/${encodeURIComponent(shopId)}/folders/${encodeURIComponent(folderId)}/prompt-versions`,
+        { method: "GET" }
+      );
+      setPromptVersions(rows);
+    } catch (err) {
+      setPromptVersions([]);
+      setStatusText(`Failed to load prompt history: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      setLoadingPromptVersions(false);
+    }
+  }
+
+  function handleTogglePromptHistory() {
+    const next = !showPromptHistory;
+    setShowPromptHistory(next);
+    if (next && selectedFolderId) {
+      void loadPromptVersions(selectedFolderId);
+    }
+  }
+
+  async function handleRevertPromptVersion(versionId: string) {
+    if (!session || !shopId || !selectedFolderId) return;
+
+    setRevertingVersionId(versionId);
+    try {
+      await adminFetch(
+        session,
+        `/admin/shops/${encodeURIComponent(shopId)}/folders/${encodeURIComponent(selectedFolderId)}/prompt-versions/${encodeURIComponent(versionId)}/revert`,
+        { method: "POST" }
+      );
+      setStatusText("Reverted to selected prompt version.");
+      await loadShopData();
+      await loadPromptVersions(selectedFolderId);
+    } catch (err) {
+      setStatusText(`Failed to revert: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      setRevertingVersionId(null);
     }
   }
 
@@ -1058,37 +1116,22 @@ export function AdminShopDetailPage() {
                     </label>
                   </div>
 
-                  <label className="row tiny">
-                    <input
-                      type="checkbox"
-                      checked={editUseCustomPrompt}
-                      onChange={(event) => setEditUseCustomPrompt(event.target.checked)}
-                    />
-                    Use custom prompt
-                  </label>
-
-                  {editUseCustomPrompt ? (
-                    <div className="grid-2">
-                      <label className="field">
-                        <span>Look prompt (used for LOOK generation)</span>
-                        <textarea
-                          value={editLookPrompt}
-                          onChange={(event) => setEditLookPrompt(event.target.value)}
-                        />
-                      </label>
-                      <label className="field">
-                        <span>Try-on prompt (used for TRY-ON)</span>
-                        <textarea
-                          value={editTryonPrompt}
-                          onChange={(event) => setEditTryonPrompt(event.target.value)}
-                        />
-                      </label>
-                    </div>
-                  ) : (
-                    <p className="tiny muted">
-                      Custom prompt is off — the generic prompt engine is used for this garment type.
-                    </p>
-                  )}
+                  <div className="grid-2">
+                    <label className="field">
+                      <span>Look Prompt</span>
+                      <textarea
+                        value={editLookPrompt}
+                        onChange={(event) => setEditLookPrompt(event.target.value)}
+                      />
+                    </label>
+                    <label className="field">
+                      <span>Try-on Prompt</span>
+                      <textarea
+                        value={editTryonPrompt}
+                        onChange={(event) => setEditTryonPrompt(event.target.value)}
+                      />
+                    </label>
+                  </div>
 
                   <div className="stack">
                     <p className="tiny muted">Image order Gemini receives:</p>
@@ -1099,14 +1142,58 @@ export function AdminShopDetailPage() {
                     </ul>
                   </div>
 
+                  <label className="field">
+                    <span>Note (optional, saved with this version)</span>
+                    <input
+                      value={editPromptNote}
+                      onChange={(event) => setEditPromptNote(event.target.value)}
+                      placeholder="e.g. Fixed collar wording"
+                    />
+                  </label>
+
                   <button
                     className="btn btn-dark"
                     type="button"
-                    disabled={savingCustomPrompt}
-                    onClick={() => void handleSaveCustomPrompt(selectedFolder.id)}
+                    disabled={savingPrompt}
+                    onClick={() => void handleSavePrompt(selectedFolder.id)}
                   >
-                    {savingCustomPrompt ? "Saving..." : "Save Prompt & Category"}
+                    {savingPrompt ? "Saving..." : "Save Prompt"}
                   </button>
+
+                  <button className="btn btn-light" type="button" onClick={handleTogglePromptHistory}>
+                    {showPromptHistory ? "Hide prompt history" : "Show prompt history"}
+                  </button>
+
+                  {showPromptHistory ? (
+                    <div className="stack" style={{ marginTop: "0.4rem" }}>
+                      {loadingPromptVersions ? (
+                        <p className="tiny muted">Loading prompt history...</p>
+                      ) : promptVersions.length === 0 ? (
+                        <div className="empty-box">No saved versions yet.</div>
+                      ) : (
+                        <ul className="hero-list">
+                          {promptVersions.map((version) => (
+                            <li key={version.id}>
+                              <div className="row" style={{ justifyContent: "space-between" }}>
+                                <div className="stack">
+                                  <span className="tiny">{new Date(version.created_at).toLocaleString()}</span>
+                                  <span className="tiny muted">{version.note || "(no note)"}</span>
+                                </div>
+                                <button
+                                  className="btn btn-light"
+                                  type="button"
+                                  disabled={revertingVersionId === version.id}
+                                  onClick={() => void handleRevertPromptVersion(version.id)}
+                                >
+                                  {revertingVersionId === version.id ? "Reverting..." : "Revert to this"}
+                                </button>
+                              </div>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  ) : null}
                 </div>
 
                 <div className="stack">
