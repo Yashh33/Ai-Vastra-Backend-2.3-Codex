@@ -178,6 +178,8 @@ _MSG_JOIN_SUCCESS_TEMPLATE = (
 _MSG_TV_PUSHED = "Bade screen par bhej diya 📺✨"
 _MSG_TV_NONE = "Pehle ek look banaiye, phir TV likhein 🙂"
 _MSG_TV_CLEARED = "Screen wapas catalog par aa gaya ✅"
+_MSG_CATALOG = "Showing catalog on screen."
+_MSG_HOME = "Screen set to home."
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -1349,6 +1351,7 @@ def _handle_tv_command(supabase, session: dict) -> None:
         {
             "shop_id": shop_id,
             "live_generation_id": generation_id,
+            "mode": "live",
             "updated_at": _utc_now_iso(),
         }
     ).execute()
@@ -1364,11 +1367,44 @@ def _handle_next_command(supabase, session: dict) -> None:
         {
             "shop_id": shop_id,
             "live_generation_id": None,
+            "mode": "catalog",
             "updated_at": _utc_now_iso(),
         }
     ).execute()
 
     send_text(phone, _MSG_TV_CLEARED)
+
+
+def _handle_catalog_command(supabase, session: dict) -> None:
+    phone = session["phone_number"]
+    shop_id = session["shop_id"]
+
+    supabase.table("shop_screen_state").upsert(
+        {
+            "shop_id": shop_id,
+            "live_generation_id": None,
+            "mode": "catalog",
+            "updated_at": _utc_now_iso(),
+        }
+    ).execute()
+
+    send_text(phone, _MSG_CATALOG)
+
+
+def _handle_home_command(supabase, session: dict) -> None:
+    phone = session["phone_number"]
+    shop_id = session["shop_id"]
+
+    supabase.table("shop_screen_state").upsert(
+        {
+            "shop_id": shop_id,
+            "live_generation_id": None,
+            "mode": "idle",
+            "updated_at": _utc_now_iso(),
+        }
+    ).execute()
+
+    send_text(phone, _MSG_HOME)
 
 
 def _dispatch(supabase, session: dict, msg: dict) -> None:
@@ -1392,6 +1428,14 @@ def _dispatch(supabase, session: dict, msg: dict) -> None:
 
     if kind == "text" and text.lower() == "tv":
         _handle_tv_command(supabase, session)
+        return
+
+    if kind == "text" and text.lower() == "catalog":
+        _handle_catalog_command(supabase, session)
+        return
+
+    if kind == "text" and text.lower() == "home":
+        _handle_home_command(supabase, session)
         return
 
     if kind == "text" and text.lower() == "next":
