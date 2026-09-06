@@ -180,6 +180,7 @@ _MSG_TV_NONE = "Pehle ek look banaiye, phir TV likhein 🙂"
 _MSG_TV_CLEARED = "Screen wapas catalog par aa gaya ✅"
 _MSG_CATALOG = "Showing catalog on screen."
 _MSG_HOME = "Screen set to home."
+_MSG_BROWSE = "Showing browse on screen."
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -1391,6 +1392,22 @@ def _handle_catalog_command(supabase, session: dict) -> None:
     send_text(phone, _MSG_CATALOG)
 
 
+def _handle_browse_command(supabase, session: dict) -> None:
+    phone = session["phone_number"]
+    shop_id = session["shop_id"]
+
+    supabase.table("shop_screen_state").upsert(
+        {
+            "shop_id": shop_id,
+            "live_generation_id": None,
+            "mode": "browse",
+            "updated_at": _utc_now_iso(),
+        }
+    ).execute()
+
+    send_text(phone, _MSG_BROWSE)
+
+
 def _handle_home_command(supabase, session: dict) -> None:
     phone = session["phone_number"]
     shop_id = session["shop_id"]
@@ -1432,6 +1449,10 @@ def _dispatch(supabase, session: dict, msg: dict) -> None:
 
     if kind == "text" and text.lower() == "catalog":
         _handle_catalog_command(supabase, session)
+        return
+
+    if kind == "text" and text.lower() == "browse":
+        _handle_browse_command(supabase, session)
         return
 
     if kind == "text" and text.lower() == "home":
