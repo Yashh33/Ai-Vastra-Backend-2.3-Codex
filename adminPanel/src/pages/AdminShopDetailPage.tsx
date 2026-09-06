@@ -84,6 +84,7 @@ export function AdminShopDetailPage() {
   const [loadingGenerations, setLoadingGenerations] = useState(false);
   const [generationsFilterFolderId, setGenerationsFilterFolderId] = useState("");
   const [expandedGenerationId, setExpandedGenerationId] = useState<string | null>(null);
+  const [heroToggleError, setHeroToggleError] = useState<{ id: string; message: string } | null>(null);
 
   const canUploadHero = useMemo(() => !!selectedFolderId && !!heroFile, [selectedFolderId, heroFile]);
   const canUploadCatalog = useMemo(
@@ -223,6 +224,31 @@ export function AdminShopDetailPage() {
       setStatusText(`Failed to load generations: ${err instanceof Error ? err.message : "Unknown error"}`);
     } finally {
       setLoadingGenerations(false);
+    }
+  }
+
+  async function handleToggleHero(generationId: string, nextValue: boolean) {
+    if (!session || !shopId) return;
+
+    setHeroToggleError(null);
+    setGenerations((prev) =>
+      prev.map((gen) => (gen.id === generationId ? { ...gen, is_hero: nextValue } : gen))
+    );
+
+    try {
+      await adminFetch<{ id: string; is_hero: boolean }>(
+        session,
+        `/admin/shops/${encodeURIComponent(shopId)}/generations/${encodeURIComponent(generationId)}/hero`,
+        { method: "PATCH", body: JSON.stringify({ is_hero: nextValue }) }
+      );
+    } catch (err) {
+      setGenerations((prev) =>
+        prev.map((gen) => (gen.id === generationId ? { ...gen, is_hero: !nextValue } : gen))
+      );
+      setHeroToggleError({
+        id: generationId,
+        message: err instanceof Error ? err.message : "Failed to update hero flag",
+      });
     }
   }
 
@@ -1442,12 +1468,41 @@ export function AdminShopDetailPage() {
                         <div className="empty-box gt-hero-thumb-placeholder">No image</div>
                       )}
                       <div className="stack grow">
-                        <span>{gen.garment_name || "(unknown garment)"}</span>
+                        <span>
+                          {gen.garment_name || "(unknown garment)"}
+                          {gen.is_hero ? (
+                            <span
+                              className="tiny"
+                              style={{ marginLeft: "0.5rem", color: "#b45309", fontWeight: 700 }}
+                            >
+                              ★ Hero
+                            </span>
+                          ) : null}
+                        </span>
                         <span className="tiny muted">
                           {gen.model_used || "unknown model"} ·{" "}
                           {new Date(gen.created_at).toLocaleString()}
                         </span>
+                        {heroToggleError?.id === gen.id ? (
+                          <span className="tiny" style={{ color: "#b91c1c" }}>
+                            {heroToggleError.message}
+                          </span>
+                        ) : null}
                       </div>
+                      {gen.generation_type !== "tryon" ? (
+                        <label
+                          className="row tiny"
+                          style={{ flexShrink: 0 }}
+                          onClick={(event) => event.stopPropagation()}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={gen.is_hero}
+                            onChange={(event) => void handleToggleHero(gen.id, event.target.checked)}
+                          />
+                          Hero
+                        </label>
+                      ) : null}
                       <span
                         className="tiny"
                         style={{

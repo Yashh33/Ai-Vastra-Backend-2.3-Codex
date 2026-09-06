@@ -116,5 +116,6 @@ export type GenerationInspect = {
   output_signed_url: string | null;
   hero_signed_url: string | null;
   fabric_signed_url: string | null;
+  is_hero: boolean;
 };
 
