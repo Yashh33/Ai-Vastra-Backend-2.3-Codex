@@ -74,6 +74,10 @@ class AdminCreateFabricSlotRequest(BaseModel):
     sort_order: int = Field(default=0, ge=0, le=100)
 
 
+class SetGenerationHeroRequest(BaseModel):
+    is_hero: bool
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -1610,7 +1614,7 @@ def list_shop_generations(
         supabase.table("generations")
         .select(
             "id, status, generation_type, model_used, prompt_used, "
-            "hero_image_id, fabric_image_id, folder_id, output_path, created_at"
+            "hero_image_id, fabric_image_id, folder_id, output_path, created_at, is_hero"
         )
         .eq("shop_id", shop_id)
         .order("created_at", desc=True)
@@ -1674,6 +1678,24 @@ def list_shop_generations(
         )
 
     return rows
+
+
+@router.patch("/shops/{shop_id}/generations/{generation_id}/hero")
+def set_generation_hero(shop_id: str, generation_id: str, body: SetGenerationHeroRequest):
+    supabase = get_supabase_admin_client()
+
+    result = (
+        supabase.table("generations")
+        .update({"is_hero": body.is_hero})
+        .eq("id", generation_id)
+        .eq("shop_id", shop_id)
+        .execute()
+    )
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Generation not found")
+
+    return {"id": rows[0]["id"], "is_hero": rows[0]["is_hero"]}
 
 
 @router.get("/shops/{shop_id}/hero-images")
