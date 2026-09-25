@@ -1,7 +1,10 @@
 ﻿import base64
 import io
 import threading
+import time
+from datetime import datetime, timezone
 from typing import Optional, Tuple
+from uuid import uuid4
 
 import anyio.to_thread
 from cachetools import TTLCache
@@ -908,3 +911,80 @@ async def tryon_multi_v2(
     )
 
     return Response(content=image_bytes, media_type=result_mime)
+
+
+def _upload_generated_output(supabase, *, bucket: str, path: str, data: bytes, content_type: str) -> None:
+    options = {"content-type": content_type, "upsert": "true"}
+    try:
+        supabase.storage.from_(bucket).upload(path, data, options)
+    except Exception:
+        supabase.storage.from_(bucket).update(path, data, options)
+
+
+@router.post("/push-to-screen")
+async def push_tryon_to_screen(
+    result_image: UploadFile = File(...),
+    folder_id: str = Form(...),
+    fabric_image_id: Optional[str] = Form(default=None),
+    hero_image_id: Optional[str] = Form(default=None),
+    source_generation_id: Optional[str] = Form(default=None),
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    """
+    Persist-on-push: the web-app equivalent of the WhatsApp TV flow. Takes
+    an ALREADY-GENERATED try-on output image and, only when the shopkeeper
+    pushes it live, stores it and puts it on the shop's TV. No customer
+    input photo is stored — this endpoint only ever receives the output
+    image.
+    """
+    supabase = get_supabase_admin_client()
+    settings = get_settings()
+
+    shop_id = current.shop_id
+    new_generation_id = str(uuid4())
+
+    data = await result_image.read()
+    mime = result_image.content_type or "image/png"
+    ext = "png" if "png" in mime else "jpg"
+
+    output_path = f"{shop_id}/{new_generation_id}/output_v{int(time.time())}.{ext}"
+    _upload_generated_output(
+        supabase,
+        bucket="generated-outputs",
+        path=output_path,
+        data=data,
+        content_type=mime,
+    )
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    supabase.table("generations").insert(
+        {
+            "id": new_generation_id,
+            "shop_id": shop_id,
+            "hero_image_id": (hero_image_id or "").strip() or None,
+            "fabric_image_id": (fabric_image_id or "").strip() or None,
+            "folder_id": folder_id.strip(),
+            "status": "done",
+            "generation_type": "tryon",
+            "model_used": settings.GEMINI_IMAGE_MODEL_ID,
+            "prompt_used": "web-app try-on (pushed to screen)",
+            "output_path": output_path,
+            "credits_used": 0,
+            "show_on_screen": True,
+            "created_at": now_iso,
+            "started_at": now_iso,
+            "completed_at": now_iso,
+        }
+    ).execute()
+
+    supabase.table("shop_screen_state").upsert(
+        {
+            "shop_id": shop_id,
+            "live_generation_id": new_generation_id,
+            "mode": "live",
+            "updated_at": now_iso,
+        }
+    ).execute()
+
+    return {"generation_id": new_generation_id, "live": True}
