@@ -140,9 +140,13 @@ def list_garment_types(
             storage_path_by_hero_image_id = {}
 
     storage_paths = sorted(set(storage_path_by_hero_image_id.values()))
-    signed_url_by_storage_path = _create_hero_image_signed_urls_batch(
-        supabase, storage_paths
-    )
+    try:
+        signed_url_by_storage_path = _create_hero_image_signed_urls_batch(
+            supabase, storage_paths
+        )
+    except Exception as exc:
+        print(f"[garment_types_api] failed to sign hero image URLs: {exc}")
+        signed_url_by_storage_path = {}
 
     all_folder_ids = [folder.get("id") for folder in folders if folder.get("id")]
 
