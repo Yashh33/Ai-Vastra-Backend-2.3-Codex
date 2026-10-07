@@ -4,15 +4,43 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { adminFetch } from "../lib/api";
 import { useAdminAuth } from "../lib/auth";
 import type {
-  AdminCatalogImageRow,
   AdminFabricSlotRow,
   AdminFolderRow,
   AdminHeroImageRow,
   AdminSetDefaultHeroRequest,
   AdminShopRow,
   GenerationInspect,
+  LookUploadItem,
+  LookUploadResponse,
+  LookUploadStatus,
   PromptVersion,
 } from "../lib/types";
+
+const LOOK_UPLOAD_BATCH_SIZE = 10;
+
+const LOOK_STATUS_STYLE: Record<LookUploadStatus, { label: string; color: string }> = {
+  uploaded: { label: "Uploaded", color: "#15803d" },
+  duplicate: { label: "Duplicate", color: "#b45309" },
+  failed: { label: "Failed", color: "#b91c1c" },
+};
+
+// Mirrors the backend rule: name without extension, trimmed, trailing copy suffixes stripped.
+function barcodeFromFilename(filename: string): string {
+  let name = (filename.split(/[\\/]/).pop() ?? "").trim();
+  const dot = name.lastIndexOf(".");
+  if (dot >= 0) name = name.slice(0, dot);
+  name = name.trim();
+
+  for (;;) {
+    const stripped = name.replace(/(\s*\(\d+\)|\s*-\s*copy)$/i, "").trim();
+    if (stripped === name) return name;
+    name = stripped;
+  }
+}
+
+function formatFileSize(bytes: number): string {
+  return bytes >= 1024 * 1024 ? `${(bytes / (1024 * 1024)).toFixed(1)} MB` : `${Math.round(bytes / 1024)} KB`;
+}
 
 export function AdminShopDetailPage() {
   const { shopId = "" } = useParams();
@@ -24,7 +52,6 @@ export function AdminShopDetailPage() {
   const [showArchived, setShowArchived] = useState(false);
   const [heroImages, setHeroImages] = useState<AdminHeroImageRow[]>([]);
   const [heroSignedUrls, setHeroSignedUrls] = useState<Record<string, string>>({});
-  const [catalogImages, setCatalogImages] = useState<AdminCatalogImageRow[]>([]);
 
   const [loading, setLoading] = useState(false);
   const [statusText, setStatusText] = useState("Loading shop...");
@@ -51,8 +78,14 @@ export function AdminShopDetailPage() {
   const [selectedFolderId, setSelectedFolderId] = useState("");
   const [heroFile, setHeroFile] = useState<File | null>(null);
   const [uploadingHero, setUploadingHero] = useState(false);
-  const [catalogFiles, setCatalogFiles] = useState<File[]>([]);
-  const [uploadingCatalog, setUploadingCatalog] = useState(false);
+  const [lookFiles, setLookFiles] = useState<File[]>([]);
+  const [lookInputKey, setLookInputKey] = useState(0);
+  const [uploadingLooks, setUploadingLooks] = useState(false);
+  const [lookUploadProgress, setLookUploadProgress] = useState("");
+  const [lookUploadResults, setLookUploadResults] = useState<{
+    folderName: string;
+    items: LookUploadItem[];
+  } | null>(null);
 
   const [fabricSlots, setFabricSlots] = useState<AdminFabricSlotRow[]>([]);
   const [newSlotLabel, setNewSlotLabel] = useState("");
@@ -87,10 +120,6 @@ export function AdminShopDetailPage() {
   const [heroToggleError, setHeroToggleError] = useState<{ id: string; message: string } | null>(null);
 
   const canUploadHero = useMemo(() => !!selectedFolderId && !!heroFile, [selectedFolderId, heroFile]);
-  const canUploadCatalog = useMemo(
-    () => !!selectedFolderId && catalogFiles.length > 0,
-    [selectedFolderId, catalogFiles]
-  );
   const selectedFolder = useMemo(
     () => folders.find((folder) => folder.id === selectedFolderId) || null,
     [folders, selectedFolderId]
@@ -167,24 +196,6 @@ export function AdminShopDetailPage() {
       }
     }
     setHeroSignedUrls(urls);
-  }
-
-  async function loadCatalogImages(folderId: string) {
-    if (!session || !shopId || !folderId) {
-      setCatalogImages([]);
-      return;
-    }
-
-    try {
-      const rows = await adminFetch<AdminCatalogImageRow[]>(
-        session,
-        `/admin/shops/${encodeURIComponent(shopId)}/catalog-images?folder_id=${encodeURIComponent(folderId)}&limit=30`,
-        { method: "GET" }
-      );
-      setCatalogImages(rows);
-    } catch {
-      setCatalogImages([]);
-    }
   }
 
   async function loadFabricSlots(folderId: string) {
@@ -265,16 +276,21 @@ export function AdminShopDetailPage() {
   useEffect(() => {
     if (!selectedFolderId) {
       setHeroImages([]);
-      setCatalogImages([]);
       setFabricSlots([]);
       return;
     }
     void Promise.all([
       loadHeroImages(selectedFolderId),
-      loadCatalogImages(selectedFolderId),
       loadFabricSlots(selectedFolderId),
     ]);
   }, [selectedFolderId, session, shopId]);
+
+  useEffect(() => {
+    // A selection made for one garment type must never be uploaded into another.
+    setLookFiles([]);
+    setLookUploadResults(null);
+    setLookInputKey((key) => key + 1);
+  }, [selectedFolderId]);
 
   useEffect(() => {
     if (!selectedFolderId && folders.length > 0) {
@@ -498,37 +514,64 @@ export function AdminShopDetailPage() {
     }
   }
 
-  async function handleCatalogBulkUpload(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!session || !shopId || !selectedFolderId || !catalogFiles.length) return;
+  async function handleLooksBulkUpload() {
+    if (!session || !shopId || !selectedFolder || !lookFiles.length || uploadingLooks) return;
 
-    setUploadingCatalog(true);
+    const folderId = selectedFolder.id;
+    const folderName = selectedFolder.name;
+    const files = lookFiles;
+    const label = `Upload ${files.length} look${files.length === 1 ? "" : "s"} to ${folderName}`;
+    if (!window.confirm(`${label}?`)) return;
+
+    const batches: File[][] = [];
+    for (let i = 0; i < files.length; i += LOOK_UPLOAD_BATCH_SIZE) {
+      batches.push(files.slice(i, i + LOOK_UPLOAD_BATCH_SIZE));
+    }
+
+    setUploadingLooks(true);
+    setLookUploadResults(null);
+    const items: LookUploadItem[] = [];
+
     try {
-      const formData = new FormData();
-      formData.append("folder_id", selectedFolderId);
-      for (const file of catalogFiles) {
-        formData.append("files", file);
-      }
+      for (let index = 0; index < batches.length; index += 1) {
+        const batch = batches[index];
+        setLookUploadProgress(`Batch ${index + 1} of ${batches.length}...`);
 
-      const result = await adminFetch<{
-        uploaded_count: number;
-        items: AdminCatalogImageRow[];
-      }>(
-        session,
-        `/admin/shops/${encodeURIComponent(shopId)}/catalog-images/upload-bulk`,
-        {
-          method: "POST",
-          body: formData,
+        const formData = new FormData();
+        formData.append("folder_id", folderId);
+        for (const file of batch) {
+          formData.append("files", file);
         }
-      );
 
-      setCatalogFiles([]);
-      setCatalogImages((prev) => [...result.items, ...prev]);
-      setStatusText(`Catalog upload completed. ${result.uploaded_count} image(s) added.`);
-    } catch (err) {
-      setStatusText(`Catalog upload failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+        try {
+          const result = await adminFetch<LookUploadResponse>(
+            session,
+            `/admin/shops/${encodeURIComponent(shopId)}/looks/upload-bulk`,
+            { method: "POST", body: formData }
+          );
+          items.push(...result.items);
+        } catch (err) {
+          const error = err instanceof Error ? err.message : "Unknown error";
+          for (const file of batch) {
+            items.push({
+              filename: file.name,
+              barcode: barcodeFromFilename(file.name) || null,
+              status: "failed",
+              error,
+            });
+          }
+        }
+      }
     } finally {
-      setUploadingCatalog(false);
+      const count = (status: LookUploadStatus) => items.filter((item) => item.status === status).length;
+      setLookUploadResults({ folderName, items });
+      setLookFiles([]);
+      setLookInputKey((key) => key + 1);
+      setLookUploadProgress("");
+      setUploadingLooks(false);
+      setStatusText(
+        `Looks upload to ${folderName} finished. Uploaded ${count("uploaded")} · Duplicates ${count("duplicate")} · Failed ${count("failed")}`
+      );
     }
   }
 
@@ -1378,43 +1421,111 @@ export function AdminShopDetailPage() {
                 </div>
 
                 <div className="stack">
-                  <h3>Upload Catalog Images (Bulk)</h3>
-                  <p className="tiny muted">These images appear in customer Catalog under the selected garment type.</p>
+                  <h3>Upload Looks to Browse (Bulk)</h3>
+                  <p style={{ fontSize: "1.05rem", fontWeight: 800 }}>
+                    Uploading into: {selectedFolder.name}
+                  </p>
 
-                  <label className="field">
-                    <span>Select Images (multiple)</span>
-                    <input
-                      type="file"
-                      accept="image/*"
-                      multiple
-                      onChange={(event) => {
-                        const nextFiles = Array.from(event.target.files ?? []);
-                        setCatalogFiles(nextFiles);
-                      }}
-                    />
-                  </label>
+                  {selectedFolder.is_active === false ? (
+                    <p className="tiny" style={{ color: "#92400e", fontWeight: 700 }}>
+                      This garment type is archived. Restore it to upload looks.
+                    </p>
+                  ) : (
+                    <>
+                      <p className="tiny muted">
+                        File name = barcode (e.g. S945132010.jpg). Images are compressed automatically. MRP and
+                        description are added later by the shop.
+                      </p>
 
-                  <form onSubmit={handleCatalogBulkUpload}>
-                    <button className="btn btn-dark" type="submit" disabled={uploadingCatalog || !canUploadCatalog}>
-                      {uploadingCatalog ? "Uploading..." : "Upload Catalog Images"}
-                    </button>
-                  </form>
+                      <label className="field">
+                        <span>Select Images (multiple)</span>
+                        <input
+                          key={lookInputKey}
+                          type="file"
+                          accept="image/*"
+                          multiple
+                          disabled={uploadingLooks}
+                          onChange={(event) => {
+                            setLookFiles(Array.from(event.target.files ?? []));
+                            setLookUploadResults(null);
+                          }}
+                        />
+                      </label>
 
-                  <div className="stack">
-                    <p className="tiny muted">Recent catalog images in selected garment type:</p>
-                    {catalogImages.length === 0 ? (
-                      <div className="empty-box">No catalog images found.</div>
-                    ) : (
-                      <ul className="hero-list">
-                        {catalogImages.map((row) => (
-                          <li key={row.id}>
-                            <span>{row.original_filename || row.id}</span>
-                            <code>{row.storage_path}</code>
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                  </div>
+                      {lookFiles.length > 0 ? (
+                        <ul className="hero-list">
+                          {lookFiles.map((file, index) => {
+                            const barcode = barcodeFromFilename(file.name);
+                            return (
+                              <li key={`${file.name}-${index}`}>
+                                <span>
+                                  {file.name} →{" "}
+                                  {barcode ? (
+                                    <code>{barcode}</code>
+                                  ) : (
+                                    <span style={{ color: "#b91c1c", fontWeight: 700 }}>no barcode</span>
+                                  )}{" "}
+                                  <span className="tiny muted">({formatFileSize(file.size)})</span>
+                                </span>
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      ) : null}
+
+                      <button
+                        className="btn btn-dark"
+                        type="button"
+                        disabled={uploadingLooks || lookFiles.length === 0}
+                        onClick={() => void handleLooksBulkUpload()}
+                      >
+                        {uploadingLooks
+                          ? lookUploadProgress || "Uploading..."
+                          : `Upload ${lookFiles.length} look${lookFiles.length === 1 ? "" : "s"} to ${selectedFolder.name}`}
+                      </button>
+                    </>
+                  )}
+
+                  {lookUploadResults ? (
+                    <div className="stack">
+                      <p style={{ fontWeight: 700 }}>
+                        Uploaded {lookUploadResults.items.filter((item) => item.status === "uploaded").length} ·
+                        Duplicates {lookUploadResults.items.filter((item) => item.status === "duplicate").length} ·
+                        Failed {lookUploadResults.items.filter((item) => item.status === "failed").length}{" "}
+                        <span className="tiny muted">(into {lookUploadResults.folderName})</span>
+                      </p>
+                      <div style={{ overflowX: "auto" }}>
+                        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.85rem" }}>
+                          <thead>
+                            <tr style={{ textAlign: "left", borderBottom: "1px solid #ded7cc" }}>
+                              <th style={{ padding: "0.35rem 0.5rem" }}>File</th>
+                              <th style={{ padding: "0.35rem 0.5rem" }}>Barcode</th>
+                              <th style={{ padding: "0.35rem 0.5rem" }}>Status</th>
+                              <th style={{ padding: "0.35rem 0.5rem" }}>Error</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {lookUploadResults.items.map((item, index) => (
+                              <tr key={`${item.filename}-${index}`} style={{ borderBottom: "1px solid #eee8dd" }}>
+                                <td style={{ padding: "0.35rem 0.5rem" }}>{item.filename}</td>
+                                <td style={{ padding: "0.35rem 0.5rem" }}>{item.barcode || "-"}</td>
+                                <td
+                                  style={{
+                                    padding: "0.35rem 0.5rem",
+                                    fontWeight: 700,
+                                    color: LOOK_STATUS_STYLE[item.status].color,
+                                  }}
+                                >
+                                  {LOOK_STATUS_STYLE[item.status].label}
+                                </td>
+                                <td style={{ padding: "0.35rem 0.5rem" }}>{item.error || ""}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  ) : null}
                 </div>
               </>
             )}

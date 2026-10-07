@@ -75,20 +75,24 @@ export type AdminHeroImageRow = {
   created_at: string;
 };
 
-export type AdminCatalogImageRow = {
-  id: string;
+export type LookUploadStatus = "uploaded" | "duplicate" | "failed";
+
+export type LookUploadItem = {
+  filename: string;
+  barcode: string | null;
+  status: LookUploadStatus;
+  generation_id?: string;
+  size_kb?: number;
+  error?: string;
+};
+
+export type LookUploadResponse = {
   shop_id: string;
   folder_id: string;
-  storage_path: string;
-  original_filename: string | null;
-  mime_type: string | null;
-  file_size_bytes: number | null;
-  width: number | null;
-  height: number | null;
-  sort_order: number;
-  is_active: boolean;
-  created_at: string;
-  updated_at: string;
+  uploaded: number;
+  duplicates: number;
+  failed: number;
+  items: LookUploadItem[];
 };
 
 export type AdminFabricSlotRow = {
