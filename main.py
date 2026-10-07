@@ -30,6 +30,7 @@ app.add_middleware(
         "http://192.168.1.9:5173",
         "http://192.168.1.7:5173",
         "https://ai-vastra-reactjs-demo-2-2-codex.onrender.com",
+        "https://screen.mytryonai.in",
         "http://localhost:5174",
         "http://127.0.0.1:5174",
     ],
