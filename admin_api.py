@@ -1,14 +1,20 @@
-﻿import re
+﻿import io
+import re
+import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from admin_deps import verify_admin_secret
 from config import get_settings
+from generations_api import derive_thumb_path
 from supabase_client import get_supabase_admin_client
+from tryon_api import _upload_generated_output
+from worker import build_thumbnail_jpeg_bytes
 
 router = APIRouter(prefix="/admin", tags=["Admin"], dependencies=[Depends(verify_admin_secret)])
 
@@ -1614,7 +1620,8 @@ def list_shop_generations(
         supabase.table("generations")
         .select(
             "id, status, generation_type, model_used, prompt_used, "
-            "hero_image_id, fabric_image_id, folder_id, output_path, created_at, is_hero"
+            "hero_image_id, fabric_image_id, folder_id, output_path, created_at, is_hero, "
+            "barcode, mrp, description"
         )
         .eq("shop_id", shop_id)
         .order("created_at", desc=True)
@@ -1924,5 +1931,235 @@ async def upload_shop_catalog_images_bulk(
         "folder_id": normalized_folder_id,
         "uploaded_count": len(inserted_rows),
         "items": inserted_rows,
+    }
+
+
+_LOOK_UPLOAD_MAX_FILES = 15
+_LOOK_UPLOAD_MAX_EDGE = 1600
+_LOOK_UPLOAD_TARGET_BYTES = 400 * 1024
+_LOOK_UPLOAD_QUALITIES = (85, 80, 75, 70)
+_LOOK_BARCODE_MAX_LENGTH = 64
+_COPY_SUFFIX_RE = re.compile(r"(\s*\(\d+\)|\s*-\s*copy)$", re.IGNORECASE)
+
+
+def _barcode_from_filename(filename: Optional[str]) -> str:
+    name = re.split(r"[\\/]", filename or "")[-1].strip()
+    if "." in name:
+        name = name.rsplit(".", 1)[0]
+    name = name.strip()
+
+    while True:
+        stripped = _COPY_SUFFIX_RE.sub("", name).strip()
+        if stripped == name:
+            return name
+        name = stripped
+
+
+def _compress_look_image(data: bytes) -> bytes:
+    from PIL import Image, ImageOps
+
+    image = Image.open(io.BytesIO(data))
+    image.load()
+    image = ImageOps.exif_transpose(image)
+
+    if image.mode in ("RGBA", "LA", "P"):
+        # Flatten transparency onto white; a plain convert("RGB") would turn it black.
+        rgba = image.convert("RGBA")
+        background = Image.new("RGB", rgba.size, (255, 255, 255))
+        background.paste(rgba, mask=rgba.getchannel("A"))
+        image = background
+    else:
+        image = image.convert("RGB")
+
+    image.thumbnail((_LOOK_UPLOAD_MAX_EDGE, _LOOK_UPLOAD_MAX_EDGE), Image.Resampling.LANCZOS)
+
+    output = b""
+    for quality in _LOOK_UPLOAD_QUALITIES:
+        buf = io.BytesIO()
+        image.save(buf, format="JPEG", quality=quality, optimize=True)
+        output = buf.getvalue()
+        if len(output) <= _LOOK_UPLOAD_TARGET_BYTES:
+            break
+    return output
+
+
+def _store_uploaded_look(
+    supabase, *, shop_id: str, folder_id: str, barcode: str, data: bytes
+) -> dict[str, Any]:
+    try:
+        jpeg_bytes = _compress_look_image(data)
+    except Exception as exc:
+        raise ValueError("not a valid image") from exc
+
+    generation_id = str(uuid4())
+    output_path = f"{shop_id}/{generation_id}/output_v{int(time.time())}.jpg"
+    thumb_path = derive_thumb_path(output_path)
+
+    _upload_generated_output(
+        supabase,
+        bucket="generated-outputs",
+        path=output_path,
+        data=jpeg_bytes,
+        content_type="image/jpeg",
+    )
+
+    stored_paths = [output_path]
+    try:
+        _upload_generated_output(
+            supabase,
+            bucket="generated-outputs",
+            path=thumb_path,
+            data=build_thumbnail_jpeg_bytes(jpeg_bytes),
+            content_type="image/jpeg",
+        )
+        stored_paths.append(thumb_path)
+    except Exception as exc:
+        print(f"[admin_api] WARNING: failed to generate/upload thumbnail for {output_path}: {exc}")
+
+    now_iso = _utc_now_iso()
+    try:
+        supabase.table("generations").insert(
+            {
+                "id": generation_id,
+                "shop_id": shop_id,
+                "folder_id": folder_id,
+                "hero_image_id": None,
+                "fabric_image_id": None,
+                "generation_type": "look",
+                "status": "done",
+                "output_path": output_path,
+                "credits_used": 0,
+                "show_on_screen": True,
+                "is_hero": False,
+                "prompt_used": "admin bulk upload",
+                "barcode": barcode,
+                "created_at": now_iso,
+                "started_at": now_iso,
+                "completed_at": now_iso,
+            }
+        ).execute()
+    except Exception:
+        try:
+            supabase.storage.from_("generated-outputs").remove(stored_paths)
+        except Exception as cleanup_exc:
+            print(f"[admin_api] WARNING: failed to clean up {stored_paths}: {cleanup_exc}")
+        raise
+
+    return {"generation_id": generation_id, "size_kb": round(len(jpeg_bytes) / 1024, 1)}
+
+
+def _process_look_uploads(
+    supabase, *, shop_id: str, folder_id: str, uploads: list[tuple[str, bytes]]
+) -> list[dict[str, Any]]:
+    barcodes = [_barcode_from_filename(filename) for filename, _ in uploads]
+
+    seen_barcodes: set[str] = set()
+    candidate_barcodes = sorted({b for b in barcodes if b})
+    if candidate_barcodes:
+        existing_result = (
+            supabase.table("generations")
+            .select("barcode")
+            .eq("shop_id", shop_id)
+            .eq("folder_id", folder_id)
+            .eq("generation_type", "look")
+            .in_("barcode", candidate_barcodes)
+            .execute()
+        )
+        for row in getattr(existing_result, "data", None) or []:
+            if row.get("barcode"):
+                seen_barcodes.add(row["barcode"])
+
+    items: list[dict[str, Any]] = []
+    for (filename, data), barcode in zip(uploads, barcodes):
+        item: dict[str, Any] = {"filename": filename, "barcode": barcode or None}
+        try:
+            if not barcode:
+                raise ValueError("no barcode in filename")
+            if len(barcode) > _LOOK_BARCODE_MAX_LENGTH:
+                raise ValueError(f"barcode longer than {_LOOK_BARCODE_MAX_LENGTH} characters")
+
+            if barcode in seen_barcodes:
+                item["status"] = "duplicate"
+            else:
+                if not data:
+                    raise ValueError("file is empty")
+                item.update(
+                    _store_uploaded_look(
+                        supabase,
+                        shop_id=shop_id,
+                        folder_id=folder_id,
+                        barcode=barcode,
+                        data=data,
+                    )
+                )
+                item["status"] = "uploaded"
+                seen_barcodes.add(barcode)
+        except Exception as exc:
+            item["status"] = "failed"
+            item["error"] = str(exc)[:300] or exc.__class__.__name__
+        items.append(item)
+
+    return items
+
+
+@router.post("/shops/{shop_id}/looks/upload-bulk")
+async def upload_shop_looks_bulk(
+    shop_id: str,
+    folder_id: str = Form(...),
+    files: list[UploadFile] = File(...),
+):
+    supabase = get_supabase_admin_client()
+
+    normalized_folder_id = _clean_text(folder_id, "folder_id")
+
+    folder_check = (
+        supabase.table("garment_types")
+        .select("id, is_active")
+        .eq("id", normalized_folder_id)
+        .eq("shop_id", shop_id)
+        .limit(1)
+        .execute()
+    )
+    folder_rows = getattr(folder_check, "data", None) or []
+    if not folder_rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Garment type not found for this shop",
+        )
+    if folder_rows[0].get("is_active") is False:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Garment type is archived",
+        )
+
+    active_files = [file for file in files if file and (file.filename or "").strip()]
+    if not active_files:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one image file is required",
+        )
+    if len(active_files) > _LOOK_UPLOAD_MAX_FILES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"At most {_LOOK_UPLOAD_MAX_FILES} files are allowed per request",
+        )
+
+    uploads = [(file.filename or "", await file.read()) for file in active_files]
+
+    items = await run_in_threadpool(
+        _process_look_uploads,
+        supabase,
+        shop_id=shop_id,
+        folder_id=normalized_folder_id,
+        uploads=uploads,
+    )
+
+    return {
+        "shop_id": shop_id,
+        "folder_id": normalized_folder_id,
+        "uploaded": sum(1 for item in items if item["status"] == "uploaded"),
+        "duplicates": sum(1 for item in items if item["status"] == "duplicate"),
+        "failed": sum(1 for item in items if item["status"] == "failed"),
+        "items": items,
     }
 

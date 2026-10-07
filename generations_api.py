@@ -1,9 +1,10 @@
 ﻿import io
 import time
+from decimal import Decimal
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from auth_deps import CurrentShopContext, get_current_shop_context
 from config import get_settings
@@ -214,7 +215,36 @@ class GenerationCreateFabricItem(BaseModel):
     )
 
 
-class GenerationCreateRequest(BaseModel):
+class LookDetailsFields(BaseModel):
+    barcode: Optional[str] = Field(default=None, max_length=64)
+    mrp: Optional[Decimal] = Field(default=None, ge=0, max_digits=10, decimal_places=2)
+    description: Optional[str] = Field(default=None, max_length=300)
+
+    @field_validator("barcode", "mrp", "description", mode="before")
+    @classmethod
+    def _blank_to_none(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+        return value
+
+    def details_payload(self, *, only_set: bool) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        for field in ("barcode", "mrp", "description"):
+            value = getattr(self, field)
+            if only_set and field not in self.model_fields_set:
+                continue
+            if not only_set and value is None:
+                continue
+            payload[field] = float(value) if isinstance(value, Decimal) else value
+        return payload
+
+
+class GenerationDetailsUpdateRequest(LookDetailsFields):
+    pass
+
+
+class GenerationCreateRequest(LookDetailsFields):
     hero_image_id: str = Field(..., min_length=1)
     # Backward-compatible single-fabric field (older clients).
     fabric_image_id: Optional[str] = Field(default=None, min_length=1)
@@ -998,6 +1028,7 @@ def create_generation(
                     "fabric_image_id": primary_fabric_image_id,
                     "generation_type": "look",
                     "model_used": settings.GEMINI_IMAGE_MODEL_ID,
+                    **body.details_payload(only_set=False),
                 }
             )
             .eq("id", generation_id)
@@ -1438,6 +1469,57 @@ def match_color_on_generation_output(
         "output_path": new_output_path,
         "edited": True,
         "applied_edits": len(normalized_edits),
+    }
+
+
+@router.patch("/{generation_id}/details")
+def update_generation_details(
+    generation_id: str,
+    body: GenerationDetailsUpdateRequest,
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    supabase = get_supabase_admin_client()
+    generation_id = _clean_id(generation_id, "generation_id")
+
+    def _look_query(builder):
+        return (
+            builder.eq("id", generation_id)
+            .eq("shop_id", current.shop_id)
+            .eq("generation_type", "look")
+        )
+
+    payload = body.details_payload(only_set=True)
+
+    try:
+        if payload:
+            result = _look_query(supabase.table("generations").update(payload)).execute()
+        else:
+            result = (
+                _look_query(
+                    supabase.table("generations").select("id, barcode, mrp, description")
+                )
+                .limit(1)
+                .execute()
+            )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update generation details",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Generation not found",
+        )
+
+    row = rows[0]
+    return {
+        "id": row.get("id"),
+        "barcode": row.get("barcode"),
+        "mrp": row.get("mrp"),
+        "description": row.get("description"),
     }
 
 
