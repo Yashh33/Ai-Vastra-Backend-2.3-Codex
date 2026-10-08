@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     RAZORPAY_KEY_SECRET: str = Field(default="")
     RAZORPAY_WEBHOOK_SECRET: str = Field(default="")
 
+    # fal.ai (SAM 3 segmentation). Never log or return this.
+    FAL_KEY: str = Field(default="")
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

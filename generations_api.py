@@ -3,13 +3,15 @@ import time
 from decimal import Decimal
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel, Field, field_validator
 
 from auth_deps import CurrentShopContext, get_current_shop_context
 from config import get_settings
 from prompting import DEFAULT_LOOK_PROMPT, fill_prompt_placeholders
+from segment_api import mask_storage_prefix
 from supabase_client import get_supabase_admin_client
+from tryon_api import _upload_generated_output
 
 router = APIRouter(prefix="/generations", tags=["Generations"])
 
@@ -1523,6 +1525,212 @@ def update_generation_details(
     }
 
 
+_COLOR_CORRECTED_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _load_own_look(supabase, *, shop_id: str, generation_id: str) -> dict:
+    try:
+        result = (
+            supabase.table("generations")
+            .select("id, generation_type, output_path, original_output_path")
+            .eq("id", generation_id)
+            .eq("shop_id", shop_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch generation",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    if not rows or rows[0].get("generation_type") != "look":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Generation not found",
+        )
+    if not str(rows[0].get("output_path") or "").strip():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Generation output is not ready yet",
+        )
+    return rows[0]
+
+
+def _remove_output_files_best_effort(supabase, paths: list[str]) -> None:
+    targets = [p for p in paths if p]
+    if not targets:
+        return
+    try:
+        supabase.storage.from_("generated-outputs").remove(targets)
+    except Exception as exc:
+        print(f"[generations_api] WARNING: storage cleanup failed for {targets}: {exc}")
+
+
+def _to_jpeg_bytes(data: bytes) -> bytes:
+    """Validate a JPEG/PNG upload and return JPEG bytes (JPEGs pass through untouched)."""
+    from PIL import Image
+
+    try:
+        image = Image.open(io.BytesIO(data))
+        image.load()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File is not a valid image",
+        ) from exc
+
+    if image.format == "JPEG":
+        return data
+    if image.format != "PNG":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only JPEG or PNG images are allowed",
+        )
+
+    rgba = image.convert("RGBA")
+    flattened = Image.new("RGB", rgba.size, (255, 255, 255))
+    flattened.paste(rgba, mask=rgba.getchannel("A"))
+    buf = io.BytesIO()
+    flattened.save(buf, format="JPEG", quality=92)
+    return buf.getvalue()
+
+
+@router.post("/{generation_id}/color-corrected")
+async def save_color_corrected_output(
+    generation_id: str,
+    file: UploadFile = File(...),
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    from fastapi.concurrency import run_in_threadpool
+
+    generation_id = _clean_id(generation_id, "generation_id")
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File is empty")
+    if len(data) > _COLOR_CORRECTED_MAX_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Image must be 8MB or smaller",
+        )
+
+    return await run_in_threadpool(
+        _save_color_corrected_output, current.shop_id, generation_id, data
+    )
+
+
+def _save_color_corrected_output(shop_id: str, generation_id: str, data: bytes) -> dict:
+    # Imported here: worker imports this module, so a top-level import would be circular.
+    from worker import build_thumbnail_jpeg_bytes
+
+    supabase = get_supabase_admin_client()
+    row = _load_own_look(supabase, shop_id=shop_id, generation_id=generation_id)
+    jpeg_bytes = _to_jpeg_bytes(data)
+
+    previous_path = str(row["output_path"]).strip()
+    original_path = str(row.get("original_output_path") or "").strip() or previous_path
+
+    # New path every save so cached/signed URLs of the old image can't be served.
+    new_path = f"{shop_id}/{generation_id}/output-cc-{int(time.time() * 1000)}.jpg"
+    new_thumb_path = derive_thumb_path(new_path)
+
+    try:
+        _upload_generated_output(
+            supabase,
+            bucket="generated-outputs",
+            path=new_path,
+            data=jpeg_bytes,
+            content_type="image/jpeg",
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to upload colour-corrected image",
+        ) from exc
+
+    try:
+        _upload_generated_output(
+            supabase,
+            bucket="generated-outputs",
+            path=new_thumb_path,
+            data=build_thumbnail_jpeg_bytes(jpeg_bytes),
+            content_type="image/jpeg",
+        )
+    except Exception as exc:
+        print(f"[generations_api] WARNING: failed to generate/upload thumbnail for {new_path}: {exc}")
+
+    try:
+        (
+            supabase.table("generations")
+            .update({"output_path": new_path, "original_output_path": original_path})
+            .eq("id", generation_id)
+            .eq("shop_id", shop_id)
+            .execute()
+        )
+    except Exception as exc:
+        _remove_output_files_best_effort(supabase, [new_path, new_thumb_path])
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to save colour-corrected image",
+        ) from exc
+
+    # The original is kept forever; only an earlier corrected version is replaced.
+    if previous_path not in (original_path, new_path):
+        _remove_output_files_best_effort(
+            supabase, [previous_path, derive_thumb_path(previous_path)]
+        )
+
+    return {"id": generation_id, "output_path": new_path}
+
+
+@router.post("/{generation_id}/restore-original")
+def restore_original_output(
+    generation_id: str,
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    supabase = get_supabase_admin_client()
+    generation_id = _clean_id(generation_id, "generation_id")
+
+    row = _load_own_look(supabase, shop_id=current.shop_id, generation_id=generation_id)
+    current_path = str(row["output_path"]).strip()
+    original_path = str(row.get("original_output_path") or "").strip()
+
+    if not original_path:
+        return {"id": generation_id, "output_path": current_path}
+
+    try:
+        (
+            supabase.table("generations")
+            .update({"output_path": original_path, "original_output_path": None})
+            .eq("id", generation_id)
+            .eq("shop_id", current.shop_id)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to restore original image",
+        ) from exc
+
+    if current_path != original_path:
+        _remove_output_files_best_effort(
+            supabase, [current_path, derive_thumb_path(current_path)]
+        )
+
+    return {"id": generation_id, "output_path": original_path}
+
+
+def _remove_generation_masks_best_effort(supabase, *, shop_id: str, generation_id: str) -> None:
+    prefix = mask_storage_prefix(shop_id, generation_id)
+    try:
+        entries = supabase.storage.from_("generated-outputs").list(prefix) or []
+        names = [entry.get("name") for entry in entries if isinstance(entry, dict)]
+        _remove_output_files_best_effort(supabase, [f"{prefix}/{name}" for name in names if name])
+    except Exception as exc:
+        print(f"[generations_api] WARNING: mask cleanup failed for {prefix}: {exc}")
+
+
 @router.delete("/{generation_id}")
 def delete_generation_output(
     generation_id: str,
@@ -1534,7 +1742,7 @@ def delete_generation_output(
     try:
         result = (
             supabase.table("generations")
-            .select("id, status, output_path")
+            .select("id, status, output_path, original_output_path")
             .eq("id", generation_id)
             .eq("shop_id", current.shop_id)
             .limit(1)
@@ -1564,6 +1772,19 @@ def delete_generation_output(
             detail="Only completed outputs can be deleted",
         )
 
+    # Mask rows reference this generation; clear them first so the delete below
+    # cannot be blocked if the foreign key does not cascade.
+    try:
+        (
+            supabase.table("generation_masks")
+            .delete()
+            .eq("generation_id", generation_id)
+            .eq("shop_id", current.shop_id)
+            .execute()
+        )
+    except Exception as exc:
+        print(f"[generations_api] WARNING: failed to delete mask rows for {generation_id}: {exc}")
+
     try:
         (
             supabase.table("generations")
@@ -1584,6 +1805,17 @@ def delete_generation_output(
     except Exception as exc:
         # Keep delete successful even if storage cleanup fails.
         storage_warning = f"Generation deleted, but storage cleanup failed: {exc}"
+
+    _remove_output_files_best_effort(supabase, [derive_thumb_path(output_path)])
+
+    original_output_path = str(row.get("original_output_path") or "").strip()
+    if original_output_path and original_output_path != output_path:
+        _remove_output_files_best_effort(
+            supabase, [original_output_path, derive_thumb_path(original_output_path)]
+        )
+    _remove_generation_masks_best_effort(
+        supabase, shop_id=current.shop_id, generation_id=generation_id
+    )
 
     response = {
         "deleted": True,
