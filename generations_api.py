@@ -518,7 +518,85 @@ def _load_folder_prompt_context_for_hero_image(
     return folder_rows[0]
 
 
-def _normalize_generation_fabrics(body: GenerationCreateRequest) -> list[dict[str, Any]]:
+_APPLY_TO_MAX_LENGTH = 80
+
+
+def _load_garment_fabric_slots(supabase, *, shop_id: str, folder_id: str) -> list[dict[str, Any]]:
+    """Fabric slots the admin configured for a garment type, in sort order."""
+    try:
+        result = (
+            supabase.table("garment_fabric_slots")
+            .select("apply_to, sort_order")
+            .eq("folder_id", folder_id)
+            .eq("shop_id", shop_id)
+            .order("sort_order", desc=False)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch fabric slots",
+        ) from exc
+
+    return [
+        row
+        for row in (getattr(result, "data", None) or [])
+        if str(row.get("apply_to") or "").strip()
+    ]
+
+
+def _normalize_slot_fabrics(
+    raw_fabrics: list["GenerationCreateFabricItem"], slots: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Validate fabrics against the garment type's own slots (apply_to is free
+    text set in the admin panel) and return them in slot order."""
+    slot_position = {
+        str(slot["apply_to"]).strip().casefold(): index for index, slot in enumerate(slots)
+    }
+
+    positioned: list[tuple[int, dict[str, Any]]] = []
+    seen: set[str] = set()
+
+    for item in raw_fabrics:
+        fabric_image_id = _clean_id(item.fabric_image_id, "fabric_image_id")
+        apply_to = (item.apply_to or "").strip()
+        key = apply_to.casefold()
+
+        if len(apply_to) > _APPLY_TO_MAX_LENGTH or key not in slot_position:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Fabric slot '{apply_to[:_APPLY_TO_MAX_LENGTH]}' is not configured "
+                    "for this garment type"
+                ),
+            )
+        if key in seen:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Duplicate apply_to value: {apply_to}",
+            )
+        seen.add(key)
+
+        positioned.append(
+            (
+                slot_position[key],
+                {
+                    "fabric_image_id": fabric_image_id,
+                    "apply_to": apply_to,
+                    "fabric_code": _clean_optional_text(item.fabric_code) or "unknown",
+                    "fabric_color": _clean_optional_text(item.fabric_color),
+                    "fabric_scale": _clean_optional_text(item.fabric_scale),
+                },
+            )
+        )
+
+    positioned.sort(key=lambda pair: pair[0])
+    return [fabric for _, fabric in positioned]
+
+
+def _normalize_generation_fabrics(
+    body: GenerationCreateRequest, slots: Optional[list[dict[str, Any]]] = None
+) -> list[dict[str, Any]]:
     raw_fabrics = list(body.fabrics or [])
     is_legacy_single = False
 
@@ -546,6 +624,12 @@ def _normalize_generation_fabrics(body: GenerationCreateRequest) -> list[dict[st
             detail="At most 4 fabrics are allowed per generation",
         )
 
+    # Garment types with admin-configured slots validate against those slots.
+    # The old single-fabric field keeps working as before even on such types.
+    if slots and not is_legacy_single:
+        return _normalize_slot_fabrics(raw_fabrics, slots)
+
+    # No slots: legacy behaviour, unchanged.
     normalized: list[dict[str, Any]] = []
     seen_apply_to: set[str] = set()
 
@@ -895,8 +979,6 @@ def create_generation(
     settings = get_settings()
 
     hero_image_id = _clean_id(body.hero_image_id, "hero_image_id")
-    normalized_fabrics = _normalize_generation_fabrics(body)
-    primary_fabric_image_id = normalized_fabrics[0]["fabric_image_id"]
 
     # Build prompt before charging credits so prompt lookup failures do not debit the user.
     folder_context = _load_folder_prompt_context_for_hero_image(
@@ -904,6 +986,12 @@ def create_generation(
         shop_id=current.shop_id,
         hero_image_id=hero_image_id,
     )
+
+    fabric_slots = _load_garment_fabric_slots(
+        supabase, shop_id=current.shop_id, folder_id=str(folder_context["id"])
+    )
+    normalized_fabrics = _normalize_generation_fabrics(body, fabric_slots)
+    primary_fabric_image_id = normalized_fabrics[0]["fabric_image_id"]
     image_count = 1 + len(normalized_fabrics)
     look_prompt = folder_context.get("look_prompt")
     if not look_prompt or not look_prompt.strip():
