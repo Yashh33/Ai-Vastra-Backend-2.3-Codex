@@ -98,6 +98,7 @@ export function AdminShopDetailPage() {
   const [editCategory, setEditCategory] = useState("unisex");
   const [editLookPrompt, setEditLookPrompt] = useState("");
   const [editTryonPrompt, setEditTryonPrompt] = useState("");
+  const [editLookTryonPrompt, setEditLookTryonPrompt] = useState("");
   const [editPromptNote, setEditPromptNote] = useState("");
   const [savingPrompt, setSavingPrompt] = useState(false);
 
@@ -303,6 +304,7 @@ export function AdminShopDetailPage() {
     setEditCategory(folder?.category || "unisex");
     setEditLookPrompt(folder?.look_prompt || "");
     setEditTryonPrompt(folder?.tryon_prompt || "");
+    setEditLookTryonPrompt(folder?.look_tryon_prompt || "");
     setEditPromptNote("");
     setShowPromptHistory(false);
     setPromptVersions([]);
@@ -711,12 +713,15 @@ export function AdminShopDetailPage() {
       const payload = {
         look_prompt: editLookPrompt,
         tryon_prompt: editTryonPrompt,
+        // Always sent: the backend treats an empty string as "clear it" (null).
+        look_tryon_prompt: editLookTryonPrompt.trim(),
         category: editCategory,
         note: editPromptNote.trim() || undefined,
       };
       const updated = await adminFetch<{
         look_prompt: string;
         tryon_prompt: string;
+        look_tryon_prompt: string | null;
         category: string;
       }>(
         session,
@@ -731,6 +736,7 @@ export function AdminShopDetailPage() {
                 ...folder,
                 look_prompt: updated.look_prompt,
                 tryon_prompt: updated.tryon_prompt,
+                look_tryon_prompt: updated.look_tryon_prompt,
                 category: updated.category,
               }
             : folder
@@ -1116,7 +1122,24 @@ export function AdminShopDetailPage() {
                       style={archived ? { opacity: 0.6 } : undefined}
                       onClick={() => setSelectedFolderId(folder.id)}
                     >
-                      <span>{folder.name}</span>
+                      <span>
+                        {folder.name}
+                        {!(folder.look_tryon_prompt || "").trim() ? (
+                          <span
+                            title="Missing Look try-on prompt"
+                            aria-label="Missing Look try-on prompt"
+                            style={{
+                              display: "inline-block",
+                              width: "8px",
+                              height: "8px",
+                              marginLeft: "0.4rem",
+                              borderRadius: "999px",
+                              background: "#f59e0b",
+                              verticalAlign: "middle",
+                            }}
+                          />
+                        ) : null}
+                      </span>
                       {archived ? (
                         <span className="tiny" style={{ color: "#92400e", fontWeight: 700 }}>
                           Archived
@@ -1212,6 +1235,26 @@ export function AdminShopDetailPage() {
                   </div>
 
                   <label className="field">
+                    <span>Look try-on prompt (Browse → Try on customer)</span>
+                    <textarea
+                      value={editLookTryonPrompt}
+                      onChange={(event) => setEditLookTryonPrompt(event.target.value)}
+                    />
+                  </label>
+                  {!editLookTryonPrompt.trim() ? (
+                    <p className="tiny" style={{ color: "#b45309", fontWeight: 700 }}>
+                      Missing — 'Try on customer' from Browse won't work for this garment type.
+                    </p>
+                  ) : null}
+                  <div className="stack">
+                    <p className="tiny muted">Image order for the Look try-on prompt:</p>
+                    <ul className="hero-list">
+                      <li>Image 1 → Finished look (garment reference)</li>
+                      <li>Image 2 → Person</li>
+                    </ul>
+                  </div>
+
+                  <label className="field">
                     <span>Note (optional, saved with this version)</span>
                     <input
                       value={editPromptNote}
@@ -1247,6 +1290,15 @@ export function AdminShopDetailPage() {
                                 <div className="stack">
                                   <span className="tiny">{new Date(version.created_at).toLocaleString()}</span>
                                   <span className="tiny muted">{version.note || "(no note)"}</span>
+                                  <span className="tiny muted">
+                                    {[
+                                      (version.look_prompt || "").trim() ? "Look" : null,
+                                      (version.tryon_prompt || "").trim() ? "Try-on" : null,
+                                      (version.look_tryon_prompt || "").trim() ? "Look try-on" : null,
+                                    ]
+                                      .filter(Boolean)
+                                      .join(" · ") || "(no prompts)"}
+                                  </span>
                                 </div>
                                 <button
                                   className="btn btn-light"

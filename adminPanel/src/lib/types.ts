@@ -48,6 +48,7 @@ export type AdminFolderRow = {
   show_in_whatsapp_menu?: boolean;
   look_prompt?: string | null;
   tryon_prompt?: string | null;
+  look_tryon_prompt?: string | null;
   category?: string;
 };
 
@@ -57,6 +58,7 @@ export type PromptVersion = {
   shop_id: string;
   look_prompt: string | null;
   tryon_prompt: string | null;
+  look_tryon_prompt?: string | null;
   note: string | null;
   created_at: string;
 };
