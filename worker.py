@@ -14,7 +14,7 @@ from google.genai import types
 from supabase import create_client
 
 from config import get_settings
-from generations_api import derive_thumb_path
+from image_thumbs import look_thumbnail_path
 
 _MAX_INPUT_IMAGE_DIMENSION = 1536
 _THUMB_MAX_WIDTH = 400
@@ -502,7 +502,7 @@ def process_job(gemini_client: genai.Client, settings, job: dict) -> None:
             )
         )
 
-        thumb_path = derive_thumb_path(output_path)
+        thumb_path = look_thumbnail_path(output_path)
         try:
             thumb_bytes = build_thumbnail_jpeg_bytes(output_bytes)
             call_with_retry(

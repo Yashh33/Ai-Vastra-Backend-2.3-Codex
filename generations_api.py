@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from auth_deps import CurrentShopContext, get_current_shop_context
 from config import get_settings
+from image_thumbs import look_thumbnail_path
 from prompting import DEFAULT_LOOK_PROMPT, fill_prompt_placeholders
 from segment_api import mask_storage_prefix
 from supabase_client import get_supabase_admin_client
@@ -17,35 +18,6 @@ router = APIRouter(prefix="/generations", tags=["Generations"])
 
 _ALLOWED_STATUSES = {"queued", "processing", "done", "failed"}
 _ALLOWED_APPLY_TO = {"shirt", "pant", "suit_full_body", "suit_upper", "koti"}
-
-
-def derive_thumb_path(output_path: str) -> str:
-    """Derive the thumbnail storage path for an output path.
-
-    "shop/gen/output.png" -> "shop/gen/thumb.jpg"
-    "shop/gen/output_v1720000000.webp" -> "shop/gen/thumb_v1720000000.jpg"
-    """
-    path = output_path or ""
-    if "/" in path:
-        directory, filename = path.rsplit("/", 1)
-    else:
-        directory, filename = "", path
-
-    name = filename.rsplit(".", 1)[0] if "." in filename else filename
-
-    if name.startswith("output"):
-        name = "thumb" + name[len("output"):]
-    else:
-        name = f"thumb_{name}"
-
-    thumb_filename = f"{name}.jpg"
-    return f"{directory}/{thumb_filename}" if directory else thumb_filename
-
-
-# Inline sanity checks for derive_thumb_path (see VERIFY step in task):
-assert derive_thumb_path("shop/gen/output.png") == "shop/gen/thumb.jpg"
-assert derive_thumb_path("shop/gen/output_v123.webp") == "shop/gen/thumb_v123.jpg"
-assert derive_thumb_path("output.png") == "thumb.jpg"
 
 
 def _guess_extension_from_mime(mime_type: str) -> str:
@@ -170,7 +142,7 @@ def _attach_download_and_thumb_urls(
         output_path = str(row.get("output_path") or "").strip()
         if row_status == "done" and output_path:
             output_paths.append(output_path)
-            thumb_paths.append(derive_thumb_path(output_path))
+            thumb_paths.append(look_thumbnail_path(output_path))
 
     if not output_paths:
         for row in rows:
@@ -192,7 +164,7 @@ def _attach_download_and_thumb_urls(
         output_path = str(row.get("output_path") or "").strip()
         if row_status == "done" and output_path:
             download_url = url_by_path.get(output_path)
-            thumb_url = url_by_path.get(derive_thumb_path(output_path)) or download_url
+            thumb_url = url_by_path.get(look_thumbnail_path(output_path)) or download_url
             row["download_url"] = download_url
             row["thumb_url"] = thumb_url
         else:
@@ -1191,7 +1163,7 @@ def get_generation_download_urls_batch(
         for row in done_rows:
             output_path = str(row["output_path"]).strip()
             output_paths.append(output_path)
-            thumb_paths.append(derive_thumb_path(output_path))
+            thumb_paths.append(look_thumbnail_path(output_path))
 
         try:
             url_by_path = _sign_paths_with_fallback(
@@ -1205,7 +1177,7 @@ def get_generation_download_urls_batch(
             generation_id = str(row["id"])
             output_path = str(row["output_path"]).strip()
             download_url = url_by_path.get(output_path)
-            thumb_url = url_by_path.get(derive_thumb_path(output_path)) or download_url
+            thumb_url = url_by_path.get(look_thumbnail_path(output_path)) or download_url
             urls[generation_id] = {
                 "download_url": download_url,
                 "thumb_url": thumb_url,
@@ -1420,7 +1392,7 @@ def match_color_on_generation_output(
             detail="Failed to upload new generation output to storage",
         ) from exc
 
-    new_thumb_path = derive_thumb_path(new_output_path)
+    new_thumb_path = look_thumbnail_path(new_output_path)
     try:
         np, Image = _import_match_color_dependencies()
         thumb_image = Image.open(io.BytesIO(edited_bytes))
@@ -1462,7 +1434,7 @@ def match_color_on_generation_output(
         ) from exc
 
     try:
-        storage_bucket.remove([old_output_path, derive_thumb_path(old_output_path)])
+        storage_bucket.remove([old_output_path, look_thumbnail_path(old_output_path)])
     except Exception:
         pass
 
@@ -1633,7 +1605,7 @@ def _save_color_corrected_output(shop_id: str, generation_id: str, data: bytes) 
 
     # New path every save so cached/signed URLs of the old image can't be served.
     new_path = f"{shop_id}/{generation_id}/output-cc-{int(time.time() * 1000)}.jpg"
-    new_thumb_path = derive_thumb_path(new_path)
+    new_thumb_path = look_thumbnail_path(new_path)
 
     try:
         _upload_generated_output(
@@ -1678,7 +1650,7 @@ def _save_color_corrected_output(shop_id: str, generation_id: str, data: bytes) 
     # The original is kept forever; only an earlier corrected version is replaced.
     if previous_path not in (original_path, new_path):
         _remove_output_files_best_effort(
-            supabase, [previous_path, derive_thumb_path(previous_path)]
+            supabase, [previous_path, look_thumbnail_path(previous_path)]
         )
 
     return {"id": generation_id, "output_path": new_path}
@@ -1715,7 +1687,7 @@ def restore_original_output(
 
     if current_path != original_path:
         _remove_output_files_best_effort(
-            supabase, [current_path, derive_thumb_path(current_path)]
+            supabase, [current_path, look_thumbnail_path(current_path)]
         )
 
     return {"id": generation_id, "output_path": original_path}
@@ -1806,12 +1778,12 @@ def delete_generation_output(
         # Keep delete successful even if storage cleanup fails.
         storage_warning = f"Generation deleted, but storage cleanup failed: {exc}"
 
-    _remove_output_files_best_effort(supabase, [derive_thumb_path(output_path)])
+    _remove_output_files_best_effort(supabase, [look_thumbnail_path(output_path)])
 
     original_output_path = str(row.get("original_output_path") or "").strip()
     if original_output_path and original_output_path != output_path:
         _remove_output_files_best_effort(
-            supabase, [original_output_path, derive_thumb_path(original_output_path)]
+            supabase, [original_output_path, look_thumbnail_path(original_output_path)]
         )
     _remove_generation_masks_best_effort(
         supabase, shop_id=current.shop_id, generation_id=generation_id

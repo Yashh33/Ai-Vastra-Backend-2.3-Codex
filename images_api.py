@@ -1,10 +1,11 @@
 ﻿from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from auth_deps import CurrentShopContext, get_current_shop_context
 from config import get_settings
+from image_thumbs import store_hero_thumbnail_best_effort
 from supabase_client import get_supabase_admin_client
 
 router = APIRouter(tags=["Images"])
@@ -90,6 +91,7 @@ def _extract_signed_url(signed_payload: object) -> Optional[str]:
 @router.post("/hero-images")
 def create_hero_image_metadata(
     body: HeroImageCreateRequest,
+    background_tasks: BackgroundTasks,
     current: CurrentShopContext = Depends(get_current_shop_context),
 ):
     supabase = get_supabase_admin_client()
@@ -159,6 +161,12 @@ def create_hero_image_metadata(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Hero image metadata created but could not fetch response",
         )
+
+    # The browser already uploaded the original straight to storage. Build the
+    # display thumbnail from it after responding; the original is only read.
+    background_tasks.add_task(
+        store_hero_thumbnail_best_effort, supabase, payload["storage_path"]
+    )
 
     return rows[0]
 

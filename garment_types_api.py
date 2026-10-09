@@ -2,11 +2,59 @@
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
+from cachetools import TTLCache
+
 from auth_deps import CurrentShopContext, get_current_shop_context
 from config import get_settings
+from image_thumbs import hero_thumbnail_path, sign_existing_paths, store_hero_thumbnail
 from supabase_client import get_supabase_admin_client
 
 router = APIRouter(prefix="/garment-types", tags=["Garment Types"])
+
+_MAX_LAZY_HERO_THUMBS_PER_REQUEST = 10
+# Heroes whose thumbnail could not be created (e.g. original file deleted):
+# don't retry them on every request.
+_hero_thumb_failures: TTLCache = TTLCache(maxsize=2000, ttl=600)
+
+
+def _hero_thumb_signed_urls(supabase, storage_paths: list[str]) -> dict[str, Optional[str]]:
+    """Hero storage path -> signed display-thumbnail URL (None if unavailable).
+
+    Missing thumbnails are created from the original, at most
+    _MAX_LAZY_HERO_THUMBS_PER_REQUEST per call. Never raises.
+    """
+    try:
+        thumb_path_by_storage_path = {path: hero_thumbnail_path(path) for path in storage_paths}
+        url_by_thumb_path = sign_existing_paths(
+            "hero-images", list(thumb_path_by_storage_path.values())
+        )
+
+        created: list[str] = []
+        for storage_path, thumb_path in thumb_path_by_storage_path.items():
+            if len(created) >= _MAX_LAZY_HERO_THUMBS_PER_REQUEST:
+                break
+            if url_by_thumb_path.get(thumb_path) or storage_path in _hero_thumb_failures:
+                continue
+            try:
+                created.append(store_hero_thumbnail(supabase, storage_path))
+                print(f"[garment_types_api] created hero thumbnail: {thumb_path}")
+            except Exception as exc:
+                _hero_thumb_failures[storage_path] = True
+                print(
+                    f"[garment_types_api] WARNING: could not create hero thumbnail "
+                    f"for {storage_path}: {exc}"
+                )
+
+        if created:
+            url_by_thumb_path.update(sign_existing_paths("hero-images", created))
+
+        return {
+            storage_path: url_by_thumb_path.get(thumb_path)
+            for storage_path, thumb_path in thumb_path_by_storage_path.items()
+        }
+    except Exception as exc:
+        print(f"[garment_types_api] WARNING: hero thumbnail URLs unavailable: {exc}")
+        return {}
 
 
 def _extract_signed_url(signed_payload: object) -> Optional[str]:
@@ -148,6 +196,8 @@ def list_garment_types(
         print(f"[garment_types_api] failed to sign hero image URLs: {exc}")
         signed_url_by_storage_path = {}
 
+    thumb_url_by_storage_path = _hero_thumb_signed_urls(supabase, storage_paths)
+
     all_folder_ids = [folder.get("id") for folder in folders if folder.get("id")]
 
     fabric_slots_by_folder_id: dict[str, list[dict]] = {}
@@ -182,6 +232,7 @@ def list_garment_types(
     for folder in folders:
         default_hero_image_id = folder.get("default_hero_image_id")
         hero_image_signed_url = None
+        hero_thumb_signed_url = None
 
         if default_hero_image_id:
             storage_path = storage_path_by_hero_image_id.get(
@@ -189,6 +240,7 @@ def list_garment_types(
             )
             if storage_path:
                 hero_image_signed_url = signed_url_by_storage_path.get(storage_path)
+                hero_thumb_signed_url = thumb_url_by_storage_path.get(storage_path)
 
         items.append(
             {
@@ -197,6 +249,7 @@ def list_garment_types(
                 "prompt_template": folder.get("prompt_template"),
                 "default_hero_image_id": default_hero_image_id or None,
                 "hero_image_signed_url": hero_image_signed_url,
+                "hero_thumb_signed_url": hero_thumb_signed_url,
                 "fabric_slots": fabric_slots_by_folder_id.get(
                     str(folder.get("id")), []
                 ),

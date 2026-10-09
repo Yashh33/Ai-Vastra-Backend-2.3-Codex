@@ -11,7 +11,12 @@ from pydantic import BaseModel, Field
 
 from admin_deps import verify_admin_secret
 from config import get_settings
-from generations_api import derive_thumb_path
+from image_thumbs import (
+    hero_thumbnail_path,
+    look_thumbnail_path,
+    sign_existing_paths,
+    store_hero_thumbnail_best_effort,
+)
 from supabase_client import get_supabase_admin_client
 from tryon_api import _upload_generated_output
 from worker import build_thumbnail_jpeg_bytes
@@ -1750,6 +1755,19 @@ def list_shop_hero_images(
     for row in rows:
         row["signed_url"] = _create_hero_image_signed_url(supabase, row.get("storage_path"))
 
+    # Display thumbnails, when they exist (null otherwise; callers fall back to signed_url).
+    thumb_path_by_row_id = {
+        row["id"]: hero_thumbnail_path(row["storage_path"])
+        for row in rows
+        if row.get("id") and row.get("storage_path")
+    }
+    thumb_url_by_path = sign_existing_paths(
+        "hero-images", sorted(set(thumb_path_by_row_id.values()))
+    )
+
+    for row in rows:
+        row["thumb_signed_url"] = thumb_url_by_path.get(thumb_path_by_row_id.get(row.get("id"), ""))
+
     return rows
 
 
@@ -1822,6 +1840,9 @@ async def upload_shop_hero_image(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Hero image metadata created but no response returned",
         )
+
+    # Display thumbnail in a separate file; the original above is left untouched.
+    await run_in_threadpool(store_hero_thumbnail_best_effort, supabase, storage_path, data)
 
     return rows[0]
 
@@ -2011,7 +2032,7 @@ def _store_uploaded_look(
 
     generation_id = str(uuid4())
     output_path = f"{shop_id}/{generation_id}/output_v{int(time.time())}.jpg"
-    thumb_path = derive_thumb_path(output_path)
+    thumb_path = look_thumbnail_path(output_path)
 
     _upload_generated_output(
         supabase,
