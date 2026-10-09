@@ -13,6 +13,7 @@ from payments_api import CREDIT_PACKS, create_payment_link_for_shop
 from prompting import DEFAULT_LOOK_PROMPT, DEFAULT_TRYON_PROMPT, fill_prompt_placeholders
 from supabase_client import get_supabase_admin_client
 from tryon_api import (
+    _build_look_tryon_prompt,
     _call_gemini_tryon,
     _downscale_image_if_needed,
     _fetch_storage_bytes,
@@ -1164,27 +1165,18 @@ def run_tryon_for_session(
                 (customer_bytes, customer_mime),
             ]
         else:
-            garment_bytes, folder_name, tryon_prompt = _prepare_tryon_assets_sync(
+            garment_bytes, folder_name, look_tryon_prompt = _prepare_tryon_assets_sync(
                 supabase, shop_id, generation_id
             )
             garment_bytes, garment_mime = _downscale_image_if_needed(garment_bytes, "image/jpeg")
 
-            if not tryon_prompt or not tryon_prompt.strip():
-                print(
-                    f"[whatsapp_state] WARNING: generation {generation_id}'s garment has no "
-                    "tryon_prompt configured; using fallback prompt"
-                )
-                tryon_prompt = DEFAULT_TRYON_PROMPT
-
-            prompt = fill_prompt_placeholders(
-                tryon_prompt,
-                garment_name=folder_name,
-                fabric_assignments=None,
-                image_count=2,
-            )
+            # No fallback here: a missing Look try-on prompt raises, which the
+            # handler below logs and answers with the try-on failed message.
+            prompt = _build_look_tryon_prompt(look_tryon_prompt, garment_name=folder_name)
+            # Look first, customer last
             image_parts = [
-                (customer_bytes, customer_mime),
                 (garment_bytes, garment_mime),
+                (customer_bytes, customer_mime),
             ]
 
         still_working_timer = threading.Timer(25.0, send_text, args=(phone, _MSG_TRYON_STILL_WORKING))

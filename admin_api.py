@@ -62,6 +62,8 @@ class AdminCreateFolderRequest(BaseModel):
 class AdminUpdateGarmentPromptRequest(BaseModel):
     look_prompt: str
     tryon_prompt: str
+    # Try-on from an already-generated look. Optional; empty string clears it.
+    look_tryon_prompt: Optional[str] = None
     category: str
     note: Optional[str] = None
 
@@ -1218,15 +1220,19 @@ def update_folder_prompt(
             detail="Both look and try-on prompts are required.",
         )
 
+    update_payload: dict[str, Any] = {
+        "look_prompt": look_prompt,
+        "tryon_prompt": tryon_prompt,
+        "category": category,
+    }
+    # Only touch look_tryon_prompt when the client sent it, so a client that
+    # doesn't know the field yet can't wipe it.
+    if "look_tryon_prompt" in body.model_fields_set:
+        update_payload["look_tryon_prompt"] = (body.look_tryon_prompt or "").strip() or None
+
     result = (
         supabase.table("garment_types")
-        .update(
-            {
-                "look_prompt": look_prompt,
-                "tryon_prompt": tryon_prompt,
-                "category": category,
-            }
-        )
+        .update(update_payload)
         .eq("id", folder_id)
         .eq("shop_id", shop_id)
         .execute()
@@ -1242,6 +1248,7 @@ def update_folder_prompt(
                 "shop_id": shop_id,
                 "look_prompt": look_prompt,
                 "tryon_prompt": tryon_prompt,
+                "look_tryon_prompt": result.data[0].get("look_tryon_prompt"),
                 "note": note,
             }
         ).execute()
@@ -1257,7 +1264,10 @@ def list_folder_prompt_versions(shop_id: str, folder_id: str):
 
     result = (
         supabase.table("garment_prompt_versions")
-        .select("id, garment_type_id, shop_id, look_prompt, tryon_prompt, note, created_at")
+        .select(
+            "id, garment_type_id, shop_id, look_prompt, tryon_prompt, look_tryon_prompt, "
+            "note, created_at"
+        )
         .eq("garment_type_id", folder_id)
         .eq("shop_id", shop_id)
         .order("created_at", desc=True)
@@ -1277,7 +1287,7 @@ def revert_folder_prompt_version(
 
     version_result = (
         supabase.table("garment_prompt_versions")
-        .select("look_prompt, tryon_prompt")
+        .select("look_prompt, tryon_prompt, look_tryon_prompt")
         .eq("id", version_id)
         .eq("garment_type_id", folder_id)
         .eq("shop_id", shop_id)
@@ -1290,10 +1300,17 @@ def revert_folder_prompt_version(
 
     look_prompt = version_rows[0].get("look_prompt") or ""
     tryon_prompt = version_rows[0].get("tryon_prompt") or ""
+    look_tryon_prompt = (version_rows[0].get("look_tryon_prompt") or "").strip() or None
 
     result = (
         supabase.table("garment_types")
-        .update({"look_prompt": look_prompt, "tryon_prompt": tryon_prompt})
+        .update(
+            {
+                "look_prompt": look_prompt,
+                "tryon_prompt": tryon_prompt,
+                "look_tryon_prompt": look_tryon_prompt,
+            }
+        )
         .eq("id", folder_id)
         .eq("shop_id", shop_id)
         .execute()
@@ -1308,6 +1325,7 @@ def revert_folder_prompt_version(
                 "shop_id": shop_id,
                 "look_prompt": look_prompt,
                 "tryon_prompt": tryon_prompt,
+                "look_tryon_prompt": look_tryon_prompt,
                 "note": f"Reverted to version {version_id}",
             }
         ).execute()

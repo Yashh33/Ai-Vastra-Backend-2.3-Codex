@@ -259,10 +259,33 @@ async def _call_gemini_tryon_async(
     )
 
 
+_LOOK_TRYON_PROMPT_MISSING_DETAIL = (
+    "This garment type has no Look try-on prompt. Add it in the admin panel."
+)
+
+
+def _build_look_tryon_prompt(look_tryon_prompt: Optional[str], *, garment_name: Optional[str]) -> str:
+    """Prompt for try-on from an already-generated look (Image 1 = look,
+    Image 2 = customer). Admin-authored only: there is deliberately no fallback."""
+    if not look_tryon_prompt or not look_tryon_prompt.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_LOOK_TRYON_PROMPT_MISSING_DETAIL,
+        )
+
+    return fill_prompt_placeholders(
+        look_tryon_prompt,
+        garment_name=garment_name,
+        fabric_assignments=None,
+        image_count=2,
+    )
+
+
 def _prepare_tryon_assets_sync(
     supabase, shop_id: str, generation_id: str
 ) -> Tuple[bytes, Optional[str], Optional[str]]:
-    """Blocking DB + storage prep phase for /tryon/v2. Runs off the event loop."""
+    """Blocking DB + storage prep phase for try-on from a look.
+    Returns (look_bytes, garment_name, look_tryon_prompt)."""
     gen_result = (
         supabase.table("generations")
         .select("id, shop_id, output_path, folder_id, status")
@@ -286,12 +309,12 @@ def _prepare_tryon_assets_sync(
         )
 
     folder_name: Optional[str] = None
-    tryon_prompt: Optional[str] = None
+    look_tryon_prompt: Optional[str] = None
     folder_id = gen.get("folder_id")
     if folder_id:
         folder_result = (
             supabase.table("garment_types")
-            .select("name, tryon_prompt")
+            .select("name, look_tryon_prompt")
             .eq("id", folder_id)
             .limit(1)
             .execute()
@@ -299,7 +322,7 @@ def _prepare_tryon_assets_sync(
         folder_rows = getattr(folder_result, "data", None) or []
         if folder_rows:
             folder_name = folder_rows[0].get("name")
-            tryon_prompt = folder_rows[0].get("tryon_prompt")
+            look_tryon_prompt = folder_rows[0].get("look_tryon_prompt")
 
     garment_bytes = _fetch_storage_bytes(
         supabase,
@@ -307,7 +330,7 @@ def _prepare_tryon_assets_sync(
         gen["output_path"],
     )
 
-    return garment_bytes, folder_name, tryon_prompt
+    return garment_bytes, folder_name, look_tryon_prompt
 
 
 def _prepare_tryon_quick_assets_sync(
@@ -477,7 +500,7 @@ def tryon(
     """
     Approach B - Stage 2 only.
     Takes an existing generation output + customer photo.
-    Calls Gemini with: customer_photo + garment_image.
+    Calls Gemini with: look image first, customer photo last.
     Returns composite image as base64. Nothing is stored.
     """
     supabase = get_supabase_admin_client()
@@ -512,14 +535,14 @@ def tryon(
             detail="Generation is not ready yet",
         )
 
-    # Fetch folder name + tryon prompt for prompt context
+    # Fetch folder name + look try-on prompt for prompt context
     folder_name: Optional[str] = None
-    folder_tryon_prompt: Optional[str] = None
+    folder_look_tryon_prompt: Optional[str] = None
     folder_id = gen.get("folder_id")
     if folder_id:
         folder_result = (
             supabase.table("garment_types")
-            .select("name, tryon_prompt")
+            .select("name, look_tryon_prompt")
             .eq("id", folder_id)
             .limit(1)
             .execute()
@@ -527,7 +550,10 @@ def tryon(
         folder_rows = getattr(folder_result, "data", None) or []
         if folder_rows:
             folder_name = folder_rows[0].get("name")
-            folder_tryon_prompt = folder_rows[0].get("tryon_prompt")
+            folder_look_tryon_prompt = folder_rows[0].get("look_tryon_prompt")
+
+    # Build prompt (400 if the garment type has no Look try-on prompt)
+    prompt = _build_look_tryon_prompt(folder_look_tryon_prompt, garment_name=folder_name)
 
     # Download garment image (Stage 1 output)
     garment_bytes = _fetch_storage_bytes(
@@ -539,21 +565,12 @@ def tryon(
     # Decode customer photo from base64 (never stored)
     customer_bytes = _decode_photo(body.customer_photo_b64)
 
-    # Build prompt
-    prompt = _resolve_tryon_prompt(
-        folder_tryon_prompt,
-        garment_name=folder_name,
-        fabric_assignments=None,
-        image_count=2,
-        context=f"folder {folder_id}" if folder_id else "",
-    )
-
-    # Call Gemini: customer first, then garment
+    # Call Gemini: look first, customer last
     return _call_gemini_tryon(
         prompt=prompt,
         image_parts=[
-            (customer_bytes, body.customer_photo_mime),
             (garment_bytes, "image/jpeg"),
+            (customer_bytes, body.customer_photo_mime),
         ],
     )
 
@@ -721,12 +738,14 @@ async def tryon_v2(
         )
     background_tasks.add_task(_log_tryon_consent, supabase, current.shop_id)
 
-    garment_bytes, folder_name, folder_tryon_prompt = await anyio.to_thread.run_sync(
+    garment_bytes, folder_name, folder_look_tryon_prompt = await anyio.to_thread.run_sync(
         _prepare_tryon_assets_sync,
         supabase,
         current.shop_id,
         generation_id.strip(),
     )
+
+    prompt = _build_look_tryon_prompt(folder_look_tryon_prompt, garment_name=folder_name)
 
     customer_bytes = await customer_photo.read()
     customer_mime = customer_photo.content_type or "image/jpeg"
@@ -734,19 +753,12 @@ async def tryon_v2(
     customer_bytes, customer_mime = _downscale_image_if_needed(customer_bytes, customer_mime)
     garment_bytes, garment_mime = _downscale_image_if_needed(garment_bytes, "image/jpeg")
 
-    prompt = _resolve_tryon_prompt(
-        folder_tryon_prompt,
-        garment_name=folder_name,
-        fabric_assignments=None,
-        image_count=2,
-        context=f"generation {generation_id.strip()}",
-    )
-
+    # Look first, customer last
     image_bytes, result_mime = await _call_gemini_tryon_async(
         prompt=prompt,
         image_parts=[
-            (customer_bytes, customer_mime),
             (garment_bytes, garment_mime),
+            (customer_bytes, customer_mime),
         ],
     )
 
