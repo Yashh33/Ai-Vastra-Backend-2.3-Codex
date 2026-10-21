@@ -21,6 +21,12 @@ The owner deploys manually (see `DEPLOY.md`). A second developer also pushes to 
 
 ## Local runs use the LIVE database and storage
 - Local runs connect to the same live Supabase database and storage as production.
+- Every local backend run must have `WHATSAPP_WATCHER_ENABLED=false` in the local `.env`.
+  Never start the backend locally with the WhatsApp watcher on: it polls real customers'
+  sessions and would race production's watcher for them. Check the startup log shows
+  `WhatsApp watcher disabled (WHATSAPP_WATCHER_ENABLED=false)`; if it shows
+  `[whatsapp_watcher] started`, stop the server immediately.
+- With that set, start the backend normally (`uvicorn main:app`); no special launcher is needed.
 - Test only with the demo shop (the `demo@gmail.com` account).
 - Never read or modify real shops' data.
 - Never run scripts that delete storage objects or database rows.

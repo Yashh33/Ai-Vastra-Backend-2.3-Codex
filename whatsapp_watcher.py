@@ -196,7 +196,25 @@ def _process_session_sync(supabase, session: dict) -> None:
         _update_session_sync(supabase, session["id"], {"state": "ERROR"})
 
 
+_missing_token_warned = False
+
+
 async def _watch_once() -> None:
+    global _missing_token_warned
+
+    # Sends swallow their own failures, so without a token every "send" would
+    # quietly fail and the session would still be marked delivered/errored.
+    # Leave sessions untouched instead.
+    if not (get_settings().WHATSAPP_ACCESS_TOKEN or "").strip():
+        if not _missing_token_warned:
+            print(
+                "[whatsapp_watcher] WARNING: WHATSAPP_ACCESS_TOKEN is missing; "
+                "skipping sessions (none will be marked delivered)"
+            )
+            _missing_token_warned = True
+        return
+    _missing_token_warned = False
+
     supabase = get_supabase_admin_client()
     sessions = await anyio.to_thread.run_sync(_fetch_processing_sessions_sync, supabase)
 
@@ -221,4 +239,7 @@ async def _watch_loop() -> None:
 
 
 def start_completion_watcher() -> None:
+    if (get_settings().WHATSAPP_WATCHER_ENABLED or "").strip().lower() == "false":
+        print("WhatsApp watcher disabled (WHATSAPP_WATCHER_ENABLED=false)")
+        return
     asyncio.create_task(_watch_loop())

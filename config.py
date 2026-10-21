@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     WHATSAPP_PHONE_NUMBER_ID: str = Field(default="")
     WHATSAPP_VERIFY_TOKEN: str = Field(default="")
     WHATSAPP_GRAPH_VERSION: str = Field(default="v25.0")
+    # "false" turns the WhatsApp completion watcher off (always do this locally:
+    # the local database is the live one). Unset or anything else = on.
+    WHATSAPP_WATCHER_ENABLED: str = Field(default="true")
 
     # Shop that holds the fixed-garment-menu master templates (one
     # hero_folders row + one hero_images row per garment type).
