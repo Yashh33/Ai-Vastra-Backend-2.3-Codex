@@ -2,3 +2,7 @@
 .env
 __pycache__/
 *.pyc
+
+# Local dump files and one-off scripts (never commit)
+*_latest*.txt
+cleanup_storage.py

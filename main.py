@@ -1,9 +1,12 @@
+import os
 import threading
 
 from cachetools import TTLCache
+from dotenv import dotenv_values
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse
 
 from admin_api import router as admin_router
 from auth_deps import CurrentShopContext, get_current_shop_context
@@ -74,6 +77,41 @@ def health():
             settings.WHATSAPP_ACCESS_TOKEN and settings.WHATSAPP_PHONE_NUMBER_ID
         ),
     }
+
+
+# Environment variables the live service needs. Variables with safe defaults
+# (APP_ENV, GEMINI_IMAGE_MODEL_ID, CREDITS_PER_IMAGE, WHATSAPP_FREE_IMAGES,
+# WORKER_POLL_INTERVAL_SECONDS, WHATSAPP_GRAPH_VERSION) are deliberately not listed.
+_HEALTHZ_REQUIRED_ENV = (
+    "SUPABASE_URL",
+    "SUPABASE_SERVICE_ROLE_KEY",
+    "GEMINI_API_KEY",
+    "ADMIN_PANEL_SECRET",
+    "WHATSAPP_ACCESS_TOKEN",
+    "WHATSAPP_PHONE_NUMBER_ID",
+    "WHATSAPP_VERIFY_TOKEN",
+    "MASTER_SHOP_ID",
+    "RAZORPAY_KEY_ID",
+    "RAZORPAY_KEY_SECRET",
+    "RAZORPAY_WEBHOOK_SECRET",
+    "FAL_KEY",
+)
+
+
+@app.get("/healthz", include_in_schema=False)
+def healthz():
+    """Render health check: no auth, no database access. Reports only the NAMES
+    of missing environment variables, never their values."""
+    # Same sources Settings uses: the process environment, then a local .env file.
+    dotenv_file = dotenv_values(".env") if os.path.exists(".env") else {}
+    missing = [
+        name
+        for name in _HEALTHZ_REQUIRED_ENV
+        if not (os.environ.get(name) or dotenv_file.get(name) or "").strip()
+    ]
+    if missing:
+        return JSONResponse(status_code=500, content={"ok": False, "missing": missing})
+    return {"ok": True}
 
 
 _me_shop_summary_cache: TTLCache = TTLCache(maxsize=1000, ttl=60)
