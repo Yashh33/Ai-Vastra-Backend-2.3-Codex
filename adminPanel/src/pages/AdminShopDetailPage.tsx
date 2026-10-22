@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { adminFetch } from "../lib/api";
 import { useAdminAuth } from "../lib/auth";
+import { copyText } from "../lib/clipboard";
 import type {
   AdminFabricSlotRow,
   AdminFolderRow,
@@ -17,6 +18,11 @@ import type {
 } from "../lib/types";
 
 const LOOK_UPLOAD_BATCH_SIZE = 10;
+
+// Same rule as the backend (admin_api._SCREEN_SLUG_RE).
+const SCREEN_SLUG_RE = /^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$/;
+const SCREEN_SLUG_RULE =
+  "TV slug must be 3–40 characters: lowercase letters, numbers and hyphens, and cannot start or end with a hyphen.";
 
 const LOOK_STATUS_STYLE: Record<LookUploadStatus, { label: string; color: string }> = {
   uploaded: { label: "Uploaded", color: "#15803d" },
@@ -110,6 +116,13 @@ export function AdminShopDetailPage() {
   const [processingSuspend, setProcessingSuspend] = useState(false);
   const [deletingShop, setDeletingShop] = useState(false);
   const [togglingMultifabric, setTogglingMultifabric] = useState(false);
+
+  const [editingSlug, setEditingSlug] = useState(false);
+  const [slugDraft, setSlugDraft] = useState("");
+  const [slugError, setSlugError] = useState("");
+  const [savingSlug, setSavingSlug] = useState(false);
+  const [suggestingSlug, setSuggestingSlug] = useState(false);
+  const [slugCopied, setSlugCopied] = useState(false);
 
   const [activeTab, setActiveTab] = useState<"overview" | "garments" | "generations">("overview");
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -371,6 +384,73 @@ export function AdminShopDetailPage() {
       setStatusText(`Credits update failed: ${err instanceof Error ? err.message : "Unknown error"}`);
     } finally {
       setGrantingCredits(false);
+    }
+  }
+
+  function startEditingSlug() {
+    setSlugDraft(shop?.screen_slug || "");
+    setSlugError("");
+    setEditingSlug(true);
+  }
+
+  async function handleCopySlug() {
+    if (shop?.screen_slug && (await copyText(shop.screen_slug))) {
+      setSlugCopied(true);
+      window.setTimeout(() => setSlugCopied(false), 1500);
+    }
+  }
+
+  async function handleSuggestSlug() {
+    if (!session || !shopId) return;
+    setSuggestingSlug(true);
+    setSlugError("");
+    try {
+      const result = await adminFetch<{ screen_slug: string }>(
+        session,
+        `/admin/shops/${encodeURIComponent(shopId)}/screen-slug-suggestion`,
+        { method: "GET" }
+      );
+      setSlugDraft(result.screen_slug);
+    } catch (err) {
+      setSlugError(err instanceof Error ? err.message : "Could not suggest a slug");
+    } finally {
+      setSuggestingSlug(false);
+    }
+  }
+
+  async function handleSaveSlug() {
+    if (!session || !shopId) return;
+
+    const slug = slugDraft.trim().toLowerCase();
+    if (!SCREEN_SLUG_RE.test(slug)) {
+      setSlugError(SCREEN_SLUG_RULE);
+      return;
+    }
+
+    const previous = shop?.screen_slug || "";
+    if (slug === previous) {
+      setEditingSlug(false);
+      return;
+    }
+    if (previous && !window.confirm("TVs using the old slug will need to be set up again.")) {
+      return;
+    }
+
+    setSavingSlug(true);
+    setSlugError("");
+    try {
+      const result = await adminFetch<{ shop_id: string; screen_slug: string }>(
+        session,
+        `/admin/shops/${encodeURIComponent(shopId)}/screen-slug`,
+        { method: "PATCH", body: JSON.stringify({ screen_slug: slug }) }
+      );
+      setShop((prev) => (prev ? { ...prev, screen_slug: result.screen_slug } : prev));
+      setEditingSlug(false);
+      setStatusText(`TV slug saved: ${result.screen_slug}`);
+    } catch (err) {
+      setSlugError(err instanceof Error ? err.message : "Failed to save TV slug");
+    } finally {
+      setSavingSlug(false);
     }
   }
 
@@ -980,6 +1060,52 @@ export function AdminShopDetailPage() {
               {savingShop ? "Saving..." : "Save Shop Details"}
             </button>
           </form>
+        </section>
+
+        <section className="card stack">
+          <h2>TV slug</h2>
+          {editingSlug ? (
+            <>
+              <label className="field">
+                <span>TV slug</span>
+                <input
+                  value={slugDraft}
+                  onChange={(event) => {
+                    setSlugDraft(event.target.value);
+                    setSlugError("");
+                  }}
+                  placeholder="e.g. retro-fashion"
+                  disabled={savingSlug}
+                  autoFocus
+                />
+              </label>
+              {slugError ? <p className="error-text">{slugError}</p> : null}
+              <div className="row">
+                <button className="btn btn-dark" type="button" onClick={() => void handleSaveSlug()} disabled={savingSlug || !slugDraft.trim()}>
+                  {savingSlug ? "Saving..." : "Save"}
+                </button>
+                <button className="btn btn-light" type="button" onClick={() => void handleSuggestSlug()} disabled={savingSlug || suggestingSlug}>
+                  {suggestingSlug ? "Suggesting..." : "Suggest from name"}
+                </button>
+                <button className="btn btn-light" type="button" onClick={() => setEditingSlug(false)} disabled={savingSlug}>
+                  Cancel
+                </button>
+              </div>
+            </>
+          ) : (
+            <div className="row">
+              {shop?.screen_slug ? <code>{shop.screen_slug}</code> : <span className="muted">Not set</span>}
+              {shop?.screen_slug ? (
+                <button className="btn btn-light" type="button" onClick={() => void handleCopySlug()}>
+                  {slugCopied ? "Copied" : "Copy"}
+                </button>
+              ) : null}
+              <button className="btn btn-light" type="button" onClick={startEditingSlug}>
+                {shop?.screen_slug ? "Edit" : "Set slug"}
+              </button>
+            </div>
+          )}
+          <p className="tiny muted">Enter this on the TV app's setup screen.</p>
         </section>
 
         <section className="card stack">

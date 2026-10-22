@@ -19,6 +19,7 @@ export type AdminShopRow = {
   channel?: string | null;
   status?: string | null;
   whatsapp_multifabric_enabled?: boolean;
+  screen_slug?: string | null;
 };
 
 export type AdminCreateShopResponse = {

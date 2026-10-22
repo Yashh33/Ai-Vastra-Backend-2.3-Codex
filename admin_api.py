@@ -38,6 +38,10 @@ class AdminUpdateShopRequest(BaseModel):
     carousel_mode_default: Optional[bool] = None
 
 
+class AdminSetScreenSlugRequest(BaseModel):
+    screen_slug: str
+
+
 class AdminResetPasswordRequest(BaseModel):
     password: str = Field(..., min_length=6, max_length=128)
 
@@ -103,6 +107,46 @@ def _clean_text(value: str, field_name: str) -> str:
             detail=f"{field_name} cannot be blank",
         )
     return cleaned
+
+
+# TV slug (shops.screen_slug): 3-40 chars, lowercase letters/digits/hyphens,
+# no leading or trailing hyphen.
+_SCREEN_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$")
+_SCREEN_SLUG_INVALID_DETAIL = (
+    "TV slug must be 3–40 characters: lowercase letters, numbers and hyphens, "
+    "and cannot start or end with a hyphen."
+)
+_SCREEN_SLUG_TAKEN_DETAIL = "That TV slug is already used by another shop."
+_SCREEN_SLUG_SUGGESTION_BASE_MAX = 36  # leaves room for a "-NN" suffix
+
+
+def _normalize_screen_slug(value: Optional[str]) -> str:
+    slug = (value or "").strip().lower()
+    if not _SCREEN_SLUG_RE.fullmatch(slug):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_SCREEN_SLUG_INVALID_DETAIL)
+    return slug
+
+
+def _screen_slug_taken(supabase, slug: str, exclude_shop_id: str) -> bool:
+    # Case-insensitive exact match: valid slugs contain no LIKE wildcards (% or _).
+    # Works before the unique index in sql/2026-10-23_unique_screen_slug.sql exists.
+    result = (
+        supabase.table("shops")
+        .select("id")
+        .ilike("screen_slug", slug)
+        .neq("id", exclude_shop_id)
+        .limit(1)
+        .execute()
+    )
+    return bool(getattr(result, "data", None))
+
+
+def _slugify_shop_name(name: Optional[str]) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
+    slug = slug[:_SCREEN_SLUG_SUGGESTION_BASE_MAX].strip("-") or "shop"
+    if len(slug) < 3:
+        slug = f"{slug}-tv"
+    return slug
 
 
 def _clean_email(value: str) -> str:
@@ -722,6 +766,54 @@ def update_shop(shop_id: str, body: AdminUpdateShopRequest):
         )
 
     return rows[0]
+
+
+def _load_shop_for_slug(supabase, shop_id: str) -> dict:
+    result = supabase.table("shops").select("id, name, screen_slug").eq("id", shop_id).limit(1).execute()
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Shop not found")
+    return rows[0]
+
+
+@router.patch("/shops/{shop_id}/screen-slug")
+def set_shop_screen_slug(shop_id: str, body: AdminSetScreenSlugRequest):
+    supabase = get_supabase_admin_client()
+    slug = _normalize_screen_slug(body.screen_slug)
+    _load_shop_for_slug(supabase, shop_id)
+
+    if _screen_slug_taken(supabase, slug, shop_id):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_SCREEN_SLUG_TAKEN_DETAIL)
+
+    try:
+        # Only the slug changes; nothing else on the shop is touched.
+        supabase.table("shops").update({"screen_slug": slug}).eq("id", shop_id).execute()
+    except Exception as exc:
+        message = str(exc).lower()
+        if "23505" in message or "duplicate key" in message or "unique" in message:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_SCREEN_SLUG_TAKEN_DETAIL) from exc
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to save TV slug",
+        ) from exc
+
+    return {"shop_id": shop_id, "screen_slug": slug}
+
+
+@router.get("/shops/{shop_id}/screen-slug-suggestion")
+def suggest_shop_screen_slug(shop_id: str):
+    supabase = get_supabase_admin_client()
+    shop = _load_shop_for_slug(supabase, shop_id)
+
+    base = _slugify_shop_name(shop.get("name"))
+    for candidate in [base, *(f"{base}-{n}" for n in range(2, 100))]:
+        if not _screen_slug_taken(supabase, candidate, shop_id):
+            return {"screen_slug": candidate}
+
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="Could not find a free TV slug for this name; please type one.",
+    )
 
 
 @router.post("/shops/{shop_id}/suspend")

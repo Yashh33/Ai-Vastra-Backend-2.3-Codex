@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 
 import { adminFetch } from "../lib/api";
 import { useAdminAuth } from "../lib/auth";
+import { copyText } from "../lib/clipboard";
 import type { AdminCreateShopResponse, AdminShopRow } from "../lib/types";
 
 function formatPhone(raw: string | null | undefined): string {
@@ -21,6 +22,14 @@ export function AdminDashboardPage() {
   const [loading, setLoading] = useState(false);
   const [statusText, setStatusText] = useState("Loading shops...");
   const [showTrial, setShowTrial] = useState(false);
+  const [copiedSlugShopId, setCopiedSlugShopId] = useState<string | null>(null);
+
+  async function handleCopySlug(shopId: string, slug: string) {
+    if (await copyText(slug)) {
+      setCopiedSlugShopId(shopId);
+      window.setTimeout(() => setCopiedSlugShopId((current) => (current === shopId ? null : current)), 1500);
+    }
+  }
 
   const [shopName, setShopName] = useState("");
   const [email, setEmail] = useState("");
@@ -221,6 +230,24 @@ export function AdminDashboardPage() {
                     ) : null}
                   </h3>
                   <p className="tiny muted">Shop ID: {shop.id}</p>
+                  <p className="tiny muted">
+                    TV slug:{" "}
+                    {shop.screen_slug ? (
+                      <>
+                        <code>{shop.screen_slug}</code>{" "}
+                        <button
+                          type="button"
+                          className="btn btn-light"
+                          style={{ minHeight: "auto", padding: "0.1rem 0.45rem", fontSize: "0.72rem" }}
+                          onClick={() => void handleCopySlug(shop.id, shop.screen_slug as string)}
+                        >
+                          {copiedSlugShopId === shop.id ? "Copied" : "Copy"}
+                        </button>
+                      </>
+                    ) : (
+                      "Not set"
+                    )}
+                  </p>
                   <p className="tiny muted">Credits: {shop.credits_balance ?? 0}</p>
                   {shop.channel === "master" ? (
                     <p className="tiny muted">Master Template</p>
