@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Upload
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
+import attempt_log
 from admin_deps import verify_admin_secret
 from config import get_settings
 from image_thumbs import (
@@ -2294,3 +2295,217 @@ async def upload_shop_looks_bulk(
         "items": items,
     }
 
+
+# ---------------------------------------------------------------- Operations: generation logs
+
+_ATTEMPT_LIST_COLUMNS = (
+    "id, request_id, created_at, started_at, finished_at, duration_ms, shop_id, user_email, "
+    "user_label, attempt_type, garment_type_name, fabric_mode, status, failed_step, "
+    "credits_charged, credits_refunded, output_path, tryon_result_path, backfilled, device_label"
+)
+_ATTEMPT_STATUS_FILTERS = {"succeeded", "failed", "running"}
+
+
+def _parse_attempt_time(value: Optional[str], name: str) -> Optional[str]:
+    if not value or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"{name} must be an ISO date-time")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _stuck_before_iso() -> str:
+    # Quoted inside PostgREST or() filters, so keep it free of '+'.
+    return (datetime.now(timezone.utc) - attempt_log.STUCK_AFTER).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _apply_attempt_filters(query, *, shop_id, attempt_type, from_iso, to_iso, status_filter):
+    if shop_id:
+        query = query.eq("shop_id", shop_id)
+    if attempt_type:
+        query = query.eq("attempt_type", attempt_type)
+    if from_iso:
+        query = query.gte("created_at", from_iso)
+    if to_iso:
+        query = query.lt("created_at", to_iso)
+
+    stuck_before = _stuck_before_iso()
+    if status_filter == "succeeded":
+        query = query.eq("status", "succeeded")
+    elif status_filter == "failed":
+        # Failed, timed out, or still open after 5 minutes (shown as timed out before the sweep).
+        query = query.or_(
+            f'status.in.(failed,timed_out),and(status.in.(started,running),started_at.lt."{stuck_before}")'
+        )
+    elif status_filter == "running":
+        query = query.in_("status", list(attempt_log.OPEN_STATUSES)).gte("started_at", stuck_before)
+    return query
+
+
+def _count_attempts(supabase, **filters) -> int:
+    query = supabase.table(attempt_log.TABLE).select("id", count="exact").limit(1)
+    result = _apply_attempt_filters(query, **filters).execute()
+    return int(getattr(result, "count", None) or 0)
+
+
+def _shop_names(supabase, shop_ids: list[str]) -> dict[str, str]:
+    if not shop_ids:
+        return {}
+    result = supabase.table("shops").select("id, name").in_("id", shop_ids).execute()
+    return {str(row["id"]): row.get("name") for row in (getattr(result, "data", None) or [])}
+
+
+@router.get("/shop-names")
+def list_shop_names():
+    """Lightweight id + name list (for filters)."""
+    supabase = get_supabase_admin_client()
+    result = supabase.table("shops").select("id, name").order("name", desc=False).limit(1000).execute()
+    return [{"id": row["id"], "name": row.get("name")} for row in (getattr(result, "data", None) or [])]
+
+
+@router.get("/attempts")
+def list_generation_attempts(
+    shop_id: Optional[str] = Query(default=None),
+    status_filter: Optional[str] = Query(default=None, alias="status"),
+    attempt_type: Optional[str] = Query(default=None),
+    from_: Optional[str] = Query(default=None, alias="from"),
+    to: Optional[str] = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=15, ge=1, le=50),
+):
+    supabase = get_supabase_admin_client()
+
+    status_filter = (status_filter or "").strip().lower() or None
+    if status_filter == "all":
+        status_filter = None
+    if status_filter and status_filter not in _ATTEMPT_STATUS_FILTERS:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid status filter")
+    attempt_type = (attempt_type or "").strip() or None
+    if attempt_type == "all":
+        attempt_type = None
+    if attempt_type and attempt_type not in attempt_log.ATTEMPT_TYPES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid attempt type")
+    shop_id = (shop_id or "").strip() or None
+    if shop_id == "all":
+        shop_id = None
+    if shop_id and not attempt_log.valid_uuid(shop_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid shop_id")
+
+    base_filters = {
+        "shop_id": shop_id,
+        "attempt_type": attempt_type,
+        "from_iso": _parse_attempt_time(from_, "from"),
+        "to_iso": _parse_attempt_time(to, "to"),
+    }
+
+    offset = (page - 1) * page_size
+    try:
+        query = (
+            supabase.table(attempt_log.TABLE)
+            .select(_ATTEMPT_LIST_COLUMNS, count="exact")
+            .order("created_at", desc=True)
+            .range(offset, offset + page_size - 1)
+        )
+        result = _apply_attempt_filters(query, status_filter=status_filter, **base_filters).execute()
+
+        # Tiles: same shop / type / dates, every status.
+        all_count = _count_attempts(supabase, status_filter=None, **base_filters)
+        succeeded_count = _count_attempts(supabase, status_filter="succeeded", **base_filters)
+        failed_count = _count_attempts(supabase, status_filter="failed", **base_filters)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch generation logs: {attempt_log.scrub(str(exc), 300)}",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    total = int(getattr(result, "count", None) or 0)
+    names = _shop_names(supabase, sorted({str(row["shop_id"]) for row in rows if row.get("shop_id")}))
+
+    result_paths = [row.get("output_path") or row.get("tryon_result_path") for row in rows]
+    sign_paths: list[str] = []
+    for path in result_paths:
+        if path:
+            sign_paths.extend([look_thumbnail_path(path), path])
+    signed = sign_existing_paths("generated-outputs", sorted(set(sign_paths)), expires_in=3600) if sign_paths else {}
+
+    now = datetime.now(timezone.utc)
+    items = []
+    for row, path in zip(rows, result_paths):
+        thumb_url = None
+        if path:
+            thumb_url = signed.get(look_thumbnail_path(path)) or signed.get(path)
+        items.append(
+            {
+                **{key: value for key, value in row.items() if key not in ("output_path", "tryon_result_path")},
+                "raw_status": row.get("status"),
+                "status": attempt_log.effective_status(row, now),
+                "shop_name": names.get(str(row.get("shop_id") or "")),
+                "has_result": bool(path),
+                "thumb_url": thumb_url,
+            }
+        )
+
+    finished = succeeded_count + failed_count
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "summary": {
+            "attempts": all_count,
+            "succeeded": succeeded_count,
+            "failed": failed_count,
+            "running": max(0, all_count - finished),
+            "success_rate": round(succeeded_count * 100.0 / finished, 1) if finished else None,
+        },
+    }
+
+
+@router.get("/attempts/{attempt_id}")
+def get_generation_attempt(attempt_id: str):
+    if not attempt_log.valid_uuid(attempt_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found")
+    supabase = get_supabase_admin_client()
+
+    result = supabase.table(attempt_log.TABLE).select("*").eq("id", attempt_id).limit(1).execute()
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found")
+    row = rows[0]
+
+    # Look try-on's input is a generated look; every other hero is a shop hero image.
+    hero_bucket = "generated-outputs" if row.get("attempt_type") == "look_tryon" else "hero-images"
+    hero_path = row.get("hero_path")
+    fabric_inputs = row.get("fabric_inputs") if isinstance(row.get("fabric_inputs"), list) else []
+    fabric_paths = [str(item.get("storage_path")) for item in fabric_inputs if isinstance(item, dict) and item.get("storage_path")]
+    output_paths = [path for path in (row.get("output_path"), row.get("tryon_result_path")) if path]
+
+    signed_hero = sign_existing_paths(hero_bucket, [hero_path]) if hero_path else {}
+    signed_fabrics = sign_existing_paths("fabric-images", sorted(set(fabric_paths))) if fabric_paths else {}
+    signed_outputs = sign_existing_paths("generated-outputs", output_paths) if output_paths else {}
+
+    shop_name = None
+    if row.get("shop_id"):
+        shop_name = _shop_names(supabase, [str(row["shop_id"])]).get(str(row["shop_id"]))
+
+    return {
+        **row,
+        "raw_status": row.get("status"),
+        "status": attempt_log.effective_status(row),
+        "shop_name": shop_name,
+        "hero_url": signed_hero.get(hero_path) if hero_path else None,
+        "fabric_inputs": [
+            {**item, "url": signed_fabrics.get(str(item.get("storage_path"))) if item.get("storage_path") else None}
+            for item in fabric_inputs
+            if isinstance(item, dict)
+        ],
+        "output_url": signed_outputs.get(row["output_path"]) if row.get("output_path") else None,
+        "tryon_result_url": signed_outputs.get(row["tryon_result_path"]) if row.get("tryon_result_path") else None,
+    }

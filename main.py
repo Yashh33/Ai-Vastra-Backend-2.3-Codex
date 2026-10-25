@@ -9,6 +9,9 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
 from admin_api import router as admin_router
+from attempt_log import AttemptLogMiddleware
+from attempt_log import flush as flush_attempt_log
+from attempt_logs_api import router as attempt_logs_router
 from auth_deps import CurrentShopContext, get_current_shop_context
 from config import get_settings
 from folders_api import router as folders_router
@@ -24,6 +27,8 @@ from whatsapp_watcher import start_completion_watcher
 
 app = FastAPI(title="Ai Vastra Backend")
 
+# Added first so it sits innermost (inside GZip): it must see the uncompressed JSON.
+app.add_middleware(AttemptLogMiddleware)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 app.add_middleware(
@@ -41,6 +46,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-Id"],
 )
 
 
@@ -53,6 +59,13 @@ app.include_router(admin_router)
 app.include_router(whatsapp_router)
 app.include_router(payments_router)
 app.include_router(segment_router)
+app.include_router(attempt_logs_router)
+
+
+@app.on_event("shutdown")
+def _flush_attempt_log() -> None:
+    # Don't lose queued attempt-log writes on a deploy/restart.
+    flush_attempt_log(timeout=5.0)
 
 
 @app.on_event("startup")

@@ -5,6 +5,7 @@ from typing import Optional
 
 import anyio.to_thread
 
+import attempt_log
 from config import get_settings
 from supabase_client import get_supabase_admin_client
 from whatsapp_transport import send_image_by_link, send_text
@@ -143,6 +144,7 @@ def _process_session_sync(supabase, session: dict) -> None:
     if not generation:
         if _is_stuck(session):
             send_text(phone, _MSG_GENERATION_FAILED)
+            attempt_log.record_user_message_for_generation(generation_id, _MSG_GENERATION_FAILED)
             _update_session_sync(
                 supabase,
                 session["id"],
@@ -156,6 +158,7 @@ def _process_session_sync(supabase, session: dict) -> None:
         output_path = str(generation.get("output_path") or "").strip()
         if not output_path:
             send_text(phone, _MSG_GENERATION_FAILED)
+            attempt_log.record_user_message_for_generation(generation_id, _MSG_GENERATION_FAILED)
             _update_session_sync(
                 supabase,
                 session["id"],
@@ -187,12 +190,15 @@ def _process_session_sync(supabase, session: dict) -> None:
 
     if gen_status == "failed":
         send_text(phone, _MSG_GENERATION_FAILED)
+        # Operations log: the exact text this shop saw for the failed look.
+        attempt_log.record_user_message_for_generation(generation_id, _MSG_GENERATION_FAILED)
         _update_session_sync(supabase, session["id"], {"state": "ERROR"})
         return
 
     # queued / processing: still working, unless it has been stuck too long.
     if _is_stuck(session):
         send_text(phone, _MSG_GENERATION_FAILED)
+        attempt_log.record_user_message_for_generation(generation_id, _MSG_GENERATION_FAILED)
         _update_session_sync(supabase, session["id"], {"state": "ERROR"})
 
 

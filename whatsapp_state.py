@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from uuid import uuid4
 
+import attempt_log
 from config import get_settings
 from payments_api import CREDIT_PACKS, create_payment_link_for_shop
 from prompting import DEFAULT_LOOK_PROMPT, DEFAULT_TRYON_PROMPT, fill_prompt_placeholders
@@ -835,15 +836,45 @@ def _handle_garment_image(supabase, session: dict, msg: dict) -> None:
 
 
 def create_generation_for_session(supabase, session: dict) -> None:
+    # Operations log. The phone number is never stored; the worker writes the final status.
+    attempt = attempt_log.begin(
+        "look",
+        "whatsapp_look",
+        shop_id=session.get("shop_id"),
+        user_label="WhatsApp",
+        device_label="WhatsApp",
+        garment_type_id=attempt_log.valid_uuid(session.get("folder_id")),
+    )
+    try:
+        _create_generation_for_session(supabase, session, attempt)
+    except Exception as exc:
+        # handle_incoming answers every exception with _MSG_TECH_ERROR.
+        if attempt.status == "running":
+            # Already queued: the worker still decides the outcome.
+            attempt.update(user_message=_MSG_TECH_ERROR, error_detail=attempt_log.describe_exception(exc))
+        else:
+            step = "credits" if "insufficient credits" in str(exc).lower() else attempt.step
+            attempt.fail(step, user_message=_MSG_TECH_ERROR, error=exc)
+        raise
+
+
+def _create_generation_for_session(supabase, session: dict, attempt) -> None:
     phone = session["phone_number"]
     shop_id = session["shop_id"]
     hero_image_id = session.get("hero_image_id")
     fabric_image_id = session.get("fabric_image_id")
 
     settings = get_settings()
+    attempt.set_step("credits")
     balance = _get_shop_balance(supabase, shop_id)
     if balance < settings.CREDITS_PER_IMAGE:
         send_text(phone, _MSG_NO_CREDITS)
+        attempt.fail(
+            "credits",
+            user_message=_MSG_NO_CREDITS,
+            error=f"Balance {balance} is below the {settings.CREDITS_PER_IMAGE} credits a look needs.",
+            credits_charged=0,
+        )
         _update_session(supabase, session["id"], {"state": "DELIVERED"})
         return
 
@@ -870,6 +901,19 @@ def create_generation_for_session(supabase, session: dict) -> None:
             }
         ]
 
+    attempt.set_step("validation")
+    attempt.enrich(
+        attempt_log.inputs_builder(
+            shop_id,
+            hero_image_id=attempt_log.valid_uuid(hero_image_id),
+            slot_labels_garment_type_id=attempt_log.valid_uuid(session.get("folder_id")),
+            fabrics=[
+                {"fabric_image_id": item["fabric_image_id"], "apply_to": item["apply_to"], "sort_order": index}
+                for index, item in enumerate(normalized_fabrics)
+                if attempt_log.valid_uuid(item.get("fabric_image_id"))
+            ],
+        )
+    )
     folder_result = (
         supabase.table("garment_types")
         .select("id, name, look_prompt")
@@ -882,9 +926,12 @@ def create_generation_for_session(supabase, session: dict) -> None:
     if not folder_rows:
         raise RuntimeError("WhatsApp folder not found")
     folder_context = folder_rows[0]
+    attempt.update(garment_type_name=folder_context.get("name"))
 
+    attempt.set_step("prompt_build")
     look_prompt = folder_context.get("look_prompt")
-    if not look_prompt or not look_prompt.strip():
+    prompt_is_fallback = not look_prompt or not look_prompt.strip()
+    if prompt_is_fallback:
         print(
             f"[whatsapp_state] WARNING: garment {folder_context.get('id')} has no "
             "look_prompt configured; using fallback prompt"
@@ -897,7 +944,14 @@ def create_generation_for_session(supabase, session: dict) -> None:
         fabric_assignments=normalized_fabrics,
         image_count=1 + len(normalized_fabrics),
     )
+    attempt.update(prompt_text=prompt_used, model_id=settings.GEMINI_IMAGE_MODEL_ID)
+    attempt.enrich(
+        attempt_log.prompt_version_builder(
+            folder_context.get("id"), "look_prompt", folder_context.get("look_prompt"), prompt_is_fallback
+        )
+    )
 
+    attempt.set_step("db_save")
     result = (
         supabase.rpc(
             "create_generation_with_credit_debit_v2",
@@ -915,6 +969,7 @@ def create_generation_for_session(supabase, session: dict) -> None:
         raise RuntimeError("Generation RPC returned no rows")
 
     generation_id = str(rows[0]["generation_id"])
+    attempt.running(generation_id=generation_id, credits_charged=rows[0].get("credits_used"))
 
     (
         supabase.table("generations")
@@ -1010,11 +1065,12 @@ def _record_tryon_generation(
     result_mime: str,
     credits_used: int,
     prompt_used: str,
+    stored: Optional[dict] = None,
 ) -> Optional[str]:
     """Record a generations row for a WhatsApp try-on OUTPUT image, mirroring
     the LOOK path, so the try-on is discoverable (TV screen, history) by
     output_path. The customer's input selfie is never stored — only this
-    generated result image."""
+    generated result image. stored (optional) gets the output_path."""
     shop_id = session["shop_id"]
 
     if is_direct:
@@ -1052,6 +1108,8 @@ def _record_tryon_generation(
         data=result_bytes,
         content_type=result_mime or "image/jpeg",
     )
+    if stored is not None:
+        stored["output_path"] = output_path
 
     now_iso = _utc_now_iso()
     supabase.table("generations").insert(
@@ -1084,28 +1142,45 @@ def run_tryon_for_session(
     shop_id = session["shop_id"]
     settings = get_settings()
 
-    _update_session(supabase, session_id, {"state": "TRYON_PROCESSING"})
-    send_text(phone, _MSG_TRYON_RECEIVED)
-
     generation_id = session.get("active_generation_id")
     is_direct = not generation_id
     balance_before: Optional[int] = None
 
+    # Operations log (phone number and customer photo are never stored).
+    attempt = attempt_log.begin(
+        "tryon" if is_direct else "look_tryon",
+        "whatsapp_tryon" if is_direct else "whatsapp_tryon_from_look",
+        shop_id=shop_id,
+        user_label="WhatsApp",
+        device_label="WhatsApp",
+        model_id=settings.GEMINI_IMAGE_MODEL_ID,
+        garment_type_id=attempt_log.valid_uuid(session.get("folder_id")) if is_direct else None,
+        source_generation_id=None if is_direct else attempt_log.valid_uuid(generation_id),
+    )
+    ai_info: dict = {}
+
+    _update_session(supabase, session_id, {"state": "TRYON_PROCESSING"})
+    send_text(phone, _MSG_TRYON_RECEIVED)
+
     try:
+        attempt.set_step("validation")
         if not media_id:
             raise RuntimeError("Missing media_id for customer photo")
 
         # Customer photo lives only in these local variables for the
         # duration of this call — never written to storage, DB, or logs.
+        attempt.set_step("upload")
         customer_bytes, downloaded_mime = download_media(media_id)
         customer_mime = downloaded_mime or mime_type or "image/jpeg"
 
         if len(customer_bytes) > _MAX_MEDIA_BYTES:
+            attempt.set_step("validation")
             raise RuntimeError("Customer photo too large")
 
         customer_bytes, customer_mime = _downscale_image_if_needed(customer_bytes, customer_mime)
 
         if is_direct:
+            attempt.set_step("validation")
             folder_result = (
                 supabase.table("garment_types")
                 .select("id, name, tryon_prompt")
@@ -1129,7 +1204,21 @@ def run_tryon_for_session(
                 if pending_fabrics
                 else [{"apply_to": "suit_full_body"}]
             )
+            attempt.update(garment_type_name=folder_name)
+            attempt.enrich(
+                attempt_log.inputs_builder(
+                    shop_id,
+                    hero_image_id=attempt_log.valid_uuid(session.get("hero_image_id")),
+                    slot_labels_garment_type_id=attempt_log.valid_uuid(session.get("folder_id")),
+                    fabrics=[
+                        {"fabric_image_id": fabric_id, "apply_to": assignment["apply_to"], "sort_order": index}
+                        for index, (fabric_id, assignment) in enumerate(zip(fabric_image_ids, fabric_assignments))
+                        if attempt_log.valid_uuid(fabric_id)
+                    ],
+                )
+            )
 
+            attempt.set_step("upload")  # reading the stored hero / fabric images
             hero_bytes, hero_mime, fabric_parts = _prepare_direct_tryon_assets(
                 supabase, shop_id, session["hero_image_id"], fabric_image_ids
             )
@@ -1139,14 +1228,23 @@ def run_tryon_for_session(
                 for fabric_bytes, fabric_mime in fabric_parts
             ]
 
+            attempt.set_step("credits")
             balance_before = _get_shop_balance(supabase, shop_id)
             if balance_before < settings.CREDITS_PER_IMAGE:
                 send_text(phone, _MSG_NO_CREDITS)
+                attempt.fail(
+                    "credits",
+                    user_message=_MSG_NO_CREDITS,
+                    error=f"Balance {balance_before} is below the {settings.CREDITS_PER_IMAGE} credits a try-on needs.",
+                    credits_charged=0,
+                )
                 _update_session(supabase, session_id, {"state": "DELIVERED"})
                 return
 
+            attempt.set_step("prompt_build")
             tryon_prompt = folder_row.get("tryon_prompt")
-            if not tryon_prompt or not tryon_prompt.strip():
+            tryon_prompt_is_fallback = not tryon_prompt or not tryon_prompt.strip()
+            if tryon_prompt_is_fallback:
                 print(
                     f"[whatsapp_state] WARNING: garment {folder_row.get('id')} has no "
                     "tryon_prompt configured; using fallback prompt"
@@ -1159,38 +1257,62 @@ def run_tryon_for_session(
                 fabric_assignments=fabric_assignments,
                 image_count=1 + len(fabric_image_ids) + 1,
             )
+            attempt.update(prompt_text=prompt)
+            attempt.enrich(
+                attempt_log.prompt_version_builder(
+                    folder_row.get("id"), "tryon_prompt", folder_row.get("tryon_prompt"), tryon_prompt_is_fallback
+                )
+            )
             image_parts = [
                 (hero_bytes, hero_mime),
                 *fabric_parts,
                 (customer_bytes, customer_mime),
             ]
         else:
+            source_generation_id = attempt_log.valid_uuid(generation_id)
+            if source_generation_id:
+                attempt.enrich(attempt_log.inputs_builder(shop_id, source_generation_id=source_generation_id))
+            attempt.set_step("upload")  # reading the stored look
+            look_meta: dict = {}
             garment_bytes, folder_name, look_tryon_prompt = _prepare_tryon_assets_sync(
-                supabase, shop_id, generation_id
+                supabase, shop_id, generation_id, look_meta
             )
+            attempt.update(garment_type_id=look_meta.get("folder_id"), garment_type_name=folder_name)
             garment_bytes, garment_mime = _downscale_image_if_needed(garment_bytes, "image/jpeg")
 
             # No fallback here: a missing Look try-on prompt raises, which the
             # handler below logs and answers with the try-on failed message.
+            attempt.set_step("prompt_build")
             prompt = _build_look_tryon_prompt(look_tryon_prompt, garment_name=folder_name)
+            attempt.update(prompt_text=prompt)
+            attempt.enrich(
+                attempt_log.prompt_version_builder(
+                    look_meta.get("folder_id"), "look_tryon_prompt", look_tryon_prompt, False
+                )
+            )
             # Look first, customer last
             image_parts = [
                 (garment_bytes, garment_mime),
                 (customer_bytes, customer_mime),
             ]
 
+        attempt.set_step("ai_call")
         still_working_timer = threading.Timer(25.0, send_text, args=(phone, _MSG_TRYON_STILL_WORKING))
         still_working_timer.start()
         try:
-            result = _call_gemini_tryon(prompt=prompt, image_parts=image_parts)
+            result = _call_gemini_tryon(prompt=prompt, image_parts=image_parts, ai_info=ai_info)
         finally:
             still_working_timer.cancel()
         result_bytes = base64.b64decode(result.result_b64)
 
+        # No dedicated step for "sending on WhatsApp"; error_detail says so if it fails.
+        attempt.set_step("unknown")
         result_media_id = upload_media(result_bytes, result.result_mime)
         send_image_by_media_id(phone, result_media_id, caption=_MSG_TRYON_DELIVERED)
 
         tryon_generation_id: Optional[str] = None
+        record_warning: Optional[str] = None
+        stored_result: dict = {}
         try:
             tryon_generation_id = _record_tryon_generation(
                 supabase,
@@ -1201,29 +1323,60 @@ def run_tryon_for_session(
                 result_mime=result.result_mime,
                 credits_used=settings.CREDITS_PER_IMAGE if is_direct else 0,
                 prompt_used=prompt,
+                stored=stored_result,
             )
         except Exception as exc:
             print(f"[whatsapp_state] failed to record generations row for tryon session {session_id}: {exc}")
+            record_warning = f"Result was sent, but storing it failed: {attempt_log.describe_exception(exc)}"
     except Exception as exc:
         print(f"[whatsapp_state] tryon failed for session {session_id}: {exc}")
         send_text(phone, _MSG_TRYON_FAILED)
+        step = ai_info.get("no_image_step") or attempt.step
+        if step == "upload" and (
+            getattr(exc, "status_code", 500) < 500 or "not found" in str(getattr(exc, "detail", None) or exc).lower()
+        ):
+            step = "validation"  # a missing / not-ready input, not a failed read
+        error = exc
+        if attempt.step == "unknown":
+            error = f"Sending the try-on result on WhatsApp failed: {attempt_log.describe_exception(exc)}"
+        attempt.fail(
+            step,
+            user_message=_MSG_TRYON_FAILED,
+            error=error,
+            credits_charged=0,
+            **{key: value for key, value in ai_info.items() if key != "no_image_step"},
+        )
         _update_session(supabase, session_id, {"state": "WAITING_CUSTOMER_PHOTO"})
         return
 
     update_payload = {"state": "DELIVERED", "active_generation_id": tryon_generation_id}
+    outcome = {
+        "generation_id": tryon_generation_id,
+        # Set only if the image was uploaded (the generations row may still have failed).
+        "tryon_result_path": stored_result.get("output_path"),
+        "error_detail": record_warning,
+        **{key: value for key, value in ai_info.items() if key != "no_image_step"},
+    }
 
     if is_direct:
         new_balance = (balance_before or 0) - settings.CREDITS_PER_IMAGE
-        supabase.table("credit_ledger").insert(
-            {
-                "shop_id": shop_id,
-                "delta": -settings.CREDITS_PER_IMAGE,
-                "reason": "whatsapp_direct_tryon",
-                "balance_after": new_balance,
-            }
-        ).execute()
+        try:
+            supabase.table("credit_ledger").insert(
+                {
+                    "shop_id": shop_id,
+                    "delta": -settings.CREDITS_PER_IMAGE,
+                    "reason": "whatsapp_direct_tryon",
+                    "balance_after": new_balance,
+                }
+            ).execute()
+        except Exception as exc:
+            # handle_incoming answers this with _MSG_TECH_ERROR (the image was already sent).
+            attempt.fail("db_save", user_message=_MSG_TECH_ERROR, error=exc, credits_charged=0, **outcome)
+            raise
         update_payload["free_generations_used"] = int(session.get("free_generations_used") or 0) + 1
 
+    # credits_charged is the ledger delta inserted above (from-look try-ons are free).
+    attempt.succeed(credits_charged=settings.CREDITS_PER_IMAGE if is_direct else 0, **outcome)
     _update_session(supabase, session_id, update_payload)
 
 

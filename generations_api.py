@@ -3,9 +3,10 @@ import time
 from decimal import Decimal
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from pydantic import BaseModel, Field, field_validator
 
+import attempt_log
 from auth_deps import CurrentShopContext, get_current_shop_context
 from config import get_settings
 from image_thumbs import look_thumbnail_path
@@ -526,7 +527,7 @@ def _load_garment_fabric_slots(supabase, *, shop_id: str, folder_id: str) -> lis
     try:
         result = (
             supabase.table("garment_fabric_slots")
-            .select("apply_to, sort_order")
+            .select("label, apply_to, sort_order")
             .eq("folder_id", folder_id)
             .eq("shop_id", shop_id)
             .order("sort_order", desc=False)
@@ -973,10 +974,16 @@ def _apply_match_color_full_res(
 @router.post("")
 def create_generation(
     body: GenerationCreateRequest,
+    request: Request,
     current: CurrentShopContext = Depends(get_current_shop_context),
 ):
     supabase = get_supabase_admin_client()
     settings = get_settings()
+
+    # Operations log: the middleware opened the row; failures it sees use the step set here.
+    attempt = attempt_log.from_request(request)
+    attempt.set_step("validation")
+    attempt.update(shop_id=current.shop_id, user_id=current.auth_user_id, user_email=current.email)
 
     hero_image_id = _clean_id(body.hero_image_id, "hero_image_id")
 
@@ -990,11 +997,33 @@ def create_generation(
     fabric_slots = _load_garment_fabric_slots(
         supabase, shop_id=current.shop_id, folder_id=str(folder_context["id"])
     )
+    attempt.update(garment_type_id=folder_context.get("id"), garment_type_name=folder_context.get("name"))
     normalized_fabrics = _normalize_generation_fabrics(body, fabric_slots)
     primary_fabric_image_id = normalized_fabrics[0]["fabric_image_id"]
     image_count = 1 + len(normalized_fabrics)
+    slot_labels = {
+        str(slot.get("apply_to") or "").strip().casefold(): slot.get("label") for slot in fabric_slots
+    }
+    attempt.enrich(
+        attempt_log.inputs_builder(
+            current.shop_id,
+            hero_image_id=hero_image_id,
+            fabrics=[
+                {
+                    "fabric_image_id": fabric["fabric_image_id"],
+                    "apply_to": fabric["apply_to"],
+                    "slot_label": slot_labels.get(str(fabric["apply_to"]).strip().casefold()),
+                    "sort_order": index,
+                }
+                for index, fabric in enumerate(normalized_fabrics)
+            ],
+        )
+    )
+
+    attempt.set_step("prompt_build")
     look_prompt = folder_context.get("look_prompt")
-    if not look_prompt or not look_prompt.strip():
+    prompt_is_fallback = not look_prompt or not look_prompt.strip()
+    if prompt_is_fallback:
         print(
             f"[generations_api] WARNING: garment {folder_context.get('id')} has no "
             "look_prompt configured; using fallback prompt"
@@ -1007,7 +1036,14 @@ def create_generation(
         fabric_assignments=normalized_fabrics,
         image_count=image_count,
     )
+    attempt.update(prompt_text=prompt_used, model_id=settings.GEMINI_IMAGE_MODEL_ID)
+    attempt.enrich(
+        attempt_log.prompt_version_builder(
+            folder_context.get("id"), "look_prompt", folder_context.get("look_prompt"), prompt_is_fallback
+        )
+    )
 
+    attempt.set_step("db_save")
     try:
         result = (
             supabase.rpc(
@@ -1023,6 +1059,14 @@ def create_generation(
         )
     except Exception as exc:
         message = str(exc).lower()
+        # The response stays exactly as before; only the logged step depends on the cause.
+        attempt.note_error(exc)
+        if "insufficient credits" in message:
+            attempt.set_step("credits")
+        elif "not found" in message or "apply_to" in message or "suit_full_body" in message or (
+            "count must be between" in message or "fabric_code is required" in message
+        ):
+            attempt.set_step("validation")
 
         if "insufficient credits" in message:
             raise HTTPException(
@@ -1075,6 +1119,8 @@ def create_generation(
 
     row = rows[0]
     generation_id = row["generation_id"]
+    # Charged by the RPC above; the worker writes the final status.
+    attempt.running(generation_id=generation_id, credits_charged=row.get("credits_used"))
 
     prompt_saved = True
     prompt_save_warning = None

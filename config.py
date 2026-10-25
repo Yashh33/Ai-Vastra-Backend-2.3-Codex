@@ -55,6 +55,16 @@ class Settings(BaseSettings):
         return self.SUPABASE_URL.rstrip("/") + "/auth/v1/.well-known/jwks.json"
 
 
+# AI cost for the Operations log: USD per 1M tokens (input, output), from Google's
+# Gemini API pricing page (Gemini 3.1 Flash Image, standard paid tier). A model not
+# listed here gets ai_cost_inr = null; never a guess.
+GEMINI_PRICES_USD_PER_1M: dict[str, tuple[float, float]] = {
+    "gemini-3.1-flash-image-preview": (0.50, 60.0),
+    "gemini-3.1-flash-image": (0.50, 60.0),
+}
+USD_TO_INR = 84.0
+
+
 @lru_cache
 def get_settings() -> Settings:
     return Settings()

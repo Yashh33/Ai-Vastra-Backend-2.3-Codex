@@ -2,8 +2,9 @@
 import io
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 from uuid import uuid4
 
 import anyio.to_thread
@@ -15,12 +16,14 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Request,
     Response,
     UploadFile,
     status,
 )
 from pydantic import BaseModel, Field
 
+import attempt_log
 from auth_deps import CurrentShopContext, get_current_shop_context
 from config import get_settings
 from prompting import DEFAULT_TRYON_PROMPT, fill_prompt_placeholders
@@ -192,9 +195,34 @@ def _resolve_tryon_prompt(
     )
 
 
+_NO_IMAGE_DETAIL = "Gemini did not return an image for try-on"
+
+
+def _first_inline_image(response) -> Optional[Any]:
+    # A blocked request comes back with no candidates or no content: same 502 as "no image".
+    candidates = getattr(response, "candidates", None) or []
+    content = getattr(candidates[0], "content", None) if candidates else None
+    for part in getattr(content, "parts", None) or []:
+        if part.inline_data is not None:
+            return part.inline_data
+    return None
+
+
+def _note_ai_response(ai_info: Optional[dict], response, model_id: str) -> None:
+    """Operations log: AI timing, usage and finish reason (ai_info is filled in place)."""
+    if ai_info is None:
+        return
+    ai_info["ai_finished_at"] = attempt_log.utc_now()
+    if response is not None:
+        ai_info.update(attempt_log.ai_response_fields(response, model_id))
+        if _first_inline_image(response) is None:
+            ai_info["no_image_step"] = attempt_log.no_image_step(response)
+
+
 def _call_gemini_tryon(
     prompt: str,
     image_parts: list[tuple[bytes, str]],
+    ai_info: Optional[dict] = None,
 ) -> TryOnResponse:
     settings = get_settings()
     client = _get_gemini_client()
@@ -205,32 +233,37 @@ def _call_gemini_tryon(
             types.Part.from_bytes(data=img_bytes, mime_type=mime_type)
         )
 
-    response = client.models.generate_content(
-        model=settings.GEMINI_IMAGE_MODEL_ID,
-        contents=contents_parts,
-        config=types.GenerateContentConfig(
-            response_modalities=["IMAGE", "TEXT"],
-        ),
-    )
+    if ai_info is not None:
+        ai_info["ai_started_at"] = attempt_log.utc_now()
+    response = None
+    try:
+        response = client.models.generate_content(
+            model=settings.GEMINI_IMAGE_MODEL_ID,
+            contents=contents_parts,
+            config=types.GenerateContentConfig(
+                response_modalities=["IMAGE", "TEXT"],
+            ),
+        )
+    finally:
+        _note_ai_response(ai_info, response, settings.GEMINI_IMAGE_MODEL_ID)
 
-    for part in response.candidates[0].content.parts:
-        if part.inline_data is not None:
-            return TryOnResponse(
-                result_b64=base64.b64encode(
-                    part.inline_data.data
-                ).decode("utf-8"),
-                result_mime=part.inline_data.mime_type or "image/png",
-            )
+    inline = _first_inline_image(response)
+    if inline is not None:
+        return TryOnResponse(
+            result_b64=base64.b64encode(inline.data).decode("utf-8"),
+            result_mime=inline.mime_type or "image/png",
+        )
 
     raise HTTPException(
         status_code=status.HTTP_502_BAD_GATEWAY,
-        detail="Gemini did not return an image for try-on",
+        detail=_NO_IMAGE_DETAIL,
     )
 
 
 async def _call_gemini_tryon_async(
     prompt: str,
     image_parts: list[tuple[bytes, str]],
+    ai_info: Optional[dict] = None,
 ) -> Tuple[bytes, str]:
     settings = get_settings()
     client = _get_gemini_client()
@@ -241,21 +274,92 @@ async def _call_gemini_tryon_async(
             types.Part.from_bytes(data=img_bytes, mime_type=mime_type)
         )
 
-    response = await client.aio.models.generate_content(
-        model=settings.GEMINI_IMAGE_MODEL_ID,
-        contents=contents_parts,
-        config=types.GenerateContentConfig(
-            response_modalities=["IMAGE", "TEXT"],
-        ),
-    )
+    if ai_info is not None:
+        ai_info["ai_started_at"] = attempt_log.utc_now()
+    response = None
+    try:
+        response = await client.aio.models.generate_content(
+            model=settings.GEMINI_IMAGE_MODEL_ID,
+            contents=contents_parts,
+            config=types.GenerateContentConfig(
+                response_modalities=["IMAGE", "TEXT"],
+            ),
+        )
+    finally:
+        _note_ai_response(ai_info, response, settings.GEMINI_IMAGE_MODEL_ID)
 
-    for part in response.candidates[0].content.parts:
-        if part.inline_data is not None:
-            return part.inline_data.data, part.inline_data.mime_type or "image/png"
+    inline = _first_inline_image(response)
+    if inline is not None:
+        return inline.data, inline.mime_type or "image/png"
 
     raise HTTPException(
         status_code=status.HTTP_502_BAD_GATEWAY,
-        detail="Gemini did not return an image for try-on",
+        detail=_NO_IMAGE_DETAIL,
+    )
+
+
+# --- Operations log helpers ---------------------------------------------------
+
+def _start_attempt(request: Request, current: CurrentShopContext, **fields: Any):
+    attempt = attempt_log.from_request(request)
+    attempt.set_step("validation")
+    attempt.update(
+        shop_id=current.shop_id,
+        user_id=current.auth_user_id,
+        user_email=current.email,
+        model_id=get_settings().GEMINI_IMAGE_MODEL_ID,
+        **fields,
+    )
+    return attempt
+
+
+@contextmanager
+def _input_stage(attempt):
+    """Loading stored inputs: 4xx = validation, 502 = a stored image could not be read."""
+    attempt.set_step("validation")
+    try:
+        yield
+    except HTTPException as exc:
+        attempt.note_error(exc)
+        if exc.status_code == status.HTTP_502_BAD_GATEWAY:
+            attempt.set_step("upload")
+        raise
+    except Exception as exc:
+        attempt.note_error(exc)
+        attempt.set_step("unknown")
+        raise
+
+
+def _log_prompt(
+    attempt, prompt: str, *, garment_type_id: Optional[str], prompt_field: str, template: Optional[str]
+) -> None:
+    attempt.update(prompt_text=prompt)
+    attempt.enrich(
+        attempt_log.prompt_version_builder(
+            garment_type_id,
+            prompt_field,
+            template,
+            # Only the try-on prompt has a built-in fallback; look try-on has none.
+            prompt_field == "tryon_prompt" and not (template or "").strip(),
+        )
+    )
+
+
+def _ai_fields(ai_info: dict) -> dict:
+    return {key: value for key, value in ai_info.items() if key != "no_image_step"}
+
+
+def _log_ai_failure(attempt, ai_info: dict, exc: Exception) -> None:
+    if isinstance(exc, HTTPException):
+        message, code = exc.detail, exc.status_code
+    else:
+        message, code = "Internal Server Error", status.HTTP_500_INTERNAL_SERVER_ERROR
+    attempt.fail(
+        ai_info.get("no_image_step") or "ai_call",
+        user_message=message if isinstance(message, str) else str(message),
+        error=exc,
+        http_status=code,
+        **_ai_fields(ai_info),
     )
 
 
@@ -282,10 +386,10 @@ def _build_look_tryon_prompt(look_tryon_prompt: Optional[str], *, garment_name: 
 
 
 def _prepare_tryon_assets_sync(
-    supabase, shop_id: str, generation_id: str
+    supabase, shop_id: str, generation_id: str, meta: Optional[dict] = None
 ) -> Tuple[bytes, Optional[str], Optional[str]]:
     """Blocking DB + storage prep phase for try-on from a look.
-    Returns (look_bytes, garment_name, look_tryon_prompt)."""
+    Returns (look_bytes, garment_name, look_tryon_prompt). meta (optional) gets folder_id."""
     gen_result = (
         supabase.table("generations")
         .select("id, shop_id, output_path, folder_id, status")
@@ -311,6 +415,8 @@ def _prepare_tryon_assets_sync(
     folder_name: Optional[str] = None
     look_tryon_prompt: Optional[str] = None
     folder_id = gen.get("folder_id")
+    if meta is not None:
+        meta["folder_id"] = folder_id
     if folder_id:
         folder_result = (
             supabase.table("garment_types")
@@ -495,6 +601,7 @@ def _prepare_tryon_multi_assets_sync(
 def tryon(
     body: TryOnRequest,
     background_tasks: BackgroundTasks,
+    request: Request,
     current: CurrentShopContext = Depends(get_current_shop_context),
 ):
     """
@@ -504,6 +611,8 @@ def tryon(
     Returns composite image as base64. Nothing is stored.
     """
     supabase = get_supabase_admin_client()
+    source_generation_id = attempt_log.valid_uuid(body.generation_id)
+    attempt = _start_attempt(request, current, source_generation_id=source_generation_id)
 
     if not body.consent_confirmed:
         raise HTTPException(
@@ -511,6 +620,8 @@ def tryon(
             detail=_CONSENT_REJECTED_DETAIL,
         )
     background_tasks.add_task(_log_tryon_consent, supabase, current.shop_id)
+    if source_generation_id:
+        attempt.enrich(attempt_log.inputs_builder(current.shop_id, source_generation_id=source_generation_id))
 
     # Fetch the generation and verify it belongs to this shop
     gen_result = (
@@ -551,34 +662,50 @@ def tryon(
         if folder_rows:
             folder_name = folder_rows[0].get("name")
             folder_look_tryon_prompt = folder_rows[0].get("look_tryon_prompt")
+    attempt.update(garment_type_id=folder_id, garment_type_name=folder_name)
 
     # Build prompt (400 if the garment type has no Look try-on prompt)
+    attempt.set_step("prompt_build")
     prompt = _build_look_tryon_prompt(folder_look_tryon_prompt, garment_name=folder_name)
+    _log_prompt(
+        attempt, prompt, garment_type_id=folder_id, prompt_field="look_tryon_prompt", template=folder_look_tryon_prompt
+    )
 
     # Download garment image (Stage 1 output)
-    garment_bytes = _fetch_storage_bytes(
-        supabase,
-        "generated-outputs",
-        gen["output_path"],
-    )
+    with _input_stage(attempt):
+        garment_bytes = _fetch_storage_bytes(
+            supabase,
+            "generated-outputs",
+            gen["output_path"],
+        )
 
-    # Decode customer photo from base64 (never stored)
-    customer_bytes = _decode_photo(body.customer_photo_b64)
+        # Decode customer photo from base64 (never stored)
+        customer_bytes = _decode_photo(body.customer_photo_b64)
 
     # Call Gemini: look first, customer last
-    return _call_gemini_tryon(
-        prompt=prompt,
-        image_parts=[
-            (garment_bytes, "image/jpeg"),
-            (customer_bytes, body.customer_photo_mime),
-        ],
-    )
+    attempt.set_step("ai_call")
+    ai_info: dict = {}
+    try:
+        result = _call_gemini_tryon(
+            prompt=prompt,
+            image_parts=[
+                (garment_bytes, "image/jpeg"),
+                (customer_bytes, body.customer_photo_mime),
+            ],
+            ai_info=ai_info,
+        )
+    except Exception as exc:
+        _log_ai_failure(attempt, ai_info, exc)
+        raise
+    attempt.succeed(**_ai_fields(ai_info))
+    return result
 
 
 @router.post("/quick", response_model=TryOnResponse)
 def tryon_quick(
     body: TryOnQuickRequest,
     background_tasks: BackgroundTasks,
+    request: Request,
     current: CurrentShopContext = Depends(get_current_shop_context),
 ):
     """
@@ -588,6 +715,7 @@ def tryon_quick(
     Returns composite image as base64. Nothing is stored.
     """
     supabase = get_supabase_admin_client()
+    attempt = _start_attempt(request, current, garment_type_id=attempt_log.valid_uuid(body.folder_id))
 
     if not body.consent_confirmed:
         raise HTTPException(
@@ -617,6 +745,7 @@ def tryon_quick(
     folder_name = folder.get("name")
     default_hero_id = folder.get("default_hero_image_id")
     folder_tryon_prompt = folder.get("tryon_prompt")
+    attempt.update(garment_type_name=folder_name)
 
     if not default_hero_id:
         raise HTTPException(
@@ -644,7 +773,7 @@ def tryon_quick(
     # Fetch this garment's fabric slots (multi-fabric garments, e.g. saree)
     slots_result = (
         supabase.table("garment_fabric_slots")
-        .select("id, apply_to, sort_order")
+        .select("id, label, apply_to, sort_order")
         .eq("folder_id", body.folder_id.strip())
         .order("sort_order")
         .limit(6)
@@ -680,24 +809,43 @@ def tryon_quick(
             )
         fabric_images.append(fabric_rows[0])
 
-    # Download hero and fabric images from storage
-    hero_bytes = _fetch_storage_bytes(
-        supabase,
-        "hero-images",
-        hero["storage_path"],
+    slot_labels = [slot.get("label") for slot in slot_rows] if slot_rows and body.fabric_image_ids else []
+    attempt.update(
+        hero_path=hero.get("storage_path"),
+        hero_colour_corrected=False,
+        fabric_mode="multi" if len(fabric_images) > 1 else "single",
+        fabric_inputs=[
+            {
+                "slot_label": slot_labels[index] if index < len(slot_labels) else None,
+                "apply_to": fabric_assignments[index]["apply_to"] if index < len(fabric_assignments) else None,
+                "sort_order": index,
+                "storage_path": fabric.get("storage_path"),
+                "colour_corrected": False,
+            }
+            for index, fabric in enumerate(fabric_images)
+        ],
     )
-    fabric_image_parts = [
-        (
-            _fetch_storage_bytes(supabase, "fabric-images", fabric["storage_path"]),
-            fabric.get("mime_type") or "image/jpeg",
-        )
-        for fabric in fabric_images
-    ]
 
-    # Decode customer photo (never stored)
-    customer_bytes = _decode_photo(body.customer_photo_b64)
+    # Download hero and fabric images from storage
+    with _input_stage(attempt):
+        hero_bytes = _fetch_storage_bytes(
+            supabase,
+            "hero-images",
+            hero["storage_path"],
+        )
+        fabric_image_parts = [
+            (
+                _fetch_storage_bytes(supabase, "fabric-images", fabric["storage_path"]),
+                fabric.get("mime_type") or "image/jpeg",
+            )
+            for fabric in fabric_images
+        ]
+
+        # Decode customer photo (never stored)
+        customer_bytes = _decode_photo(body.customer_photo_b64)
 
     # Build combined prompt
+    attempt.set_step("prompt_build")
     prompt = _resolve_tryon_prompt(
         folder_tryon_prompt,
         garment_name=folder_name,
@@ -705,21 +853,34 @@ def tryon_quick(
         image_count=1 + len(fabric_ids) + 1,
         context=f"folder {body.folder_id.strip()}",
     )
+    _log_prompt(
+        attempt, prompt, garment_type_id=folder.get("id"), prompt_field="tryon_prompt", template=folder_tryon_prompt
+    )
 
     # Call Gemini: hero first, then fabrics in slot order, customer last
-    return _call_gemini_tryon(
-        prompt=prompt,
-        image_parts=[
-            (hero_bytes, hero.get("mime_type") or "image/jpeg"),
-            *fabric_image_parts,
-            (customer_bytes, body.customer_photo_mime),
-        ],
-    )
+    attempt.set_step("ai_call")
+    ai_info: dict = {}
+    try:
+        result = _call_gemini_tryon(
+            prompt=prompt,
+            image_parts=[
+                (hero_bytes, hero.get("mime_type") or "image/jpeg"),
+                *fabric_image_parts,
+                (customer_bytes, body.customer_photo_mime),
+            ],
+            ai_info=ai_info,
+        )
+    except Exception as exc:
+        _log_ai_failure(attempt, ai_info, exc)
+        raise
+    attempt.succeed(**_ai_fields(ai_info))
+    return result
 
 
 @router.post("/v2")
 async def tryon_v2(
     background_tasks: BackgroundTasks,
+    request: Request,
     generation_id: str = Form(...),
     consent_confirmed: bool = Form(...),
     customer_photo: UploadFile = File(...),
@@ -730,6 +891,8 @@ async def tryon_v2(
     instead of a base64 JSON payload.
     """
     supabase = get_supabase_admin_client()
+    source_generation_id = attempt_log.valid_uuid(generation_id)
+    attempt = _start_attempt(request, current, source_generation_id=source_generation_id)
 
     if not consent_confirmed:
         raise HTTPException(
@@ -737,16 +900,31 @@ async def tryon_v2(
             detail=_CONSENT_REJECTED_DETAIL,
         )
     background_tasks.add_task(_log_tryon_consent, supabase, current.shop_id)
+    if source_generation_id:
+        attempt.enrich(attempt_log.inputs_builder(current.shop_id, source_generation_id=source_generation_id))
 
-    garment_bytes, folder_name, folder_look_tryon_prompt = await anyio.to_thread.run_sync(
-        _prepare_tryon_assets_sync,
-        supabase,
-        current.shop_id,
-        generation_id.strip(),
+    look_meta: dict = {}
+    with _input_stage(attempt):
+        garment_bytes, folder_name, folder_look_tryon_prompt = await anyio.to_thread.run_sync(
+            _prepare_tryon_assets_sync,
+            supabase,
+            current.shop_id,
+            generation_id.strip(),
+            look_meta,
+        )
+    attempt.update(garment_type_id=look_meta.get("folder_id"), garment_type_name=folder_name)
+
+    attempt.set_step("prompt_build")
+    prompt = _build_look_tryon_prompt(folder_look_tryon_prompt, garment_name=folder_name)
+    _log_prompt(
+        attempt,
+        prompt,
+        garment_type_id=look_meta.get("folder_id"),
+        prompt_field="look_tryon_prompt",
+        template=folder_look_tryon_prompt,
     )
 
-    prompt = _build_look_tryon_prompt(folder_look_tryon_prompt, garment_name=folder_name)
-
+    attempt.set_step("upload")
     customer_bytes = await customer_photo.read()
     customer_mime = customer_photo.content_type or "image/jpeg"
 
@@ -754,13 +932,21 @@ async def tryon_v2(
     garment_bytes, garment_mime = _downscale_image_if_needed(garment_bytes, "image/jpeg")
 
     # Look first, customer last
-    image_bytes, result_mime = await _call_gemini_tryon_async(
-        prompt=prompt,
-        image_parts=[
-            (garment_bytes, garment_mime),
-            (customer_bytes, customer_mime),
-        ],
-    )
+    attempt.set_step("ai_call")
+    ai_info: dict = {}
+    try:
+        image_bytes, result_mime = await _call_gemini_tryon_async(
+            prompt=prompt,
+            image_parts=[
+                (garment_bytes, garment_mime),
+                (customer_bytes, customer_mime),
+            ],
+            ai_info=ai_info,
+        )
+    except Exception as exc:
+        _log_ai_failure(attempt, ai_info, exc)
+        raise
+    attempt.succeed(**_ai_fields(ai_info))
 
     return Response(content=image_bytes, media_type=result_mime)
 
@@ -768,6 +954,7 @@ async def tryon_v2(
 @router.post("/quick/v2")
 async def tryon_quick_v2(
     background_tasks: BackgroundTasks,
+    request: Request,
     fabric_image_id: str = Form(...),
     folder_id: str = Form(...),
     consent_confirmed: bool = Form(...),
@@ -779,6 +966,8 @@ async def tryon_quick_v2(
     bytes instead of a base64 JSON payload.
     """
     supabase = get_supabase_admin_client()
+    garment_type_id = attempt_log.valid_uuid(folder_id)
+    attempt = _start_attempt(request, current, garment_type_id=garment_type_id, fabric_mode="single")
 
     if not consent_confirmed:
         raise HTTPException(
@@ -786,22 +975,34 @@ async def tryon_quick_v2(
             detail=_CONSENT_REJECTED_DETAIL,
         )
     background_tasks.add_task(_log_tryon_consent, supabase, current.shop_id)
+    if garment_type_id and attempt_log.valid_uuid(fabric_image_id):
+        attempt.enrich(
+            attempt_log.inputs_builder(
+                current.shop_id,
+                hero_from_garment_type_id=garment_type_id,
+                slot_labels_garment_type_id=garment_type_id,
+                fabrics=[{"fabric_image_id": fabric_image_id.strip(), "apply_to": "suit_full_body", "sort_order": 0}],
+            )
+        )
 
-    (
-        hero_bytes,
-        hero_mime,
-        fabric_bytes,
-        fabric_mime,
-        folder_name,
-        folder_tryon_prompt,
-    ) = await anyio.to_thread.run_sync(
-        _prepare_tryon_quick_assets_sync,
-        supabase,
-        current.shop_id,
-        folder_id.strip(),
-        fabric_image_id.strip(),
-    )
+    with _input_stage(attempt):
+        (
+            hero_bytes,
+            hero_mime,
+            fabric_bytes,
+            fabric_mime,
+            folder_name,
+            folder_tryon_prompt,
+        ) = await anyio.to_thread.run_sync(
+            _prepare_tryon_quick_assets_sync,
+            supabase,
+            current.shop_id,
+            folder_id.strip(),
+            fabric_image_id.strip(),
+        )
+    attempt.update(garment_type_name=folder_name)
 
+    attempt.set_step("upload")
     customer_bytes = await customer_photo.read()
     customer_mime = customer_photo.content_type or "image/jpeg"
 
@@ -809,6 +1010,7 @@ async def tryon_quick_v2(
     fabric_bytes, fabric_mime = _downscale_image_if_needed(fabric_bytes, fabric_mime)
     customer_bytes, customer_mime = _downscale_image_if_needed(customer_bytes, customer_mime)
 
+    attempt.set_step("prompt_build")
     prompt = _resolve_tryon_prompt(
         folder_tryon_prompt,
         garment_name=folder_name,
@@ -816,15 +1018,24 @@ async def tryon_quick_v2(
         image_count=3,
         context=f"folder {folder_id.strip()}",
     )
+    _log_prompt(attempt, prompt, garment_type_id=garment_type_id, prompt_field="tryon_prompt", template=folder_tryon_prompt)
 
-    image_bytes, result_mime = await _call_gemini_tryon_async(
-        prompt=prompt,
-        image_parts=[
-            (hero_bytes, hero_mime),
-            (fabric_bytes, fabric_mime),
-            (customer_bytes, customer_mime),
-        ],
-    )
+    attempt.set_step("ai_call")
+    ai_info: dict = {}
+    try:
+        image_bytes, result_mime = await _call_gemini_tryon_async(
+            prompt=prompt,
+            image_parts=[
+                (hero_bytes, hero_mime),
+                (fabric_bytes, fabric_mime),
+                (customer_bytes, customer_mime),
+            ],
+            ai_info=ai_info,
+        )
+    except Exception as exc:
+        _log_ai_failure(attempt, ai_info, exc)
+        raise
+    attempt.succeed(**_ai_fields(ai_info))
 
     return Response(content=image_bytes, media_type=result_mime)
 
@@ -832,6 +1043,7 @@ async def tryon_quick_v2(
 @router.post("/multi/v2")
 async def tryon_multi_v2(
     background_tasks: BackgroundTasks,
+    request: Request,
     hero_image_id: str = Form(...),
     folder_id: str = Form(...),
     consent_confirmed: str = Form(...),
@@ -851,6 +1063,8 @@ async def tryon_multi_v2(
     Returns raw binary image bytes instead of a base64 JSON payload.
     """
     supabase = get_supabase_admin_client()
+    garment_type_id = attempt_log.valid_uuid(folder_id)
+    attempt = _start_attempt(request, current, garment_type_id=garment_type_id)
 
     if consent_confirmed.strip().lower() != "true":
         raise HTTPException(
@@ -876,22 +1090,37 @@ async def tryon_multi_v2(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="At least one fabric is required",
         )
+    if all(attempt_log.valid_uuid(fabric_id) for fabric_id, _ in fabric_pairs):
+        attempt.enrich(
+            attempt_log.inputs_builder(
+                current.shop_id,
+                hero_image_id=attempt_log.valid_uuid(hero_image_id),
+                slot_labels_garment_type_id=garment_type_id,
+                fabrics=[
+                    {"fabric_image_id": fabric_id, "apply_to": apply_to, "sort_order": index}
+                    for index, (fabric_id, apply_to) in enumerate(fabric_pairs)
+                ],
+            )
+        )
 
-    (
-        hero_bytes,
-        hero_mime,
-        fabric_assets,
-        folder_name,
-        folder_tryon_prompt,
-    ) = await anyio.to_thread.run_sync(
-        _prepare_tryon_multi_assets_sync,
-        supabase,
-        current.shop_id,
-        hero_image_id.strip(),
-        folder_id.strip(),
-        [fabric_id for fabric_id, _ in fabric_pairs],
-    )
+    with _input_stage(attempt):
+        (
+            hero_bytes,
+            hero_mime,
+            fabric_assets,
+            folder_name,
+            folder_tryon_prompt,
+        ) = await anyio.to_thread.run_sync(
+            _prepare_tryon_multi_assets_sync,
+            supabase,
+            current.shop_id,
+            hero_image_id.strip(),
+            folder_id.strip(),
+            [fabric_id for fabric_id, _ in fabric_pairs],
+        )
+    attempt.update(garment_type_name=folder_name)
 
+    attempt.set_step("upload")
     customer_bytes = await customer_photo.read()
     customer_mime = customer_photo.content_type or "image/jpeg"
 
@@ -907,6 +1136,7 @@ async def tryon_multi_v2(
         for idx, (_, apply_to) in enumerate(fabric_pairs)
     ]
 
+    attempt.set_step("prompt_build")
     prompt = _resolve_tryon_prompt(
         folder_tryon_prompt,
         garment_name=folder_name,
@@ -914,13 +1144,22 @@ async def tryon_multi_v2(
         image_count=1 + len(fabric_pairs) + 1,
         context=f"folder {folder_id.strip()}",
     )
+    _log_prompt(attempt, prompt, garment_type_id=garment_type_id, prompt_field="tryon_prompt", template=folder_tryon_prompt)
 
     image_parts = [(hero_bytes, hero_mime), *fabric_assets, (customer_bytes, customer_mime)]
 
-    image_bytes, result_mime = await _call_gemini_tryon_async(
-        prompt=prompt,
-        image_parts=image_parts,
-    )
+    attempt.set_step("ai_call")
+    ai_info: dict = {}
+    try:
+        image_bytes, result_mime = await _call_gemini_tryon_async(
+            prompt=prompt,
+            image_parts=image_parts,
+            ai_info=ai_info,
+        )
+    except Exception as exc:
+        _log_ai_failure(attempt, ai_info, exc)
+        raise
+    attempt.succeed(**_ai_fields(ai_info))
 
     return Response(content=image_bytes, media_type=result_mime)
 
@@ -935,6 +1174,7 @@ def _upload_generated_output(supabase, *, bucket: str, path: str, data: bytes, c
 
 @router.post("/push-to-screen")
 async def push_tryon_to_screen(
+    request: Request,
     result_image: UploadFile = File(...),
     folder_id: str = Form(...),
     fabric_image_id: Optional[str] = Form(default=None),
@@ -998,5 +1238,10 @@ async def push_tryon_to_screen(
             "updated_at": now_iso,
         }
     ).execute()
+
+    # Optional X-Client-Request-Id (the try-on's id): attach the stored result to its log row.
+    attempt_log.link_tryon_result(
+        request.headers.get("x-client-request-id"), shop_id, output_path, generation_id=new_generation_id
+    )
 
     return {"generation_id": new_generation_id, "live": True}

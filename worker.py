@@ -13,6 +13,7 @@ from google import genai
 from google.genai import types
 from supabase import create_client
 
+import attempt_log
 from config import get_settings
 from image_thumbs import look_thumbnail_path
 
@@ -313,7 +314,10 @@ def call_gemini_image_generation(
     hero_image_bytes: bytes,
     hero_mime_type: str,
     fabric_inputs: list[dict[str, Any]],
+    ai_info: Optional[dict] = None,
 ) -> Tuple[bytes, str, Optional[str]]:
+    """ai_info (optional) is filled in place for the Operations log: AI times, usage, cost,
+    finish reason and, when no image came back, whether the model blocked it."""
     contents: list[Any] = [
         prompt,
         types.Part.from_bytes(
@@ -330,19 +334,32 @@ def call_gemini_image_generation(
             )
         )
 
-    response = client.models.generate_content(
-        model=model_id,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            response_modalities=["IMAGE"],
-            image_config=types.ImageConfig(
-            aspect_ratio="3:4",
-            image_size="2K",
+    if ai_info is not None:
+        ai_info.setdefault("ai_started_at", attempt_log.utc_now())
+    try:
+        response = client.models.generate_content(
+            model=model_id,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                response_modalities=["IMAGE"],
+                image_config=types.ImageConfig(
+                aspect_ratio="3:4",
+                image_size="2K",
+                ),
             ),
-        ),
-    )
+        )
+    finally:
+        if ai_info is not None:
+            ai_info["ai_finished_at"] = attempt_log.utc_now()
+    if ai_info is not None:
+        ai_info.update(attempt_log.ai_response_fields(response, model_id))
 
-    image_bytes, output_mime_type = extract_first_image_from_gemini_response(response)
+    try:
+        image_bytes, output_mime_type = extract_first_image_from_gemini_response(response)
+    except RuntimeError:
+        if ai_info is not None:
+            ai_info["no_image_step"] = attempt_log.no_image_step(response)
+        raise
 
     # Keep existing DB column name `nano_request_id` for now (schema already created).
     external_request_id = (
@@ -437,7 +454,12 @@ def process_job(gemini_client: genai.Client, settings, job: dict) -> None:
     generation_id = str(job["id"])
     shop_id = str(job["shop_id"])
 
+    # Operations log: finishes the attempt the API (web or WhatsApp) started. Never raises.
+    attempt = attempt_log.WorkerAttempt(generation_id)
+    ai_info: dict[str, Any] = {}
+
     try:
+        attempt.step = "upload"  # reading the stored input images
         assets = call_with_retry(lambda: fetch_generation_assets(get_supabase(), job))
 
         hero = assets["hero"]
@@ -478,6 +500,9 @@ def process_job(gemini_client: genai.Client, settings, job: dict) -> None:
             )
 
         print(f"[worker] calling Gemini model: {settings.GEMINI_IMAGE_MODEL_ID}")
+        attempt.step = "ai_call"
+        ai_info["ai_started_at"] = attempt_log.utc_now()
+        attempt.update(ai_started_at=ai_info["ai_started_at"], model_id=settings.GEMINI_IMAGE_MODEL_ID)
         output_bytes, output_mime, external_request_id = call_gemini_image_generation(
             gemini_client,
             settings.GEMINI_IMAGE_MODEL_ID,
@@ -485,12 +510,14 @@ def process_job(gemini_client: genai.Client, settings, job: dict) -> None:
             hero_bytes,
             hero_mime,
             fabric_inputs,
+            ai_info=ai_info,
         )
 
         ext = guess_output_extension(output_mime)
         output_path = f"{shop_id}/{generation_id}/output_v{int(time.time())}.{ext}"
 
         print(f"[worker] uploading generated output: {output_path}")
+        attempt.step = "storage_save"
         call_with_retry(
             lambda: get_supabase().storage.from_("generated-outputs").upload(
                 output_path,
@@ -519,6 +546,7 @@ def process_job(gemini_client: genai.Client, settings, job: dict) -> None:
         except Exception as exc:
             print(f"[worker] WARNING: failed to generate/upload thumbnail for {output_path}: {exc}")
 
+        attempt.step = "db_save"
         call_with_retry(
             lambda: mark_generation_done(
                 get_supabase(),
@@ -530,12 +558,19 @@ def process_job(gemini_client: genai.Client, settings, job: dict) -> None:
         )
 
         print(f"[worker] generation done: {generation_id}")
+        attempt.succeed(output_path=output_path, **_attempt_ai_fields(ai_info))
 
     except Exception as exc:
         error_message = short_error_message(exc)
         print(f"[worker] generation failed: {generation_id} :: {error_message}")
         traceback.print_exc()
 
+        failed_step = ai_info.get("no_image_step") or attempt.step
+        if failed_step == "upload" and "prompt_used is empty" in str(exc):
+            failed_step = "prompt_build"  # raised by fetch_generation_assets
+
+        # null = the refund call itself failed, so the log cannot say what was refunded.
+        credits_refunded: Optional[int] = None
         try:
             refund_info = mark_generation_failed_with_refund(
                 get_supabase(),
@@ -549,10 +584,40 @@ def process_job(gemini_client: genai.Client, settings, job: dict) -> None:
                 f"refund_amount={refund_info.get('refund_amount')} "
                 f"balance_after={refund_info.get('balance_after')}"
             )
+            credits_refunded = int(refund_info.get("refund_amount") or 0) if refund_info.get("refunded") else 0
 
         except Exception as mark_exc:
             print(f"[worker] failed to mark generation as failed: {mark_exc}")
             traceback.print_exc()
+
+        attempt.fail(failed_step, error=exc, credits_refunded=credits_refunded, **_attempt_ai_fields(ai_info))
+
+
+def _attempt_ai_fields(ai_info: dict) -> dict:
+    return {key: value for key, value in ai_info.items() if key != "no_image_step"}
+
+
+_SWEEP_EVERY_SECONDS = 120
+_RETENTION_EVERY_SECONDS = 24 * 60 * 60
+
+
+def run_attempt_log_housekeeping(state: dict) -> None:
+    """Operations log upkeep from the main loop: mark stuck attempts timed out (every 2 min)
+    and delete log rows older than 90 days (daily; rows only, never images). Never raises."""
+    now = time.monotonic()
+    try:
+        if now - state.get("last_sweep", float("-inf")) >= _SWEEP_EVERY_SECONDS:
+            state["last_sweep"] = now
+            swept = attempt_log.sweep_timed_out()
+            if swept:
+                print(f"[worker] attempt log: marked {swept} stuck attempt(s) timed out")
+        if now - state.get("last_retention", float("-inf")) >= _RETENTION_EVERY_SECONDS:
+            state["last_retention"] = now
+            deleted = attempt_log.delete_older_than_retention()
+            if deleted:
+                print(f"[worker] attempt log: deleted {deleted} row(s) older than 90 days")
+    except Exception as exc:
+        print(f"[worker] attempt log housekeeping failed: {short_error_message(exc)}")
 
 
 def main() -> None:
@@ -562,6 +627,9 @@ def main() -> None:
         raise RuntimeError("Set a real GEMINI_API_KEY in backend/.env before running worker")
 
     gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+    # Worker log writes are synchronous (durable before the next job), on each thread's own client.
+    attempt_log.configure(client_factory=get_supabase, sync=True)
+    housekeeping_state: dict = {}
 
     print("[worker] started")
     print(f"[worker] poll interval: {settings.WORKER_POLL_INTERVAL_SECONDS}s")
@@ -600,6 +668,8 @@ def main() -> None:
                     except Exception as exc:
                         print(f"[worker] job future raised: {short_error_message(exc)}")
                         traceback.print_exc()
+
+                run_attempt_log_housekeeping(housekeeping_state)
 
             except Exception as exc:
                 print(f"[worker] loop error: {short_error_message(exc)}")
