@@ -231,16 +231,30 @@ export function OperationsDetailPage() {
 
             {attempt.fabric_inputs.map((fabric, index) => (
               <figure className="ops-figure" key={`${fabric.storage_path ?? "fabric"}-${index}`}>
-                <ImageBox
-                  url={fabric.url}
-                  alt={fabric.slot_label || "Fabric"}
-                  missingText={fabric.storage_path ? "image no longer in storage" : NOT_RECORDED}
-                  onOpen={setFullImage}
-                />
+                {fabric.default_fabric ? (
+                  <div
+                    className={`ops-default-swatch tiny${fabric.default_fabric === "black" ? " is-black" : ""}`}
+                  >
+                    {fabric.fabric_label || `Default ${fabric.default_fabric}`}
+                  </div>
+                ) : (
+                  <ImageBox
+                    url={fabric.url}
+                    alt={fabric.slot_label || "Fabric"}
+                    missingText={fabric.storage_path ? "image no longer in storage" : NOT_RECORDED}
+                    onOpen={setFullImage}
+                  />
+                )}
                 <figcaption className="tiny">
                   <strong>{fabric.slot_label || fabric.apply_to || `Fabric ${index + 1}`}</strong>
                   {fabric.slot_label && fabric.apply_to ? <span className="muted"> ({fabric.apply_to})</span> : null}
                   <br />
+                  {fabric.default_fabric ? (
+                    <>
+                      fabric: {fabric.fabric_label || `Default ${fabric.default_fabric}`} (built-in)
+                      <br />
+                    </>
+                  ) : null}
                   colour fixed: {yesNo(fabric.colour_corrected)}
                 </figcaption>
               </figure>

@@ -24,6 +24,7 @@ from fastapi import (
 from pydantic import BaseModel, Field
 
 import attempt_log
+import default_fabrics
 from auth_deps import CurrentShopContext, get_current_shop_context
 from config import get_settings
 from prompting import DEFAULT_TRYON_PROMPT, fill_prompt_placeholders
@@ -57,6 +58,8 @@ class TryOnRequest(BaseModel):
 class TryOnQuickRequest(BaseModel):
     fabric_image_id: str = Field(..., min_length=1)
     fabric_image_ids: Optional[list[str]] = Field(default=None)
+    # Optional slots left empty: {"<slot apply_to>": "white" | "black"} (missing -> white).
+    default_fabrics: Optional[dict[str, Any]] = None
     folder_id: str = Field(..., min_length=1)
     customer_photo_b64: str = Field(..., min_length=1)
     customer_photo_mime: str = Field(
@@ -521,14 +524,28 @@ def _prepare_tryon_quick_assets_sync(
     )
 
 
+def _load_fabric_slots_sync(supabase, shop_id: str, folder_id: str) -> list[dict]:
+    """This shop's fabric slots for a garment type, in sort order (empty apply_to skipped)."""
+    result = (
+        supabase.table("garment_fabric_slots")
+        .select("label, apply_to, sort_order")
+        .eq("folder_id", folder_id)
+        .eq("shop_id", shop_id)
+        .order("sort_order")
+        .execute()
+    )
+    return [row for row in (getattr(result, "data", None) or []) if str(row.get("apply_to") or "").strip()]
+
+
 def _prepare_tryon_multi_assets_sync(
     supabase,
     shop_id: str,
     hero_image_id: str,
     folder_id: str,
-    fabric_image_ids: list[str],
+    fabric_entries: list[dict],
 ) -> Tuple[bytes, str, list[Tuple[bytes, str]], Optional[str], Optional[str]]:
-    """Blocking DB + storage prep phase for /tryon/multi/v2. Runs off the event loop."""
+    """Blocking DB + storage prep phase for /tryon/multi/v2. Runs off the event loop.
+    fabric_entries: {"fabric_image_id"} or a built-in {"default_fabric"}, in image order."""
     folder_result = (
         supabase.table("garment_types")
         .select("id, name, tryon_prompt")
@@ -569,7 +586,11 @@ def _prepare_tryon_multi_assets_sync(
     hero_mime = str(hero.get("mime_type") or "image/jpeg")
 
     fabric_assets: list[Tuple[bytes, str]] = []
-    for fabric_image_id in fabric_image_ids:
+    for entry in fabric_entries:
+        if entry.get("default_fabric"):
+            fabric_assets.append(default_fabrics.load(entry["default_fabric"]))
+            continue
+        fabric_image_id = entry["fabric_image_id"]
         fabric_result = (
             supabase.table("fabric_images")
             .select("id, storage_path, mime_type")
@@ -783,16 +804,33 @@ def tryon_quick(
 
     if slot_rows and body.fabric_image_ids:
         fabric_ids = [fid.strip() for fid in body.fabric_image_ids if fid and fid.strip()]
-        fabric_assignments = [
-            {"apply_to": slot.get("apply_to", "unknown")} for slot in slot_rows[: len(fabric_ids)]
-        ]
+        # Ids fill the slots in order; the first slot is required, later empty slots get
+        # a built-in default fabric in their place.
+        slot_entries = default_fabrics.resolve_slot_entries(
+            slot_rows,
+            {
+                str(slot.get("apply_to") or "").strip().casefold(): {
+                    "fabric_image_id": fabric_id,
+                    "apply_to": slot.get("apply_to", "unknown"),
+                }
+                for slot, fabric_id in zip(slot_rows, fabric_ids)
+            },
+            default_fabrics.parse_choices(body.default_fabrics),
+        )
+        fabric_assignments = [{"apply_to": entry["apply_to"]} for entry in slot_entries]
+        # More ids than slots: kept as before (sent, without a slot assignment).
+        fabric_entries = slot_entries + [{"fabric_image_id": fid} for fid in fabric_ids[len(slot_rows):]]
     else:
-        fabric_ids = [body.fabric_image_id.strip()]
+        fabric_entries = [{"fabric_image_id": body.fabric_image_id.strip()}]
         fabric_assignments = [{"apply_to": "suit_full_body"}]
 
-    # Fetch fabric image storage paths, in the given order
+    # Fetch fabric image storage paths, in the given order (defaults have none)
     fabric_images: list[dict] = []
-    for fabric_id in fabric_ids:
+    for entry in fabric_entries:
+        if entry.get("default_fabric"):
+            fabric_images.append({"default_fabric": entry["default_fabric"]})
+            continue
+        fabric_id = entry["fabric_image_id"]
         fabric_result = (
             supabase.table("fabric_images")
             .select("id, storage_path, mime_type")
@@ -821,12 +859,23 @@ def tryon_quick(
                 "sort_order": index,
                 "storage_path": fabric.get("storage_path"),
                 "colour_corrected": False,
+                **(
+                    {
+                        "default_fabric": fabric["default_fabric"],
+                        "fabric_label": default_fabrics.label(fabric["default_fabric"]),
+                    }
+                    if fabric.get("default_fabric")
+                    else {}
+                ),
             }
             for index, fabric in enumerate(fabric_images)
         ],
     )
+    default_fabrics.ensure_available(
+        [fabric["default_fabric"] for fabric in fabric_images if fabric.get("default_fabric")]
+    )
 
-    # Download hero and fabric images from storage
+    # Download hero and fabric images from storage (built-in defaults come from disk)
     with _input_stage(attempt):
         hero_bytes = _fetch_storage_bytes(
             supabase,
@@ -834,7 +883,9 @@ def tryon_quick(
             hero["storage_path"],
         )
         fabric_image_parts = [
-            (
+            default_fabrics.load(fabric["default_fabric"])
+            if fabric.get("default_fabric")
+            else (
                 _fetch_storage_bytes(supabase, "fabric-images", fabric["storage_path"]),
                 fabric.get("mime_type") or "image/jpeg",
             )
@@ -850,7 +901,7 @@ def tryon_quick(
         folder_tryon_prompt,
         garment_name=folder_name,
         fabric_assignments=fabric_assignments,
-        image_count=1 + len(fabric_ids) + 1,
+        image_count=1 + len(fabric_images) + 1,
         context=f"folder {body.folder_id.strip()}",
     )
     _log_prompt(
@@ -1056,6 +1107,8 @@ async def tryon_multi_v2(
     apply_to_3: Optional[str] = Form(default=None),
     fabric_image_id_4: Optional[str] = Form(default=None),
     apply_to_4: Optional[str] = Form(default=None),
+    # JSON object {"<slot apply_to>": "white" | "black"} for optional slots left empty.
+    default_fabrics_json: Optional[str] = Form(default=None, alias="default_fabrics"),
     current: CurrentShopContext = Depends(get_current_shop_context),
 ):
     """
@@ -1090,15 +1143,43 @@ async def tryon_multi_v2(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="At least one fabric is required",
         )
-    if all(attempt_log.valid_uuid(fabric_id) for fabric_id, _ in fabric_pairs):
+
+    fabric_entries = [{"fabric_image_id": fabric_id, "apply_to": apply_to} for fabric_id, apply_to in fabric_pairs]
+    with _input_stage(attempt):
+        slot_rows = await anyio.to_thread.run_sync(
+            _load_fabric_slots_sync, supabase, current.shop_id, folder_id.strip()
+        )
+        slot_keys = {str(slot["apply_to"]).strip().casefold() for slot in slot_rows}
+        pair_keys = [apply_to.casefold() for _, apply_to in fabric_pairs]
+        # Garments with slots, when every fabric names one of them: slot order, the first
+        # slot required, later empty slots filled with a built-in default fabric. Anything
+        # else keeps the previous behaviour exactly.
+        if slot_rows and len(set(pair_keys)) == len(pair_keys) and all(key in slot_keys for key in pair_keys):
+            fabric_entries = default_fabrics.resolve_slot_entries(
+                slot_rows,
+                {entry["apply_to"].casefold(): entry for entry in fabric_entries},
+                default_fabrics.parse_choices(default_fabrics_json),
+            )
+            default_fabrics.ensure_available(
+                [entry["default_fabric"] for entry in fabric_entries if entry.get("default_fabric")]
+            )
+
+    if all(
+        attempt_log.valid_uuid(entry["fabric_image_id"]) for entry in fabric_entries if not entry.get("default_fabric")
+    ):
         attempt.enrich(
             attempt_log.inputs_builder(
                 current.shop_id,
                 hero_image_id=attempt_log.valid_uuid(hero_image_id),
                 slot_labels_garment_type_id=garment_type_id,
                 fabrics=[
-                    {"fabric_image_id": fabric_id, "apply_to": apply_to, "sort_order": index}
-                    for index, (fabric_id, apply_to) in enumerate(fabric_pairs)
+                    {
+                        "fabric_image_id": entry.get("fabric_image_id"),
+                        "default_fabric": entry.get("default_fabric"),
+                        "apply_to": entry["apply_to"],
+                        "sort_order": index,
+                    }
+                    for index, entry in enumerate(fabric_entries)
                 ],
             )
         )
@@ -1116,7 +1197,7 @@ async def tryon_multi_v2(
             current.shop_id,
             hero_image_id.strip(),
             folder_id.strip(),
-            [fabric_id for fabric_id, _ in fabric_pairs],
+            fabric_entries,
         )
     attempt.update(garment_type_name=folder_name)
 
@@ -1132,8 +1213,8 @@ async def tryon_multi_v2(
     ]
 
     fabric_assignments = [
-        {"apply_to": apply_to, "image_index": idx}
-        for idx, (_, apply_to) in enumerate(fabric_pairs)
+        {"apply_to": entry["apply_to"], "image_index": idx}
+        for idx, entry in enumerate(fabric_entries)
     ]
 
     attempt.set_step("prompt_build")
@@ -1141,7 +1222,7 @@ async def tryon_multi_v2(
         folder_tryon_prompt,
         garment_name=folder_name,
         fabric_assignments=fabric_assignments,
-        image_count=1 + len(fabric_pairs) + 1,
+        image_count=1 + len(fabric_entries) + 1,
         context=f"folder {folder_id.strip()}",
     )
     _log_prompt(attempt, prompt, garment_type_id=garment_type_id, prompt_field="tryon_prompt", template=folder_tryon_prompt)

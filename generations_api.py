@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Upl
 from pydantic import BaseModel, Field, field_validator
 
 import attempt_log
+import default_fabrics
 from auth_deps import CurrentShopContext, get_current_shop_context
 from config import get_settings
 from image_thumbs import look_thumbnail_path
@@ -224,6 +225,8 @@ class GenerationCreateRequest(LookDetailsFields):
     # Backward-compatible single-fabric field (older clients).
     fabric_image_id: Optional[str] = Field(default=None, min_length=1)
     fabrics: list[GenerationCreateFabricItem] = Field(default_factory=list)
+    # Optional slots left empty: {"<slot apply_to>": "white" | "black"} (missing -> white).
+    default_fabrics: Optional[dict[str, Any]] = None
 
 
 class GenerationMatchColorEdit(BaseModel):
@@ -276,15 +279,21 @@ def _format_apply_to_label(value: str) -> str:
     return mapping.get(key, value or "Garment")
 
 
-def _build_fabric_summary_label(fabrics: list[dict[str, Any]]) -> Optional[str]:
+def _build_fabric_summary_label(
+    fabrics: list[dict[str, Any]], default_slots: Optional[list[Any]] = None
+) -> Optional[str]:
     if not fabrics:
         return None
 
     parts: list[str] = []
     ordered = sorted(fabrics, key=lambda item: int(item.get("sort_order") or 0))
+    ordered = default_fabrics.merge_into(ordered, default_slots)
 
     for item in ordered:
         apply_to_label = _format_apply_to_label(str(item.get("apply_to") or ""))
+        if item.get("default_fabric"):
+            parts.append(f"{apply_to_label}: {default_fabrics.label(item['default_fabric'])}")
+            continue
         fabric_code = _clean_optional_text(item.get("fabric_code"))
 
         if fabric_code:
@@ -364,7 +373,10 @@ def _attach_generation_fabric_metadata(
         next_row = dict(row)
         if fabrics:
             next_row["generation_fabrics"] = fabrics
-            summary = _build_fabric_summary_label(fabrics)
+            default_slots = row.get("default_fabric_slots")
+            summary = _build_fabric_summary_label(
+                fabrics, default_slots if isinstance(default_slots, list) else None
+            )
             if summary:
                 next_row["fabric_summary_label"] = summary
 
@@ -547,15 +559,20 @@ def _load_garment_fabric_slots(supabase, *, shop_id: str, folder_id: str) -> lis
 
 
 def _normalize_slot_fabrics(
-    raw_fabrics: list["GenerationCreateFabricItem"], slots: list[dict[str, Any]]
+    raw_fabrics: list["GenerationCreateFabricItem"],
+    slots: list[dict[str, Any]],
+    raw_defaults: Optional[dict[str, Any]] = None,
 ) -> list[dict[str, Any]]:
     """Validate fabrics against the garment type's own slots (apply_to is free
-    text set in the admin panel) and return them in slot order."""
+    text set in the admin panel) and return one entry per slot, in slot order.
+    The first slot needs a real fabric; an empty optional slot gets a default
+    entry ({"default_fabric": "white"|"black", ...}) in its place."""
     slot_position = {
         str(slot["apply_to"]).strip().casefold(): index for index, slot in enumerate(slots)
     }
+    choices = default_fabrics.parse_choices(raw_defaults)
 
-    positioned: list[tuple[int, dict[str, Any]]] = []
+    provided: dict[str, dict[str, Any]] = {}
     seen: set[str] = set()
 
     for item in raw_fabrics:
@@ -578,21 +595,15 @@ def _normalize_slot_fabrics(
             )
         seen.add(key)
 
-        positioned.append(
-            (
-                slot_position[key],
-                {
-                    "fabric_image_id": fabric_image_id,
-                    "apply_to": apply_to,
-                    "fabric_code": _clean_optional_text(item.fabric_code) or "unknown",
-                    "fabric_color": _clean_optional_text(item.fabric_color),
-                    "fabric_scale": _clean_optional_text(item.fabric_scale),
-                },
-            )
-        )
+        provided[key] = {
+            "fabric_image_id": fabric_image_id,
+            "apply_to": apply_to,
+            "fabric_code": _clean_optional_text(item.fabric_code) or "unknown",
+            "fabric_color": _clean_optional_text(item.fabric_color),
+            "fabric_scale": _clean_optional_text(item.fabric_scale),
+        }
 
-    positioned.sort(key=lambda pair: pair[0])
-    return [fabric for _, fabric in positioned]
+    return default_fabrics.resolve_slot_entries(slots, provided, choices)
 
 
 def _normalize_generation_fabrics(
@@ -628,7 +639,7 @@ def _normalize_generation_fabrics(
     # Garment types with admin-configured slots validate against those slots.
     # The old single-fabric field keeps working as before even on such types.
     if slots and not is_legacy_single:
-        return _normalize_slot_fabrics(raw_fabrics, slots)
+        return _normalize_slot_fabrics(raw_fabrics, slots, body.default_fabrics)
 
     # No slots: legacy behaviour, unchanged.
     normalized: list[dict[str, Any]] = []
@@ -998,9 +1009,14 @@ def create_generation(
         supabase, shop_id=current.shop_id, folder_id=str(folder_context["id"])
     )
     attempt.update(garment_type_id=folder_context.get("id"), garment_type_name=folder_context.get("name"))
-    normalized_fabrics = _normalize_generation_fabrics(body, fabric_slots)
+    # One entry per fabric image, in image order; built-in defaults included.
+    all_fabrics = _normalize_generation_fabrics(body, fabric_slots)
+    # Only real fabrics go to the debit RPC / generation_fabrics; defaults are recorded on
+    # the generation row (default_fabric_slots) and put back in place by the worker.
+    normalized_fabrics = [fabric for fabric in all_fabrics if not fabric.get("default_fabric")]
+    default_slots = default_fabrics.default_slots_record(all_fabrics)
     primary_fabric_image_id = normalized_fabrics[0]["fabric_image_id"]
-    image_count = 1 + len(normalized_fabrics)
+    image_count = 1 + len(all_fabrics)
     slot_labels = {
         str(slot.get("apply_to") or "").strip().casefold(): slot.get("label") for slot in fabric_slots
     }
@@ -1010,15 +1026,18 @@ def create_generation(
             hero_image_id=hero_image_id,
             fabrics=[
                 {
-                    "fabric_image_id": fabric["fabric_image_id"],
+                    "fabric_image_id": fabric.get("fabric_image_id"),
+                    "default_fabric": fabric.get("default_fabric"),
                     "apply_to": fabric["apply_to"],
                     "slot_label": slot_labels.get(str(fabric["apply_to"]).strip().casefold()),
                     "sort_order": index,
                 }
-                for index, fabric in enumerate(normalized_fabrics)
+                for index, fabric in enumerate(all_fabrics)
             ],
         )
     )
+    # Before the debit: a missing built-in image fails here, with nothing charged.
+    default_fabrics.ensure_available([item["default_fabric"] for item in default_slots])
 
     attempt.set_step("prompt_build")
     look_prompt = folder_context.get("look_prompt")
@@ -1033,7 +1052,7 @@ def create_generation(
     prompt_used = fill_prompt_placeholders(
         look_prompt,
         garment_name=folder_context.get("name"),
-        fabric_assignments=normalized_fabrics,
+        fabric_assignments=all_fabrics,
         image_count=image_count,
     )
     attempt.update(prompt_text=prompt_used, model_id=settings.GEMINI_IMAGE_MODEL_ID)
@@ -1137,6 +1156,9 @@ def create_generation(
                     "generation_type": "look",
                     "model_used": settings.GEMINI_IMAGE_MODEL_ID,
                     **body.details_payload(only_set=False),
+                    # Saved with prompt_used: if this update fails the worker fails the job
+                    # ("prompt_used is empty") and refunds, never runs without its defaults.
+                    **({"default_fabric_slots": default_slots} if default_slots else {}),
                 }
             )
             .eq("id", generation_id)
@@ -1203,31 +1225,41 @@ def list_generations(
         fabric_color=fabric_color,
     )
 
-    query = (
-        supabase.table("generations")
-        .select(
-            "id, shop_id, hero_image_id, fabric_image_id, folder_id, status, "
-            "output_path, credits_used, created_at, started_at, completed_at"
-        )
-        .eq("shop_id", current.shop_id)
-        .order("created_at", desc=True)
+    if filtered_generation_ids is not None and not filtered_generation_ids:
+        return []
+
+    base_columns = (
+        "id, shop_id, hero_image_id, fabric_image_id, folder_id, status, "
+        "output_path, credits_used, created_at, started_at, completed_at"
     )
 
-    if status_filter:
-        query = query.eq("status", status_filter)
+    def _build_query(columns: str):
+        query = (
+            supabase.table("generations")
+            .select(columns)
+            .eq("shop_id", current.shop_id)
+            .order("created_at", desc=True)
+        )
 
-    if folder_id and folder_id.strip():
-        query = query.eq("folder_id", folder_id.strip())
+        if status_filter:
+            query = query.eq("status", status_filter)
 
-    if filtered_generation_ids is not None:
-        if not filtered_generation_ids:
-            return []
-        query = query.in_("id", filtered_generation_ids)
+        if folder_id and folder_id.strip():
+            query = query.eq("folder_id", folder_id.strip())
 
-    query = query.range(offset, offset + limit - 1)
+        if filtered_generation_ids is not None:
+            query = query.in_("id", filtered_generation_ids)
+
+        return query.range(offset, offset + limit - 1)
 
     try:
-        result = query.execute()
+        try:
+            result = _build_query(f"{base_columns}, default_fabric_slots").execute()
+        except Exception as exc:
+            # Backward-compatible fallback until the default_fabric_slots column exists.
+            if "default_fabric_slots" not in str(exc).lower():
+                raise
+            result = _build_query(base_columns).execute()
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

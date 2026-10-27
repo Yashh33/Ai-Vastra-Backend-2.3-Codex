@@ -591,6 +591,8 @@ def inputs_builder(
     slot_labels_garment_type_id: Optional[str] = None,
 ) -> Callable[[Any], dict]:
     """fabrics: [{fabric_image_id, apply_to, slot_label?, sort_order}] -> fabric_inputs with storage paths.
+    A built-in default slot is {default_fabric: "white"|"black", ...} with no fabric_image_id:
+    it is recorded as "Default white" / "Default black" with no storage path.
     Missing slot labels are looked up from slot_labels_garment_type_id's fabric slots.
     Hero: by hero image id, or a garment type's default hero, or (look try-on) the source look.
     The customer photo is never part of this."""
@@ -620,9 +622,14 @@ def inputs_builder(
                     "slot_label": f.get("slot_label") or labels.get(str(f.get("apply_to") or "").strip().casefold()),
                     "apply_to": f.get("apply_to"),
                     "sort_order": f.get("sort_order"),
-                    "storage_path": paths.get(str(f.get("fabric_image_id"))),
+                    "storage_path": None if f.get("default_fabric") else paths.get(str(f.get("fabric_image_id"))),
                     # There is no colour-fix feature for fabric images.
                     "colour_corrected": False,
+                    **(
+                        {"default_fabric": f["default_fabric"], "fabric_label": f"Default {f['default_fabric']}"}
+                        if f.get("default_fabric")
+                        else {}
+                    ),
                 }
                 for f in fabrics
             ]

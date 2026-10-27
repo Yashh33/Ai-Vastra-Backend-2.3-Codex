@@ -14,6 +14,7 @@ from google.genai import types
 from supabase import create_client
 
 import attempt_log
+import default_fabrics
 from config import get_settings
 from image_thumbs import look_thumbnail_path
 
@@ -153,14 +154,24 @@ def fetch_generation_assets(supabase, job: dict) -> dict:
     hero_image_id = str(job["hero_image_id"])
     legacy_fabric_image_id = str(job["fabric_image_id"]) if job.get("fabric_image_id") else ""
 
-    gen_result = (
-        supabase.table("generations")
-        .select("id, shop_id, hero_image_id, fabric_image_id, prompt_used")
-        .eq("id", generation_id)
-        .eq("shop_id", shop_id)
-        .limit(1)
-        .execute()
-    )
+    def _fetch_generation(columns: str):
+        return (
+            supabase.table("generations")
+            .select(columns)
+            .eq("id", generation_id)
+            .eq("shop_id", shop_id)
+            .limit(1)
+            .execute()
+        )
+
+    base_columns = "id, shop_id, hero_image_id, fabric_image_id, prompt_used"
+    try:
+        gen_result = _fetch_generation(f"{base_columns}, default_fabric_slots")
+    except Exception as exc:
+        # Backward-compatible fallback until the default_fabric_slots column exists.
+        if "default_fabric_slots" not in str(exc).lower():
+            raise
+        gen_result = _fetch_generation(base_columns)
     gen_rows = getattr(gen_result, "data", None) or []
     if not gen_rows:
         raise RuntimeError("Generation row not found after claim")
@@ -256,6 +267,11 @@ def fetch_generation_assets(supabase, job: dict) -> dict:
     prompt_used = generation.get("prompt_used")
     if not prompt_used:
         raise RuntimeError("prompt_used is empty; create generation again after Step 21")
+
+    # Optional slots left empty use a built-in plain fabric, in that slot's image position.
+    default_slots = generation.get("default_fabric_slots")
+    if isinstance(default_slots, list) and default_slots:
+        mapped_fabrics = default_fabrics.merge_into(mapped_fabrics, default_slots)
 
     return {
         "generation": generation,
@@ -477,9 +493,21 @@ def process_job(gemini_client: genai.Client, settings, job: dict) -> None:
 
         fabric_inputs: list[dict[str, Any]] = []
         for idx, fabric in enumerate(fabrics, start=1):
+            apply_to = str(fabric.get("apply_to") or "unknown")
+
+            if fabric.get("default_fabric"):
+                print(
+                    "[worker] using built-in default fabric "
+                    f"{idx}/{len(fabrics)} apply_to={apply_to}: {fabric['default_fabric']}"
+                )
+                # A missing file raises here: the job fails and is refunded like any other failure.
+                fabric_bytes, fabric_mime = default_fabrics.load(str(fabric["default_fabric"]))
+                fabric_bytes, fabric_mime = downscale_image_if_needed(fabric_bytes, fabric_mime)
+                fabric_inputs.append({"bytes": fabric_bytes, "mime_type": fabric_mime, "apply_to": apply_to})
+                continue
+
             fabric_path = str(fabric["storage_path"])
             fabric_mime = str(fabric.get("mime_type") or "image/jpeg")
-            apply_to = str(fabric.get("apply_to") or "unknown")
 
             print(
                 "[worker] downloading fabric image "

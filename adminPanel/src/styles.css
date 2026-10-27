@@ -588,6 +588,25 @@ input[type="number"] {
   padding: 0.5rem;
 }
 
+/* Built-in plain fabric used for an empty optional slot. */
+.ops-default-swatch {
+  width: 150px;
+  height: 190px;
+  border: 1px solid #d8d1c6;
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  text-align: center;
+  padding: 0.5rem;
+  background: #ffffff;
+  color: #3a332b;
+}
+
+.ops-default-swatch.is-black {
+  background: #111111;
+  color: #f4efe8;
+}
+
 .ops-small-btn {
   min-height: auto;
   padding: 0.15rem 0.55rem;

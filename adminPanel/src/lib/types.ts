@@ -183,6 +183,9 @@ export type AttemptFabricInput = {
   storage_path: string | null;
   colour_corrected: boolean | null;
   url: string | null;
+  // Built-in plain fabric used for an empty optional slot ("white" | "black"); no storage path.
+  default_fabric?: string | null;
+  fabric_label?: string | null;
 };
 
 export type AttemptDetail = Omit<AttemptRow, "has_result" | "thumb_url"> & {
