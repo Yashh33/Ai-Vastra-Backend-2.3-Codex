@@ -4,13 +4,16 @@ import { BrowserRouter } from "react-router-dom";
 
 import App from "./App";
 import { AdminAuthProvider } from "./lib/auth";
+import { CurrentShopProvider } from "./lib/currentShop";
 import "./styles.css";
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <BrowserRouter>
       <AdminAuthProvider>
-        <App />
+        <CurrentShopProvider>
+          <App />
+        </CurrentShopProvider>
       </AdminAuthProvider>
     </BrowserRouter>
   </React.StrictMode>

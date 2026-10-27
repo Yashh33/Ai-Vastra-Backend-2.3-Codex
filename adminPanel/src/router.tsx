@@ -1,41 +1,24 @@
-import { Link, Navigate, Route, Routes, useLocation } from "react-router-dom";
+import { Navigate, Route, Routes } from "react-router-dom";
 
+import { AppShell } from "./components/AppShell";
 import { useAdminAuth } from "./lib/auth";
-import { AdminDashboardPage } from "./pages/AdminDashboardPage";
 import { AdminLoginPage } from "./pages/AdminLoginPage";
-import { AdminShopDetailPage } from "./pages/AdminShopDetailPage";
 import { OperationsDetailPage } from "./pages/OperationsDetailPage";
 import { OperationsPage } from "./pages/OperationsPage";
-
-/** Top tabs: Setup = shops and catalog (unchanged pages), Operations = generation logs. */
-function TopNav() {
-  const { pathname } = useLocation();
-  const inOperations = pathname.startsWith("/operations");
-  return (
-    <nav className="top-nav" aria-label="Sections">
-      <div className="top-nav-inner">
-        <Link className={inOperations ? "tab" : "tab tab-active"} to="/">
-          Setup
-        </Link>
-        <Link className={inOperations ? "tab tab-active" : "tab"} to="/operations">
-          Operations
-        </Link>
-      </div>
-    </nav>
-  );
-}
+import { PromptLibraryPage } from "./pages/PromptLibraryPage";
+import { ShopsPage } from "./pages/ShopsPage";
+import { BulkLooksPage } from "./pages/shop/BulkLooksPage";
+import { CreditsPage } from "./pages/shop/CreditsPage";
+import { GarmentsPage } from "./pages/shop/GarmentsPage";
+import { ShopLayout } from "./pages/shop/ShopLayout";
+import { ShopSettingsPage } from "./pages/shop/ShopSettingsPage";
 
 function RequireAdminAuth({ children }: { children: React.ReactNode }) {
   const { isAuthenticated } = useAdminAuth();
   if (!isAuthenticated) {
     return <Navigate to="/login" replace />;
   }
-  return (
-    <>
-      <TopNav />
-      {children}
-    </>
-  );
+  return <>{children}</>;
 }
 
 function LoginRoute() {
@@ -52,40 +35,27 @@ export function AppRouter() {
       <Route path="/login" element={<LoginRoute />} />
 
       <Route
-        path="/"
         element={
           <RequireAdminAuth>
-            <AdminDashboardPage />
+            <AppShell />
           </RequireAdminAuth>
         }
-      />
+      >
+        <Route index element={<ShopsPage />} />
 
-      <Route
-        path="/shops/:shopId"
-        element={
-          <RequireAdminAuth>
-            <AdminShopDetailPage />
-          </RequireAdminAuth>
-        }
-      />
+        <Route path="shops/:shopId" element={<ShopLayout />}>
+          <Route index element={<Navigate to="garments" replace />} />
+          <Route path="garments" element={<GarmentsPage />} />
+          <Route path="bulk-looks" element={<BulkLooksPage />} />
+          <Route path="settings" element={<ShopSettingsPage />} />
+          <Route path="credits" element={<CreditsPage />} />
+          <Route path="*" element={<Navigate to="garments" replace />} />
+        </Route>
 
-      <Route
-        path="/operations"
-        element={
-          <RequireAdminAuth>
-            <OperationsPage />
-          </RequireAdminAuth>
-        }
-      />
-
-      <Route
-        path="/operations/:attemptId"
-        element={
-          <RequireAdminAuth>
-            <OperationsDetailPage />
-          </RequireAdminAuth>
-        }
-      />
+        <Route path="prompt-library" element={<PromptLibraryPage />} />
+        <Route path="operations" element={<OperationsPage />} />
+        <Route path="operations/:attemptId" element={<OperationsDetailPage />} />
+      </Route>
 
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

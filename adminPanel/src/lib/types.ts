@@ -20,6 +20,8 @@ export type AdminShopRow = {
   status?: string | null;
   whatsapp_multifabric_enabled?: boolean;
   screen_slug?: string | null;
+  /** Active garment types (GET /admin/shops only). */
+  garments_count?: number;
 };
 
 export type AdminCreateShopResponse = {
@@ -51,6 +53,16 @@ export type AdminFolderRow = {
   tryon_prompt?: string | null;
   look_tryon_prompt?: string | null;
   category?: string;
+  // Prompt library (sql/2026-10-28_prompt_library.sql). prompt_set null = own prompts.
+  prompt_set?: PromptSetKey | null;
+  prompt_set_version?: number | null;
+  design_text?: string | null;
+  keep_text?: string | null;
+  part1_name?: string | null;
+  part1_sam_word?: string | null;
+  part2_name?: string | null;
+  part2_sam_word?: string | null;
+  part2_default?: "white" | "black" | null;
 };
 
 export type PromptVersion = {
@@ -75,6 +87,7 @@ export type AdminHeroImageRow = {
   width: number | null;
   height: number | null;
   signed_url?: string | null;
+  thumb_signed_url?: string | null;
   created_at: string;
 };
 
@@ -221,3 +234,65 @@ export type AttemptDetail = Omit<AttemptRow, "has_result" | "thumb_url"> & {
 };
 
 export type ShopNameRow = { id: string; name: string | null };
+
+
+// --- Prompt library ---------------------------------------------------------
+
+export type PromptSetKey = "single" | "two";
+
+export type PromptSetVersion = {
+  id: string;
+  set_key: PromptSetKey;
+  version: number;
+  look_prompt: string;
+  tryon_prompt: string;
+  look_tryon_prompt: string | null;
+  note: string | null;
+  created_at: string;
+  garments_count: number;
+};
+
+export type PromptSet = {
+  key: PromptSetKey;
+  label: string;
+  blanks: string[];
+  garments_count: number;
+  latest_version: number | null;
+  /** Newest first. */
+  versions: PromptSetVersion[];
+};
+
+export type PromptLibraryResponse = { sets: PromptSet[] };
+
+export type MoveAllResponse = {
+  set_key: PromptSetKey;
+  version: number;
+  moved: number;
+  unchanged: number;
+  failed: { garment_id: string; shop_id: string; name: string | null; error: string }[];
+};
+
+export type GarmentOverviewRow = AdminFolderRow & {
+  fabric_slots: AdminFabricSlotRow[];
+  hero_thumb_url: string | null;
+};
+
+export type GarmentsOverviewResponse = {
+  garments: GarmentOverviewRow[];
+  latest_versions: Record<PromptSetKey, number | null>;
+};
+
+export type SkillFields = {
+  name?: string;
+  category?: string;
+  prompt_set?: PromptSetKey;
+  part1_name?: string;
+  part1_sam_word?: string;
+  part2_name?: string;
+  part2_sam_word?: string;
+  part2_default?: "white" | "black";
+  design_text?: string;
+  keep_text?: string;
+};
+
+export type SkillParseResponse = { fields: SkillFields; filled: string[] };

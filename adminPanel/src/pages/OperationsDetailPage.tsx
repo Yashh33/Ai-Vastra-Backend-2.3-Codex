@@ -99,23 +99,23 @@ export function OperationsDetailPage() {
 
   if (loading) {
     return (
-      <main className="screen">
+      <div className="screen">
         <section className="page-shell">
           {backLink}
           <div className="empty-box">Loading…</div>
         </section>
-      </main>
+      </div>
     );
   }
 
   if (error || !attempt) {
     return (
-      <main className="screen">
+      <div className="screen">
         <section className="page-shell">
           {backLink}
           <p className="error-text">Could not load this attempt: {error ?? "not found"}</p>
         </section>
-      </main>
+      </div>
     );
   }
 
@@ -127,7 +127,7 @@ export function OperationsDetailPage() {
   const timedOutBeforeSweep = attempt.status === "timed_out" && attempt.raw_status !== "timed_out";
 
   return (
-    <main className="screen">
+    <div className="screen">
       <section className="page-shell">
         <div className="row">{backLink}</div>
 
@@ -333,6 +333,6 @@ export function OperationsDetailPage() {
           <img className="ops-full-image" src={fullImage} alt="Full size" />
         </div>
       ) : null}
-    </main>
+    </div>
   );
 }

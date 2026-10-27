@@ -81,7 +81,7 @@ export function OperationsPage() {
   const summary = data?.summary;
 
   return (
-    <main className="screen">
+    <div className="screen">
       <section className="page-shell">
         <header className="header-row">
           <div>
@@ -238,6 +238,6 @@ export function OperationsPage() {
           </div>
         </section>
       </section>
-    </main>
+    </div>
   );
 }

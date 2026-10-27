@@ -551,6 +551,24 @@ def list_shops(
         except Exception:
             phones_by_shop = {}
 
+    # Active garment types per shop (for the admin Shops table).
+    garments_by_shop: dict[str, int] = {}
+    if shop_ids:
+        try:
+            garment_result = (
+                supabase.table("garment_types")
+                .select("shop_id, is_active")
+                .in_("shop_id", shop_ids)
+                .execute()
+            )
+            for row in getattr(garment_result, "data", None) or []:
+                if row.get("is_active") is False:
+                    continue
+                target_shop_id = str(row.get("shop_id") or "")
+                garments_by_shop[target_shop_id] = garments_by_shop.get(target_shop_id, 0) + 1
+        except Exception:
+            garments_by_shop = {}
+
     emails_by_uid: dict[str, Optional[str]] = {}
     owner_uids = {uid for uid in owners_by_shop.values() if uid}
     for uid in owner_uids:
@@ -593,6 +611,7 @@ def list_shops(
                 "owner_email": emails_by_uid.get(owner_auth_user_id) if owner_auth_user_id else None,
                 "channel": channel,
                 "status": shop.get("status") or "active",
+                "garments_count": garments_by_shop.get(target_shop_id, 0),
             }
         )
 

@@ -26,15 +26,16 @@ export function AdminLoginPage() {
   }
 
   return (
-    <main className="screen auth-screen">
-      <section className="card auth-card">
-        <h1>Ai Vastra Admin</h1>
-        <p className="muted">Private control panel access</p>
+    <main className="login-screen">
+      <section className="login-card">
+        <h1>MyTryonAi admin</h1>
+        <p className="muted">Private control panel</p>
 
         <form className="stack" onSubmit={handleSubmit}>
           <label className="field">
             <span>Backend URL</span>
             <input
+              className="input"
               type="text"
               value={apiBaseUrl}
               onChange={(event) => setApiBaseUrl(event.target.value)}
@@ -44,24 +45,24 @@ export function AdminLoginPage() {
           </label>
 
           <label className="field">
-            <span>Admin Secret</span>
+            <span>Admin secret</span>
             <input
+              className="input"
               type="password"
               value={adminSecret}
               onChange={(event) => setAdminSecret(event.target.value)}
-              placeholder="Enter ADMIN_PANEL_SECRET"
+              placeholder="ADMIN_PANEL_SECRET"
               disabled={busy}
             />
           </label>
 
           {error ? <p className="error-text">{error}</p> : null}
 
-          <button className="btn btn-dark" type="submit" disabled={busy}>
-            {busy ? "Checking..." : "Enter Admin Panel"}
+          <button className="btn btn-primary btn-block" type="submit" disabled={busy}>
+            {busy ? "Checking…" : "Log in"}
           </button>
         </form>
       </section>
     </main>
   );
 }
-
