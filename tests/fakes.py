@@ -179,6 +179,17 @@ class _Bucket:
 
     update = upload
 
+    def copy(self, from_path, to_path):
+        self._check("copy")
+        self.db.files[(self.bucket, to_path)] = self.db.files[(self.bucket, from_path)]
+        return {"Key": to_path}
+
+    def remove(self, paths):
+        self._check("remove")
+        for path in paths:
+            self.db.files.pop((self.bucket, path), None)
+        return []
+
 
 class FakeSupabase:
     def __init__(self) -> None:

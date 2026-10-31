@@ -1,7 +1,9 @@
 ﻿import io
 import time
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Optional
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from pydantic import BaseModel, Field, field_validator
@@ -1857,6 +1859,137 @@ def restore_original_output(
         )
 
     return {"id": generation_id, "output_path": original_path}
+
+
+_OUTPUT_CONTENT_TYPES = {"png": "image/png", "webp": "image/webp"}
+
+
+def _copy_output_file(supabase, *, source_path: str, new_path: str, ext: str) -> None:
+    storage_bucket = supabase.storage.from_("generated-outputs")
+    try:
+        storage_bucket.copy(source_path, new_path)
+        return
+    except Exception as exc:
+        print(f"[generations_api] WARNING: storage copy failed for {source_path}, re-uploading: {exc}")
+
+    _upload_generated_output(
+        supabase,
+        bucket="generated-outputs",
+        path=new_path,
+        data=storage_bucket.download(source_path),
+        content_type=_OUTPUT_CONTENT_TYPES.get(ext, "image/jpeg"),
+    )
+
+
+@router.post("/{generation_id}/push-to-screen")
+def push_look_to_screen(
+    generation_id: str,
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    """
+    "Push to big screen" for a finished look. Stores a copy of the look's CURRENT
+    image as a new try-on-type row, the same as /tryon/push-to-screen, so the copy
+    stays out of Browse and Carousel. Every push makes a new id, so the TV always updates.
+    """
+    supabase = get_supabase_admin_client()
+    settings = get_settings()
+    shop_id = current.shop_id
+
+    generation_id = _clean_id(generation_id, "generation_id")
+    if not attempt_log.valid_uuid(generation_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Generation not found",
+        )
+
+    try:
+        result = (
+            supabase.table("generations")
+            .select("id, generation_type, status, output_path, folder_id, hero_image_id, fabric_image_id")
+            .eq("id", generation_id)
+            .eq("shop_id", shop_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch generation",
+        ) from exc
+
+    rows = getattr(result, "data", None) or []
+    if not rows or rows[0].get("generation_type") != "look":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Generation not found",
+        )
+
+    look = rows[0]
+    source_path = str(look.get("output_path") or "").strip()
+    if str(look.get("status") or "") != "done" or not source_path:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Generation output is not ready yet",
+        )
+
+    filename = source_path.rsplit("/", 1)[-1]
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "png"
+    new_generation_id = str(uuid4())
+    output_path = f"{shop_id}/{new_generation_id}/output_v{int(time.time())}.{ext}"
+
+    try:
+        _copy_output_file(supabase, source_path=source_path, new_path=output_path, ext=ext)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to copy look image",
+        ) from exc
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    try:
+        supabase.table("generations").insert(
+            {
+                "id": new_generation_id,
+                "shop_id": shop_id,
+                "hero_image_id": look.get("hero_image_id"),
+                "fabric_image_id": look.get("fabric_image_id"),
+                "folder_id": look.get("folder_id"),
+                "status": "done",
+                "generation_type": "tryon",
+                "model_used": settings.GEMINI_IMAGE_MODEL_ID,
+                "prompt_used": "web-app look (pushed to screen)",
+                "output_path": output_path,
+                "credits_used": 0,
+                "show_on_screen": True,
+                "created_at": now_iso,
+                "started_at": now_iso,
+                "completed_at": now_iso,
+            }
+        ).execute()
+    except Exception as exc:
+        _remove_output_files_best_effort(supabase, [output_path])
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to save pushed look",
+        ) from exc
+
+    try:
+        supabase.table("shop_screen_state").upsert(
+            {
+                "shop_id": shop_id,
+                "live_generation_id": new_generation_id,
+                "mode": "live",
+                "updated_at": now_iso,
+            }
+        ).execute()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update screen state",
+        ) from exc
+
+    return {"generation_id": new_generation_id, "live": True}
 
 
 def _remove_generation_masks_best_effort(supabase, *, shop_id: str, generation_id: str) -> None:
