@@ -12,6 +12,8 @@ class Settings(BaseSettings):
 
     GEMINI_API_KEY: str
     GEMINI_IMAGE_MODEL_ID: str = "gemini-3.1-flash-image-preview"
+    # Output size of every generated image (looks and try-ons), for every model.
+    GEMINI_IMAGE_SIZE: str = "1K"
 
     # Single source of truth for the credit/image ratio. A future ratio
     # change (e.g. perception pricing) is a one-line edit here.
@@ -55,12 +57,21 @@ class Settings(BaseSettings):
         return self.SUPABASE_URL.rstrip("/") + "/auth/v1/.well-known/jwks.json"
 
 
+# The only models a shop can be set to: id -> (label, short label).
+# The admin panel keeps the same labels in src/lib/imageModels.ts.
+IMAGE_MODELS: dict[str, tuple[str, str]] = {
+    "gemini-nano-banana-2.1": ("Nano Banana 2.1", "NB 2.1"),
+    "gemini-3.1-flash-image-preview": ("Nano Banana 2", "NB 2"),
+}
+
+
 # AI cost for the Operations log: USD per 1M tokens (input, output), from Google's
-# Gemini API pricing page (Gemini 3.1 Flash Image, standard paid tier). A model not
-# listed here gets ai_cost_inr = null; never a guess.
+# Gemini API pricing page (standard paid tier). A model not listed here gets
+# ai_cost_inr = null; never a guess.
 GEMINI_PRICES_USD_PER_1M: dict[str, tuple[float, float]] = {
     "gemini-3.1-flash-image-preview": (0.50, 60.0),
     "gemini-3.1-flash-image": (0.50, 60.0),
+    "gemini-nano-banana-2.1": (1.50, 30.0),
 }
 USD_TO_INR = 84.0
 

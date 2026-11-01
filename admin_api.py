@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 
 import attempt_log
 from admin_deps import verify_admin_secret
-from config import get_settings
+from config import IMAGE_MODELS, get_settings
 from image_thumbs import (
     hero_thumbnail_path,
     look_thumbnail_path,
@@ -37,6 +37,11 @@ class AdminUpdateShopRequest(BaseModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=120)
     header_display_text: Optional[str] = Field(default=None, max_length=120)
     carousel_mode_default: Optional[bool] = None
+
+
+class AdminSetImageModelRequest(BaseModel):
+    # An id from config.IMAGE_MODELS, or null for Default. Required, so null is always deliberate.
+    image_model_id: Optional[str]
 
 
 class AdminSetScreenSlugRequest(BaseModel):
@@ -612,6 +617,7 @@ def list_shops(
                 "channel": channel,
                 "status": shop.get("status") or "active",
                 "garments_count": garments_by_shop.get(target_shop_id, 0),
+                **_shop_image_model_fields(shop),
             }
         )
 
@@ -640,6 +646,7 @@ def get_shop(shop_id: str):
     shop = rows[0]
     shop["is_suspended"] = bool(shop.get("is_suspended", False))
     shop["credits_balance"] = _get_shop_balance(supabase, shop_id)
+    shop.update(_shop_image_model_fields(shop))
 
     mapping_result = (
         supabase.table("shop_users")
@@ -786,6 +793,51 @@ def update_shop(shop_id: str, body: AdminUpdateShopRequest):
         )
 
     return rows[0]
+
+
+def _shop_image_model_fields(shop: dict) -> dict:
+    # .get: the column does not exist until sql/2026-11-02_shop_image_model.sql has run.
+    return {
+        "image_model_id": shop.get("image_model_id"),
+        "default_image_model_id": get_settings().GEMINI_IMAGE_MODEL_ID,
+    }
+
+
+@router.get("/shops/{shop_id}/image-model")
+def get_shop_image_model(shop_id: str):
+    supabase = get_supabase_admin_client()
+    result = supabase.table("shops").select("*").eq("id", shop_id).limit(1).execute()
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Shop not found")
+    return {"shop_id": shop_id, **_shop_image_model_fields(rows[0])}
+
+
+@router.patch("/shops/{shop_id}/image-model")
+def set_shop_image_model(shop_id: str, body: AdminSetImageModelRequest):
+    if body.image_model_id is not None and body.image_model_id not in IMAGE_MODELS:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown image model")
+
+    supabase = get_supabase_admin_client()
+    try:
+        # Only the model changes; nothing else on the shop is touched.
+        result = (
+            supabase.table("shops").update({"image_model_id": body.image_model_id}).eq("id", shop_id).execute()
+        )
+    except Exception as exc:
+        if "image_model_id" in str(exc):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The database is not ready for this yet: run sql/2026-11-02_shop_image_model.sql first.",
+            ) from exc
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to save image model",
+        ) from exc
+
+    if not (getattr(result, "data", None) or []):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Shop not found")
+    return {"shop_id": shop_id, **_shop_image_model_fields({"image_model_id": body.image_model_id})}
 
 
 def _load_shop_for_slug(supabase, shop_id: str) -> dict:
@@ -2320,8 +2372,10 @@ async def upload_shop_looks_bulk(
 _ATTEMPT_LIST_COLUMNS = (
     "id, request_id, created_at, started_at, finished_at, duration_ms, shop_id, user_email, "
     "user_label, attempt_type, garment_type_name, fabric_mode, status, failed_step, "
-    "credits_charged, credits_refunded, output_path, tryon_result_path, backfilled, device_label"
+    "credits_charged, credits_refunded, output_path, tryon_result_path, backfilled, device_label, model_id"
 )
+# Until sql/2026-11-02_shop_image_model.sql has run, the list works without this column.
+_ATTEMPT_OPTIONAL_LIST_COLUMNS = ", image_size"
 _ATTEMPT_STATUS_FILTERS = {"succeeded", "failed", "running"}
 
 
@@ -2423,13 +2477,22 @@ def list_generation_attempts(
 
     offset = (page - 1) * page_size
     try:
-        query = (
-            supabase.table(attempt_log.TABLE)
-            .select(_ATTEMPT_LIST_COLUMNS, count="exact")
-            .order("created_at", desc=True)
-            .range(offset, offset + page_size - 1)
-        )
-        result = _apply_attempt_filters(query, status_filter=status_filter, **base_filters).execute()
+        def _fetch_page(columns: str):
+            query = (
+                supabase.table(attempt_log.TABLE)
+                .select(columns, count="exact")
+                .order("created_at", desc=True)
+                .range(offset, offset + page_size - 1)
+            )
+            return _apply_attempt_filters(query, status_filter=status_filter, **base_filters).execute()
+
+        try:
+            result = _fetch_page(_ATTEMPT_LIST_COLUMNS + _ATTEMPT_OPTIONAL_LIST_COLUMNS)
+        except Exception as exc:
+            if "image_size" not in str(exc):
+                raise
+            print(f"[admin_api] WARNING: generation_attempts.image_size is missing: {attempt_log.scrub(str(exc), 300)}")
+            result = _fetch_page(_ATTEMPT_LIST_COLUMNS)
 
         # Tiles: same shop / type / dates, every status.
         all_count = _count_attempts(supabase, status_filter=None, **base_filters)

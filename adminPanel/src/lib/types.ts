@@ -22,6 +22,9 @@ export type AdminShopRow = {
   screen_slug?: string | null;
   /** Active garment types (GET /admin/shops only). */
   garments_count?: number;
+  /** null = Default (the env default below). */
+  image_model_id?: string | null;
+  default_image_model_id?: string | null;
 };
 
 export type AdminCreateShopResponse = {
@@ -167,6 +170,9 @@ export type AttemptRow = {
   credits_refunded: number | null;
   backfilled: boolean;
   device_label: string | null;
+  model_id: string | null;
+  /** Output size requested, e.g. "1K". Null on old rows. */
+  image_size?: string | null;
   has_result: boolean;
   thumb_url: string | null;
 };
@@ -212,7 +218,6 @@ export type AttemptDetail = Omit<AttemptRow, "has_result" | "thumb_url"> & {
   prompt_text: string | null;
   prompt_version_id: string | null;
   prompt_version_label: string | null;
-  model_id: string | null;
   user_message: string | null;
   error_detail: string | null;
   http_status: number | null;

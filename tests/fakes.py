@@ -52,10 +52,12 @@ class _Query:
         self._limit: Optional[int] = None
         self._order: Optional[tuple[str, bool]] = None
         self._count = None
+        self.columns: tuple = ()
 
     # --- operations
-    def select(self, *_columns, count=None, head=None):
+    def select(self, *columns, count=None, head=None):
         self.op, self._count = "select", count
+        self.columns = columns
         return self
 
     def insert(self, payload):
@@ -104,12 +106,20 @@ class _Query:
         self._limit = end - start + 1
         return self
 
+    def _check_columns(self) -> None:
+        items = self.payload if isinstance(self.payload, list) else [self.payload] if self.payload else []
+        used = " ".join(self.columns) + " " + " ".join(key for item in items for key in item)
+        for column in self.db.missing_columns.get(self.table, ()):
+            if column in used:
+                raise FakeDBError(f"column {self.table}.{column} does not exist (42703)")
+
     # --- run
     def execute(self):
         self.db.log.append((self.table, self.op, copy.deepcopy(self.payload)))
         hook = self.db.fail.get((self.table, self.op)) or self.db.fail.get((self.table, "*"))
         if hook:
             raise hook if isinstance(hook, BaseException) else FakeDBError(str(hook))
+        self._check_columns()
 
         rows = self.db.tables.setdefault(self.table, [])
         if self.op in ("insert", "upsert"):
@@ -200,6 +210,7 @@ class FakeSupabase:
         self.files: dict[tuple[str, str], bytes] = {}
         self.rpc_handlers: dict[str, Callable[[dict], list]] = {}
         self.unique = {"generation_attempts": ("request_id",)}
+        self.missing_columns: dict[str, tuple[str, ...]] = {}
         self.storage = SimpleNamespace(from_=lambda bucket: _Bucket(self, bucket))
 
     def table(self, name: str) -> _Query:
@@ -258,18 +269,21 @@ class FakeGemini:
     def __init__(self, outcome: Any) -> None:
         self.outcome = outcome
         self.calls = 0
+        self.requests: list[dict] = []
         fake = self
 
         class _Models:
-            def generate_content(self, **_kwargs):
+            def generate_content(self, **kwargs):
                 fake.calls += 1
+                fake.requests.append(kwargs)
                 if isinstance(fake.outcome, BaseException):
                     raise fake.outcome
                 return fake.outcome
 
         class _AioModels:
-            async def generate_content(self, **_kwargs):
+            async def generate_content(self, **kwargs):
                 fake.calls += 1
+                fake.requests.append(kwargs)
                 if isinstance(fake.outcome, BaseException):
                     raise fake.outcome
                 return fake.outcome

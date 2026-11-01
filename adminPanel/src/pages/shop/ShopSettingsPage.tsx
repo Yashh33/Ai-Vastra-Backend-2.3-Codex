@@ -4,6 +4,7 @@ import { useNavigate } from "react-router-dom";
 import { adminFetch } from "../../lib/api";
 import { copyText } from "../../lib/clipboard";
 import { useCurrentShop } from "../../lib/currentShop";
+import { IMAGE_MODEL_OPTIONS, imageModelLabel } from "../../lib/imageModels";
 import { errorMessage } from "../../lib/promptLibrary";
 import type { AdminShopRow } from "../../lib/types";
 import { useShopScreen } from "./ShopLayout";
@@ -64,6 +65,10 @@ export function ShopSettingsPage() {
   const [suggestingSlug, setSuggestingSlug] = useState(false);
   const [slugStatus, setSlugStatus] = useState("");
 
+  const [imageModelId, setImageModelId] = useState<string | null>(shop.image_model_id ?? null);
+  const [savingModel, setSavingModel] = useState(false);
+  const [modelStatus, setModelStatus] = useState("");
+
   const [newPassword, setNewPassword] = useState("");
   const [resettingPassword, setResettingPassword] = useState(false);
   const [loginStatus, setLoginStatus] = useState("");
@@ -77,6 +82,10 @@ export function ShopSettingsPage() {
     setHeaderDisplayText(shop.header_display_text || "");
     setCarouselModeDefault(Boolean(shop.carousel_mode_default));
   }, [shop.id]);
+
+  useEffect(() => {
+    setImageModelId(shop.image_model_id ?? null);
+  }, [shop.id, shop.image_model_id]);
 
   async function handleShopUpdate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -164,6 +173,24 @@ export function ShopSettingsPage() {
       setSlugError(errorMessage(err));
     } finally {
       setSavingSlug(false);
+    }
+  }
+
+  async function handleSaveImageModel(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setSavingModel(true);
+    try {
+      const result = await adminFetch<{ image_model_id: string | null; default_image_model_id: string | null }>(
+        session,
+        `${base}/image-model`,
+        { method: "PATCH", body: JSON.stringify({ image_model_id: imageModelId }) }
+      );
+      patchShop(result);
+      setModelStatus("AI model saved. It applies to the next generation.");
+    } catch (err) {
+      setModelStatus(`Save failed: ${errorMessage(err)}`);
+    } finally {
+      setSavingModel(false);
     }
   }
 
@@ -341,6 +368,39 @@ export function ShopSettingsPage() {
           )}
           <p className="tiny muted">Enter this on the TV app's setup screen.</p>
           {slugStatus ? <p className="tiny muted">{slugStatus}</p> : null}
+        </section>
+
+        <section className="section">
+          <h2>AI model</h2>
+          <form className="stack" onSubmit={handleSaveImageModel}>
+            <label className="check">
+              <input
+                type="radio"
+                name="image-model"
+                checked={imageModelId === null}
+                onChange={() => setImageModelId(null)}
+              />
+              Default ({shop.default_image_model_id ? imageModelLabel(shop.default_image_model_id) : "not set"})
+            </label>
+            {IMAGE_MODEL_OPTIONS.map((option) => (
+              <label className="check" key={option.id}>
+                <input
+                  type="radio"
+                  name="image-model"
+                  checked={imageModelId === option.id}
+                  onChange={() => setImageModelId(option.id)}
+                />
+                {option.label}
+              </label>
+            ))}
+            <p className="tiny muted">Used for this shop's looks and try-ons. All images are made at 1K.</p>
+            <div className="row">
+              <button className="btn btn-primary" type="submit" disabled={savingModel}>
+                {savingModel ? "Saving…" : "Save"}
+              </button>
+              {modelStatus ? <span className="tiny muted">{modelStatus}</span> : null}
+            </div>
+          </form>
         </section>
 
         <section className="section">

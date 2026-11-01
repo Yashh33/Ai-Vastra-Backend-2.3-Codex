@@ -371,6 +371,16 @@ def _clean(fields: dict) -> dict:
     return out
 
 
+# Columns that may not exist until their SQL file has run. Always written on their own, so a
+# missing column only loses that value (logged as a write failure), never a status.
+_OPTIONAL_COLUMNS = ("image_size",)
+
+
+def _split_optional(data: dict) -> tuple[dict, dict]:
+    optional = {key: data[key] for key in _OPTIONAL_COLUMNS if key in data}
+    return {key: value for key, value in data.items() if key not in optional}, optional
+
+
 def _is_unique_violation(exc: Exception) -> bool:
     text = str(exc).lower()
     return "23505" in text or "duplicate key" in text or "already exists" in text
@@ -440,11 +450,12 @@ class AttemptRecord:
             pass
 
     def update(self, **fields: Any) -> None:
-        data = _clean(fields)
-        if not data:
-            return
+        data, optional = _split_optional(_clean(fields))
         row_id = self.id
-        _writer.submit(self.request_id, lambda client: client.table(TABLE).update(data).eq("id", row_id).execute())
+        if data:
+            _writer.submit(self.request_id, lambda client: client.table(TABLE).update(data).eq("id", row_id).execute())
+        if optional:
+            _writer.submit(self.request_id, lambda client: client.table(TABLE).update(optional).eq("id", row_id).execute())
 
     def enrich(self, build: Callable[[Any], dict]) -> None:
         """Fields that need a DB lookup are resolved on the writer thread, off the request path."""
@@ -735,19 +746,30 @@ class WorkerAttempt:
             log_write_failed(f"generation:{self.generation_id}", "no attempt row for this generation")
         return None
 
+    def _write_optional(self, row_id: Any, optional: dict) -> None:
+        if not optional:
+            return
+        try:
+            _client().table(TABLE).update(optional).eq("id", row_id).execute()
+        except Exception as exc:
+            log_write_failed(f"generation:{self.generation_id}", exc)
+
     def update(self, **fields: Any) -> None:
         try:
             row = self._lookup(retries=0)
             if not row:
                 return
-            (
-                _client()
-                .table(TABLE)
-                .update(_clean(fields))
-                .eq("id", row["id"])
-                .in_("status", list(OPEN_STATUSES))
-                .execute()
-            )
+            data, optional = _split_optional(_clean(fields))
+            self._write_optional(row["id"], optional)
+            if data:
+                (
+                    _client()
+                    .table(TABLE)
+                    .update(data)
+                    .eq("id", row["id"])
+                    .in_("status", list(OPEN_STATUSES))
+                    .execute()
+                )
         except Exception as exc:
             log_write_failed(f"generation:{self.generation_id}", exc)
 
@@ -763,7 +785,10 @@ class WorkerAttempt:
                 duration_ms = int((finished - started).total_seconds() * 1000)
             except Exception:
                 pass
-            payload = _clean(dict(fields, status=status, finished_at=finished, duration_ms=duration_ms))
+            payload, optional = _split_optional(
+                _clean(dict(fields, status=status, finished_at=finished, duration_ms=duration_ms))
+            )
+            self._write_optional(row["id"], optional)
             (
                 _client()
                 .table(TABLE)

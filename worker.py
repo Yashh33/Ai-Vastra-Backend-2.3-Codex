@@ -16,6 +16,7 @@ from supabase import create_client
 import attempt_log
 import default_fabrics
 from config import get_settings
+from image_models import pick_image_model, read_shop_image_model, warn_read_failed
 from image_thumbs import look_thumbnail_path
 
 _MAX_INPUT_IMAGE_DIMENSION = 1536
@@ -326,6 +327,7 @@ def extract_first_image_from_gemini_response(response: Any) -> Tuple[bytes, str]
 def call_gemini_image_generation(
     client: genai.Client,
     model_id: str,
+    image_size: str,
     prompt: str,
     hero_image_bytes: bytes,
     hero_mime_type: str,
@@ -352,6 +354,7 @@ def call_gemini_image_generation(
 
     if ai_info is not None:
         ai_info.setdefault("ai_started_at", attempt_log.utc_now())
+        ai_info.update(model_id=model_id, image_size=image_size)
     try:
         response = client.models.generate_content(
             model=model_id,
@@ -360,7 +363,7 @@ def call_gemini_image_generation(
                 response_modalities=["IMAGE"],
                 image_config=types.ImageConfig(
                 aspect_ratio="3:4",
-                image_size="2K",
+                image_size=image_size,
                 ),
             ),
         )
@@ -394,10 +397,12 @@ def mark_generation_done(
     shop_id: str,
     output_path: str,
     external_request_id: Optional[str],
+    model_used: str,
 ) -> None:
     payload = {
         "status": "done",
         "output_path": output_path,
+        "model_used": model_used,
         "completed_at": utc_now_iso(),
         "error": None,
     }
@@ -461,6 +466,17 @@ def mark_generation_failed_with_refund(
 
     return rows[0]
 
+
+
+def resolve_job_image_model(shop_id: str) -> str:
+    """Same result as image_models.resolve_image_model, on this thread's client with the
+    worker's retry: a dropped connection must not silently fall back to the default model."""
+    try:
+        stored = call_with_retry(lambda: read_shop_image_model(get_supabase(), shop_id))
+    except Exception as exc:
+        warn_read_failed(shop_id, exc)
+        stored = None
+    return pick_image_model(stored, shop_id)
 
 
 def process_job(gemini_client: genai.Client, settings, job: dict) -> None:
@@ -527,13 +543,17 @@ def process_job(gemini_client: genai.Client, settings, job: dict) -> None:
                 }
             )
 
-        print(f"[worker] calling Gemini model: {settings.GEMINI_IMAGE_MODEL_ID}")
+        model_id = resolve_job_image_model(shop_id)
+        print(f"[worker] calling Gemini model: {model_id}")
         attempt.step = "ai_call"
         ai_info["ai_started_at"] = attempt_log.utc_now()
-        attempt.update(ai_started_at=ai_info["ai_started_at"], model_id=settings.GEMINI_IMAGE_MODEL_ID)
+        attempt.update(
+            ai_started_at=ai_info["ai_started_at"], model_id=model_id, image_size=settings.GEMINI_IMAGE_SIZE
+        )
         output_bytes, output_mime, external_request_id = call_gemini_image_generation(
             gemini_client,
-            settings.GEMINI_IMAGE_MODEL_ID,
+            model_id,
+            settings.GEMINI_IMAGE_SIZE,
             prompt_used,
             hero_bytes,
             hero_mime,
@@ -582,6 +602,7 @@ def process_job(gemini_client: genai.Client, settings, job: dict) -> None:
                 shop_id=shop_id,
                 output_path=output_path,
                 external_request_id=external_request_id,
+                model_used=model_id,
             )
         )
 
@@ -661,7 +682,8 @@ def main() -> None:
 
     print("[worker] started")
     print(f"[worker] poll interval: {settings.WORKER_POLL_INTERVAL_SECONDS}s")
-    print(f"[worker] model: {settings.GEMINI_IMAGE_MODEL_ID}")
+    print(f"[worker] default model: {settings.GEMINI_IMAGE_MODEL_ID}")
+    print(f"[worker] image size: {settings.GEMINI_IMAGE_SIZE}")
     print(f"[worker] max concurrent jobs: {_MAX_CONCURRENT_JOBS}")
 
     executor = ThreadPoolExecutor(max_workers=_MAX_CONCURRENT_JOBS)

@@ -4,6 +4,7 @@ import { Link, useLocation, useParams } from "react-router-dom";
 import { adminFetch } from "../lib/api";
 import { useAdminAuth } from "../lib/auth";
 import { copyText } from "../lib/clipboard";
+import { imageModelFullLabel } from "../lib/imageModels";
 import {
   ATTEMPT_TYPE_LABELS,
   FAILED_STEP_LABELS,
@@ -175,6 +176,10 @@ export function OperationsDetailPage() {
           </div>
         </section>
         <p className="tiny muted">
+          Model: {attempt.model_id ? imageModelFullLabel(attempt.model_id) : NOT_RECORDED} · Size:{" "}
+          {attempt.image_size || NOT_RECORDED}
+        </p>
+        <p className="tiny muted">
           Net credits: {formatCredits(attempt.credits_charged, attempt.credits_refunded)} · AI tokens in/out:{" "}
           {attempt.ai_input_tokens ?? NOT_RECORDED} / {attempt.ai_output_tokens ?? NOT_RECORDED} · AI time:{" "}
           {attempt.ai_started_at && attempt.ai_finished_at
@@ -296,9 +301,7 @@ export function OperationsDetailPage() {
             <h2 className="grow">Prompt</h2>
             {attempt.prompt_text ? <CopyButton text={attempt.prompt_text} /> : null}
           </div>
-          <p className="tiny muted">
-            Version: {attempt.prompt_version_label || NOT_RECORDED} · Model: {attempt.model_id || NOT_RECORDED}
-          </p>
+          <p className="tiny muted">Version: {attempt.prompt_version_label || NOT_RECORDED}</p>
           {attempt.prompt_text ? (
             <pre className="ops-pre">{attempt.prompt_text}</pre>
           ) : (

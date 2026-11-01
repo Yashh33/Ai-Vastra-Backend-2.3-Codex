@@ -3,6 +3,7 @@ import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 
 import { adminFetch } from "../lib/api";
 import { useAdminAuth } from "../lib/auth";
+import { imageModelShortLabel } from "../lib/imageModels";
 import {
   ATTEMPT_TYPE_LABELS,
   NOT_RECORDED,
@@ -171,6 +172,8 @@ export function OperationsPage() {
                     <th>Type</th>
                     <th>Garment</th>
                     <th>Status</th>
+                    <th>Model</th>
+                    <th>Size</th>
                     <th>Credits</th>
                     <th>Time taken</th>
                     <th>Output</th>
@@ -198,6 +201,8 @@ export function OperationsPage() {
                       <td>
                         <span className={statusPillClass(row.status)}>{STATUS_LABELS[row.status] ?? row.status}</span>
                       </td>
+                      <td className="ops-nowrap">{row.model_id ? imageModelShortLabel(row.model_id) : "—"}</td>
+                      <td className="ops-nowrap">{row.image_size || "—"}</td>
                       <td className="ops-nowrap">{formatCredits(row.credits_charged, row.credits_refunded)}</td>
                       <td className="ops-nowrap">
                         {row.status === "running" || row.status === "started" ? "running…" : formatDuration(row.duration_ms)}

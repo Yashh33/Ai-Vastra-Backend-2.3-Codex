@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import attempt_log
 from config import get_settings
+from image_models import resolve_image_model
 from payments_api import CREDIT_PACKS, create_payment_link_for_shop
 from prompting import DEFAULT_LOOK_PROMPT, DEFAULT_TRYON_PROMPT, fill_prompt_placeholders
 from supabase_client import get_supabase_admin_client
@@ -944,7 +945,9 @@ def _create_generation_for_session(supabase, session: dict, attempt) -> None:
         fabric_assignments=normalized_fabrics,
         image_count=1 + len(normalized_fabrics),
     )
-    attempt.update(prompt_text=prompt_used, model_id=settings.GEMINI_IMAGE_MODEL_ID)
+    # What the shop is set to now; the worker re-reads it per job and records what it used.
+    model_id = resolve_image_model(supabase, shop_id)
+    attempt.update(prompt_text=prompt_used, model_id=model_id, image_size=settings.GEMINI_IMAGE_SIZE)
     attempt.enrich(
         attempt_log.prompt_version_builder(
             folder_context.get("id"), "look_prompt", folder_context.get("look_prompt"), prompt_is_fallback
@@ -978,7 +981,7 @@ def _create_generation_for_session(supabase, session: dict, attempt) -> None:
                 "prompt_used": prompt_used,
                 "fabric_image_id": fabric_image_id,
                 "generation_type": "look",
-                "model_used": settings.GEMINI_IMAGE_MODEL_ID,
+                "model_used": model_id,
             }
         )
         .eq("id", generation_id)
@@ -1065,6 +1068,7 @@ def _record_tryon_generation(
     result_mime: str,
     credits_used: int,
     prompt_used: str,
+    model_used: str,
     stored: Optional[dict] = None,
 ) -> Optional[str]:
     """Record a generations row for a WhatsApp try-on OUTPUT image, mirroring
@@ -1121,7 +1125,7 @@ def _record_tryon_generation(
             "folder_id": folder_id,
             "status": "done",
             "generation_type": "tryon",
-            "model_used": get_settings().GEMINI_IMAGE_MODEL_ID,
+            "model_used": model_used,
             "prompt_used": prompt_used,
             "output_path": output_path,
             "credits_used": credits_used,
@@ -1145,6 +1149,7 @@ def run_tryon_for_session(
     generation_id = session.get("active_generation_id")
     is_direct = not generation_id
     balance_before: Optional[int] = None
+    model_id = resolve_image_model(supabase, shop_id)
 
     # Operations log (phone number and customer photo are never stored).
     attempt = attempt_log.begin(
@@ -1153,7 +1158,7 @@ def run_tryon_for_session(
         shop_id=shop_id,
         user_label="WhatsApp",
         device_label="WhatsApp",
-        model_id=settings.GEMINI_IMAGE_MODEL_ID,
+        model_id=model_id,
         garment_type_id=attempt_log.valid_uuid(session.get("folder_id")) if is_direct else None,
         source_generation_id=None if is_direct else attempt_log.valid_uuid(generation_id),
     )
@@ -1297,10 +1302,11 @@ def run_tryon_for_session(
             ]
 
         attempt.set_step("ai_call")
+        attempt.update(image_size=settings.GEMINI_IMAGE_SIZE)
         still_working_timer = threading.Timer(25.0, send_text, args=(phone, _MSG_TRYON_STILL_WORKING))
         still_working_timer.start()
         try:
-            result = _call_gemini_tryon(prompt=prompt, image_parts=image_parts, ai_info=ai_info)
+            result = _call_gemini_tryon(prompt=prompt, image_parts=image_parts, model_id=model_id, ai_info=ai_info)
         finally:
             still_working_timer.cancel()
         result_bytes = base64.b64decode(result.result_b64)
@@ -1323,6 +1329,7 @@ def run_tryon_for_session(
                 result_mime=result.result_mime,
                 credits_used=settings.CREDITS_PER_IMAGE if is_direct else 0,
                 prompt_used=prompt,
+                model_used=model_id,
                 stored=stored_result,
             )
         except Exception as exc:

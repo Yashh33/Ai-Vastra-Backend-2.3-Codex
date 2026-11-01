@@ -12,6 +12,7 @@ import attempt_log
 import default_fabrics
 from auth_deps import CurrentShopContext, get_current_shop_context
 from config import get_settings
+from image_models import resolve_image_model
 from image_thumbs import look_thumbnail_path
 from prompting import DEFAULT_LOOK_PROMPT, fill_prompt_placeholders
 from segment_api import mask_storage_prefix
@@ -1057,7 +1058,9 @@ def create_generation(
         fabric_assignments=all_fabrics,
         image_count=image_count,
     )
-    attempt.update(prompt_text=prompt_used, model_id=settings.GEMINI_IMAGE_MODEL_ID)
+    # What the shop is set to now; the worker re-reads it per job and records what it used.
+    model_id = resolve_image_model(supabase, current.shop_id)
+    attempt.update(prompt_text=prompt_used, model_id=model_id, image_size=settings.GEMINI_IMAGE_SIZE)
     attempt.enrich(
         attempt_log.prompt_version_builder(
             folder_context.get("id"), "look_prompt", folder_context.get("look_prompt"), prompt_is_fallback
@@ -1156,7 +1159,7 @@ def create_generation(
                     # Keep legacy column populated for backward compatibility.
                     "fabric_image_id": primary_fabric_image_id,
                     "generation_type": "look",
-                    "model_used": settings.GEMINI_IMAGE_MODEL_ID,
+                    "model_used": model_id,
                     **body.details_payload(only_set=False),
                     # Saved with prompt_used: if this update fails the worker fails the job
                     # ("prompt_used is empty") and refunds, never runs without its defaults.
@@ -1905,7 +1908,7 @@ def push_look_to_screen(
     try:
         result = (
             supabase.table("generations")
-            .select("id, generation_type, status, output_path, folder_id, hero_image_id, fabric_image_id")
+            .select("id, generation_type, status, output_path, folder_id, hero_image_id, fabric_image_id, model_used")
             .eq("id", generation_id)
             .eq("shop_id", shop_id)
             .limit(1)
@@ -1957,7 +1960,7 @@ def push_look_to_screen(
                 "folder_id": look.get("folder_id"),
                 "status": "done",
                 "generation_type": "tryon",
-                "model_used": settings.GEMINI_IMAGE_MODEL_ID,
+                "model_used": look.get("model_used") or settings.GEMINI_IMAGE_MODEL_ID,
                 "prompt_used": "web-app look (pushed to screen)",
                 "output_path": output_path,
                 "credits_used": 0,

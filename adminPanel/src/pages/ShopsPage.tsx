@@ -5,6 +5,7 @@ import { adminFetch } from "../lib/api";
 import { useAdminAuth } from "../lib/auth";
 import { copyText } from "../lib/clipboard";
 import { shopStatusLabel, useCurrentShop } from "../lib/currentShop";
+import { imageModelShortLabel } from "../lib/imageModels";
 import { errorMessage } from "../lib/promptLibrary";
 import type { AdminCreateShopResponse, AdminShopRow } from "../lib/types";
 
@@ -167,13 +168,14 @@ export function ShopsPage() {
               <th className="num">Credits</th>
               <th className="num">Garments</th>
               <th>TV slug</th>
+              <th>Model</th>
               <th>Status</th>
             </tr>
           </thead>
           <tbody>
             {visibleShops.length === 0 ? (
               <tr>
-                <td colSpan={5} className="empty-cell">
+                <td colSpan={6} className="empty-cell">
                   {loading ? "Loading…" : "No shops match."}
                 </td>
               </tr>
@@ -213,6 +215,7 @@ export function ShopsPage() {
                       <span className="muted">Not set</span>
                     )}
                   </td>
+                  <td className="tiny">{shop.image_model_id ? imageModelShortLabel(shop.image_model_id) : "Default"}</td>
                   <td>
                     <span className={shop.is_suspended ? "pill pill-bad" : shop.status === "trial" ? "pill pill-warn" : "pill pill-ok"}>
                       {shopStatusLabel(shop)}

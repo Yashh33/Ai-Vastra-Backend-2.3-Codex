@@ -27,6 +27,7 @@ import attempt_log
 import default_fabrics
 from auth_deps import CurrentShopContext, get_current_shop_context
 from config import get_settings
+from image_models import resolve_image_model
 from prompting import DEFAULT_TRYON_PROMPT, fill_prompt_placeholders
 from supabase_client import get_supabase_admin_client
 
@@ -225,6 +226,8 @@ def _note_ai_response(ai_info: Optional[dict], response, model_id: str) -> None:
 def _call_gemini_tryon(
     prompt: str,
     image_parts: list[tuple[bytes, str]],
+    *,
+    model_id: str,
     ai_info: Optional[dict] = None,
 ) -> TryOnResponse:
     settings = get_settings()
@@ -237,18 +240,21 @@ def _call_gemini_tryon(
         )
 
     if ai_info is not None:
-        ai_info["ai_started_at"] = attempt_log.utc_now()
+        ai_info.update(
+            ai_started_at=attempt_log.utc_now(), model_id=model_id, image_size=settings.GEMINI_IMAGE_SIZE
+        )
     response = None
     try:
         response = client.models.generate_content(
-            model=settings.GEMINI_IMAGE_MODEL_ID,
+            model=model_id,
             contents=contents_parts,
             config=types.GenerateContentConfig(
                 response_modalities=["IMAGE", "TEXT"],
+                image_config=types.ImageConfig(image_size=settings.GEMINI_IMAGE_SIZE),
             ),
         )
     finally:
-        _note_ai_response(ai_info, response, settings.GEMINI_IMAGE_MODEL_ID)
+        _note_ai_response(ai_info, response, model_id)
 
     inline = _first_inline_image(response)
     if inline is not None:
@@ -266,6 +272,8 @@ def _call_gemini_tryon(
 async def _call_gemini_tryon_async(
     prompt: str,
     image_parts: list[tuple[bytes, str]],
+    *,
+    model_id: str,
     ai_info: Optional[dict] = None,
 ) -> Tuple[bytes, str]:
     settings = get_settings()
@@ -278,18 +286,21 @@ async def _call_gemini_tryon_async(
         )
 
     if ai_info is not None:
-        ai_info["ai_started_at"] = attempt_log.utc_now()
+        ai_info.update(
+            ai_started_at=attempt_log.utc_now(), model_id=model_id, image_size=settings.GEMINI_IMAGE_SIZE
+        )
     response = None
     try:
         response = await client.aio.models.generate_content(
-            model=settings.GEMINI_IMAGE_MODEL_ID,
+            model=model_id,
             contents=contents_parts,
             config=types.GenerateContentConfig(
                 response_modalities=["IMAGE", "TEXT"],
+                image_config=types.ImageConfig(image_size=settings.GEMINI_IMAGE_SIZE),
             ),
         )
     finally:
-        _note_ai_response(ai_info, response, settings.GEMINI_IMAGE_MODEL_ID)
+        _note_ai_response(ai_info, response, model_id)
 
     inline = _first_inline_image(response)
     if inline is not None:
@@ -310,10 +321,17 @@ def _start_attempt(request: Request, current: CurrentShopContext, **fields: Any)
         shop_id=current.shop_id,
         user_id=current.auth_user_id,
         user_email=current.email,
-        model_id=get_settings().GEMINI_IMAGE_MODEL_ID,
         **fields,
     )
     return attempt
+
+
+def _begin_ai_call(attempt, supabase, shop_id: str) -> str:
+    """Picks the shop's model and logs it with the size. Does a DB read: async callers use a thread."""
+    attempt.set_step("ai_call")
+    model_id = resolve_image_model(supabase, shop_id)
+    attempt.update(model_id=model_id, image_size=get_settings().GEMINI_IMAGE_SIZE)
+    return model_id
 
 
 @contextmanager
@@ -704,11 +722,12 @@ def tryon(
         customer_bytes = _decode_photo(body.customer_photo_b64)
 
     # Call Gemini: look first, customer last
-    attempt.set_step("ai_call")
+    model_id = _begin_ai_call(attempt, supabase, current.shop_id)
     ai_info: dict = {}
     try:
         result = _call_gemini_tryon(
             prompt=prompt,
+            model_id=model_id,
             image_parts=[
                 (garment_bytes, "image/jpeg"),
                 (customer_bytes, body.customer_photo_mime),
@@ -909,11 +928,12 @@ def tryon_quick(
     )
 
     # Call Gemini: hero first, then fabrics in slot order, customer last
-    attempt.set_step("ai_call")
+    model_id = _begin_ai_call(attempt, supabase, shop_id)
     ai_info: dict = {}
     try:
         result = _call_gemini_tryon(
             prompt=prompt,
+            model_id=model_id,
             image_parts=[
                 (hero_bytes, hero.get("mime_type") or "image/jpeg"),
                 *fabric_image_parts,
@@ -983,11 +1003,12 @@ async def tryon_v2(
     garment_bytes, garment_mime = _downscale_image_if_needed(garment_bytes, "image/jpeg")
 
     # Look first, customer last
-    attempt.set_step("ai_call")
+    model_id = await anyio.to_thread.run_sync(_begin_ai_call, attempt, supabase, current.shop_id)
     ai_info: dict = {}
     try:
         image_bytes, result_mime = await _call_gemini_tryon_async(
             prompt=prompt,
+            model_id=model_id,
             image_parts=[
                 (garment_bytes, garment_mime),
                 (customer_bytes, customer_mime),
@@ -1071,11 +1092,12 @@ async def tryon_quick_v2(
     )
     _log_prompt(attempt, prompt, garment_type_id=garment_type_id, prompt_field="tryon_prompt", template=folder_tryon_prompt)
 
-    attempt.set_step("ai_call")
+    model_id = await anyio.to_thread.run_sync(_begin_ai_call, attempt, supabase, current.shop_id)
     ai_info: dict = {}
     try:
         image_bytes, result_mime = await _call_gemini_tryon_async(
             prompt=prompt,
+            model_id=model_id,
             image_parts=[
                 (hero_bytes, hero_mime),
                 (fabric_bytes, fabric_mime),
@@ -1229,11 +1251,12 @@ async def tryon_multi_v2(
 
     image_parts = [(hero_bytes, hero_mime), *fabric_assets, (customer_bytes, customer_mime)]
 
-    attempt.set_step("ai_call")
+    model_id = await anyio.to_thread.run_sync(_begin_ai_call, attempt, supabase, current.shop_id)
     ai_info: dict = {}
     try:
         image_bytes, result_mime = await _call_gemini_tryon_async(
             prompt=prompt,
+            model_id=model_id,
             image_parts=image_parts,
             ai_info=ai_info,
         )
@@ -1271,10 +1294,11 @@ async def push_tryon_to_screen(
     image.
     """
     supabase = get_supabase_admin_client()
-    settings = get_settings()
 
     shop_id = current.shop_id
     new_generation_id = str(uuid4())
+    # The image was made moments ago by the web app, with the model the shop is set to.
+    model_used = await anyio.to_thread.run_sync(resolve_image_model, supabase, shop_id)
 
     data = await result_image.read()
     mime = result_image.content_type or "image/png"
@@ -1300,7 +1324,7 @@ async def push_tryon_to_screen(
             "folder_id": folder_id.strip(),
             "status": "done",
             "generation_type": "tryon",
-            "model_used": settings.GEMINI_IMAGE_MODEL_ID,
+            "model_used": model_used,
             "prompt_used": "web-app try-on (pushed to screen)",
             "output_path": output_path,
             "credits_used": 0,
