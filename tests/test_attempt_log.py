@@ -7,6 +7,7 @@ import json
 import unittest
 import uuid
 from datetime import timedelta
+from types import SimpleNamespace
 from unittest import mock
 
 from fastapi.testclient import TestClient
@@ -82,14 +83,134 @@ class CostAndResponseTests(unittest.TestCase):
             fakes.image_response(input_tokens=1000, output_tokens=1200, thoughts=90), "gemini-3.1-flash-image-preview"
         )
         self.assertEqual(fields["ai_input_tokens"], 1000)
-        self.assertEqual(fields["ai_output_tokens"], 1290)
-        # (1000 * 0.50 + 1290 * 60) / 1M USD * 84
-        self.assertAlmostEqual(fields["ai_cost_inr"], 6.5436, places=4)
+        self.assertEqual(fields["ai_output_tokens"], 1290)  # total output, as before
+        self.assertEqual((fields["ai_image_output_tokens"], fields["ai_text_output_tokens"]), (1200, 90))
+        # (1000 x 0.50 + 1200 x 60 + 90 x 3.00) / 1M USD x 84
+        self.assertEqual(fields["ai_cost_inr"], 6.11)
         self.assertEqual(fields["ai_finish_reason"], "STOP")
 
     def test_unknown_model_or_missing_usage_gives_null_cost(self):
         self.assertIsNone(attempt_log.ai_cost_inr("some-other-model", 10, 10))
         self.assertIsNone(attempt_log.ai_cost_inr("gemini-3.1-flash-image-preview", None, 10))
+        fields = attempt_log.ai_response_fields(fakes.image_response(), "some-other-model")
+        self.assertIsNone(fields["ai_cost_inr"])
+        self.assertEqual(fields["ai_output_tokens"], 1290)  # tokens are still recorded
+
+
+NB21 = "gemini-nano-banana-2.1"
+
+
+def usage(**fields):
+    return SimpleNamespace(**fields)
+
+
+class CostBreakdownTests(unittest.TestCase):
+    """Real NB 2.1 rows: image = 1,120 tokens, the rest of the output is thinking, Rs 84 / USD."""
+
+    REAL_ROWS = [
+        # (input, total output, expected INR)
+        (3771, 1881, 3.78),
+        (4946, 3033, 4.65),
+        (2506, 2061, 3.73),
+    ]
+
+    def test_real_nb21_rows_without_modality_details(self):
+        for input_tokens, total_output, expected in self.REAL_ROWS:
+            with self.subTest(input_tokens=input_tokens):
+                response = fakes.image_response(
+                    input_tokens=input_tokens, output_tokens=1120, thoughts=total_output - 1120
+                )
+                fields = attempt_log.ai_response_fields(response, NB21)
+                self.assertEqual(fields["ai_cost_inr"], expected)
+                self.assertEqual(fields["ai_input_tokens"], input_tokens)
+                self.assertEqual(fields["ai_output_tokens"], total_output)
+                self.assertEqual(fields["ai_image_output_tokens"], 1120)
+                self.assertEqual(fields["ai_text_output_tokens"], total_output - 1120)
+
+    def test_real_rows_with_modality_details_give_the_same_cost(self):
+        for input_tokens, total_output, expected in self.REAL_ROWS:
+            with self.subTest(input_tokens=input_tokens):
+                details = [SimpleNamespace(modality="IMAGE", token_count=1120)]
+                tokens = attempt_log.ai_token_breakdown(
+                    usage(prompt_token_count=input_tokens, candidates_token_count=1120,
+                          thoughts_token_count=total_output - 1120, candidates_tokens_details=details)
+                )
+                self.assertTrue(tokens["from_details"])
+                cost = attempt_log.ai_cost_inr(
+                    NB21, tokens["input_tokens"], tokens["image_output_tokens"], tokens["text_output_tokens"]
+                )
+                self.assertEqual(cost, expected)
+
+    def test_modality_details_are_used_instead_of_the_fallback(self):
+        # candidates_token_count holds 1,120 image + 200 text tokens; the fallback would price all
+        # 1,320 at the image rate.
+        modality = SimpleNamespace(value="TEXT")  # an enum, like google.genai's MediaModality
+        details = [
+            SimpleNamespace(modality=SimpleNamespace(value="IMAGE"), token_count=1120),
+            SimpleNamespace(modality=modality, token_count=200),
+        ]
+        tokens = attempt_log.ai_token_breakdown(
+            usage(prompt_token_count=3000, candidates_token_count=1320, thoughts_token_count=500,
+                  candidates_tokens_details=details)
+        )
+        self.assertEqual(
+            (tokens["input_tokens"], tokens["image_output_tokens"], tokens["text_output_tokens"], tokens["output_tokens"]),
+            (3000, 1120, 700, 1820),
+        )
+        # (3000 x 1.50 + 1120 x 30 + 700 x 7.50) / 1M x 84 = 3.6414
+        self.assertEqual(attempt_log.ai_cost_inr(NB21, 3000, 1120, 700), 3.64)
+        fallback = attempt_log.ai_token_breakdown(
+            usage(prompt_token_count=3000, candidates_token_count=1320, thoughts_token_count=500)
+        )
+        self.assertFalse(fallback["from_details"])
+        self.assertEqual((fallback["image_output_tokens"], fallback["text_output_tokens"]), (1320, 500))
+
+    def test_nb2_uses_its_own_three_rates(self):
+        # (1000 x 0.50 + 1120 x 60 + 500 x 3.00) / 1M x 84 = 5.8128
+        self.assertEqual(attempt_log.ai_cost_inr("gemini-3.1-flash-image-preview", 1000, 1120, 500), 5.81)
+        self.assertEqual(attempt_log.ai_cost_inr("gemini-3.1-flash-image", 1000, 1120, 500), 5.81)
+
+    def test_unknown_model_is_null_never_a_guess(self):
+        self.assertIsNone(attempt_log.ai_cost_inr("gemini-made-up", 3771, 1120, 761))
+        self.assertIsNone(attempt_log.ai_cost_parts_inr("gemini-made-up", 3771, 1120, 761))
+        breakdown = attempt_log.ai_cost_breakdown(
+            {"model_id": "gemini-made-up", "ai_input_tokens": 10, "ai_image_output_tokens": 5,
+             "ai_text_output_tokens": 1, "ai_cost_inr": None}
+        )
+        self.assertEqual(breakdown["method"], "split")
+        self.assertIsNone(breakdown["image"]["inr"])
+        self.assertIsNone(breakdown["total_inr"])
+
+    def test_broken_usage_never_raises(self):
+        class Exploding:
+            def __getattr__(self, name):
+                raise RuntimeError("bad usage")
+
+        response = SimpleNamespace(usage_metadata=Exploding(), candidates=[], prompt_feedback=None)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            fields = attempt_log.ai_response_fields(response, NB21)
+        self.assertEqual(fields["model_id"], NB21)
+        self.assertNotIn("ai_cost_inr", fields)
+        self.assertIn("WARNING: AI cost not recorded", out.getvalue())
+
+    def test_detail_breakdown_new_and_old_rows(self):
+        new = attempt_log.ai_cost_breakdown(
+            {"model_id": NB21, "ai_input_tokens": 3771, "ai_output_tokens": 1881,
+             "ai_image_output_tokens": 1120, "ai_text_output_tokens": 761, "ai_cost_inr": 3.78}
+        )
+        self.assertEqual(new["method"], "split")
+        self.assertEqual((new["input"]["tokens"], new["image"]["tokens"], new["text"]["tokens"]), (3771, 1120, 761))
+        self.assertAlmostEqual(new["input"]["inr"], 0.4751, places=4)
+        self.assertAlmostEqual(new["image"]["inr"], 2.8224, places=4)
+        self.assertAlmostEqual(new["text"]["inr"], 0.4794, places=4)
+        self.assertEqual(new["total_inr"], 3.78)
+
+        old = attempt_log.ai_cost_breakdown(
+            {"model_id": NB21, "ai_input_tokens": 3771, "ai_output_tokens": 1881, "ai_cost_inr": "5.2151"}
+        )
+        self.assertEqual(old, {"method": "old", "total_inr": 5.2151})
+        self.assertIsNone(attempt_log.ai_cost_breakdown({"model_id": NB21}))
 
     def test_blocked_vs_no_image(self):
         self.assertEqual(attempt_log.no_image_step(fakes.blocked_response()), "ai_blocked")

@@ -90,6 +90,10 @@ class _Query:
         self.filters.append(lambda row: row.get(column) is not None and _as_time(row.get(column)) < _as_time(value))
         return self
 
+    def gt(self, column, value):
+        self.filters.append(lambda row: row.get(column) is not None and _as_time(row.get(column)) > _as_time(value))
+        return self
+
     def gte(self, column, value):
         self.filters.append(lambda row: row.get(column) is not None and _as_time(row.get(column)) >= _as_time(value))
         return self

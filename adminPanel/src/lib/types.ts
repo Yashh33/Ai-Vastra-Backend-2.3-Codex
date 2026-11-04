@@ -173,9 +173,18 @@ export type AttemptRow = {
   model_id: string | null;
   /** Output size requested, e.g. "1K". Null on old rows. */
   image_size?: string | null;
+  /** Estimated AI cost at Google list prices. */
+  ai_cost_inr?: number | string | null;
   has_result: boolean;
   thumb_url: string | null;
 };
+
+export type AiCostPart = { tokens: number | null; inr: number | null };
+
+export type AiCostBreakdown =
+  | { method: "split"; input: AiCostPart; image: AiCostPart; text: AiCostPart; total_inr: number | null }
+  /** Row from before the per-token-type split: every output token was priced at the image rate. */
+  | { method: "old"; total_inr: number | null };
 
 export type AttemptSummary = {
   attempts: number;
@@ -185,6 +194,11 @@ export type AttemptSummary = {
   running: number;
   /** Succeeded / finished, in percent; null when nothing finished. */
   success_rate: number | null;
+  /** Sum of ai_cost_inr for the selected shop / type / dates (every status). */
+  ai_cost_inr?: number | null;
+  ai_cost_succeeded_with_cost?: number;
+  /** ai_cost_inr / succeeded attempts that have a cost. */
+  ai_cost_avg_per_image_inr?: number | null;
 };
 
 export type AttemptListResponse = {
@@ -228,7 +242,10 @@ export type AttemptDetail = Omit<AttemptRow, "has_result" | "thumb_url"> & {
   tryon_result_path: string | null;
   ai_input_tokens: number | null;
   ai_output_tokens: number | null;
+  ai_image_output_tokens?: number | null;
+  ai_text_output_tokens?: number | null;
   ai_cost_inr: number | string | null;
+  ai_cost_breakdown?: AiCostBreakdown | null;
   ai_started_at: string | null;
   ai_finished_at: string | null;
   user_agent: string | null;

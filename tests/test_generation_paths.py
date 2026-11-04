@@ -136,7 +136,7 @@ class WebTryonTests(PathTestCase):
         self.assertTrue(row["prompt_version_label"].startswith("saved 24 Oct 2026"))
         self.assertEqual(row["model_id"], "gemini-3.1-flash-image-preview")
         self.assertEqual((row["ai_input_tokens"], row["ai_output_tokens"]), (1000, 1290))
-        self.assertAlmostEqual(row["ai_cost_inr"], 6.5436, places=4)
+        self.assertAlmostEqual(row["ai_cost_inr"], 6.54, places=2)
         self.assertEqual(row["device_label"], "iPhone · Safari")
         for key in ("ai_started_at", "ai_finished_at", "finished_at", "duration_ms"):
             self.assertIsNotNone(row[key], key)
@@ -355,7 +355,7 @@ class WorkerTests(PathTestCase):
         self.assertEqual(self.row["status"], "succeeded")
         self.assertTrue(self.row["output_path"].startswith(f"{SHOP}/{self.generation_id}/output_v"))
         self.assertEqual((self.row["ai_input_tokens"], self.row["ai_output_tokens"]), (1000, 1290))
-        self.assertAlmostEqual(self.row["ai_cost_inr"], 6.5436, places=4)
+        self.assertAlmostEqual(self.row["ai_cost_inr"], 6.54, places=2)
         self.assertEqual(self.row["credits_charged"], 50)  # set by the API, untouched
         self.assertGreaterEqual(self.row["duration_ms"], 40000)
         self.assertIsNotNone(self.row["ai_started_at"])

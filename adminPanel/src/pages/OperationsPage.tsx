@@ -8,6 +8,7 @@ import {
   ATTEMPT_TYPE_LABELS,
   NOT_RECORDED,
   STATUS_LABELS,
+  formatApproxInr,
   formatCredits,
   formatDuration,
   formatIst,
@@ -151,8 +152,23 @@ export function OperationsPage() {
             <span className="tiny muted">Success rate</span>
             <strong>{summary?.success_rate === null || !summary ? "—" : `${summary.success_rate}%`}</strong>
           </div>
+          <div className="card ops-tile">
+            <span className="tiny muted">AI cost (est.)</span>
+            <strong>{summary?.ai_cost_inr === null || summary?.ai_cost_inr === undefined ? "—" : formatApproxInr(summary.ai_cost_inr)}</strong>
+          </div>
+          <div className="card ops-tile">
+            <span className="tiny muted">Avg per image</span>
+            <strong>
+              {summary?.ai_cost_avg_per_image_inr === null || summary?.ai_cost_avg_per_image_inr === undefined
+                ? "—"
+                : formatApproxInr(summary.ai_cost_avg_per_image_inr)}
+            </strong>
+          </div>
         </section>
-        <p className="tiny muted">Tiles count every status for the selected shop, type and dates.</p>
+        <p className="tiny muted">
+          Tiles count every status for the selected shop, type and dates. AI cost is an estimate at Google list prices
+          (failed attempts included); avg per image = AI cost ÷ succeeded attempts with a cost.
+        </p>
 
         <section className="card stack">
           {error ? <p className="error-text">Could not load the logs: {error}</p> : null}
@@ -175,6 +191,7 @@ export function OperationsPage() {
                     <th>Model</th>
                     <th>Size</th>
                     <th>Credits</th>
+                    <th>AI cost</th>
                     <th>Time taken</th>
                     <th>Output</th>
                   </tr>
@@ -204,6 +221,7 @@ export function OperationsPage() {
                       <td className="ops-nowrap">{row.model_id ? imageModelShortLabel(row.model_id) : "—"}</td>
                       <td className="ops-nowrap">{row.image_size || "—"}</td>
                       <td className="ops-nowrap">{formatCredits(row.credits_charged, row.credits_refunded)}</td>
+                      <td className="ops-nowrap">{row.ai_cost_inr === null || row.ai_cost_inr === undefined ? "—" : formatApproxInr(row.ai_cost_inr)}</td>
                       <td className="ops-nowrap">
                         {row.status === "running" || row.status === "started" ? "running…" : formatDuration(row.duration_ms)}
                       </td>

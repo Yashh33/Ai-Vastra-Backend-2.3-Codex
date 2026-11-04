@@ -98,6 +98,12 @@ export function formatInr(value: number | string | null | undefined): string {
   return Number.isFinite(amount) ? `₹${amount.toFixed(2)}` : NOT_RECORDED;
 }
 
+/** Estimated amount: "≈ ₹3.78"; "—"-style placeholder when not recorded. */
+export function formatApproxInr(value: number | string | null | undefined): string {
+  const text = formatInr(value);
+  return text === NOT_RECORDED ? text : `≈ ${text}`;
+}
+
 export function statusPillClass(status: AttemptStatus): string {
   if (status === "succeeded") return "pill pill-ok";
   if (status === "failed") return "pill pill-bad";

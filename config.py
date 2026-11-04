@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import NamedTuple
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -67,13 +68,21 @@ IMAGE_MODELS: dict[str, tuple[str, str]] = {
 }
 
 
-# AI cost for the Operations log: USD per 1M tokens (input, output), from Google's
-# Gemini API pricing page (standard paid tier). A model not listed here gets
-# ai_cost_inr = null; never a guess.
-GEMINI_PRICES_USD_PER_1M: dict[str, tuple[float, float]] = {
-    "gemini-3.1-flash-image-preview": (0.50, 60.0),
-    "gemini-3.1-flash-image": (0.50, 60.0),
-    "gemini-nano-banana-2.1": (1.50, 30.0),
+class GeminiPrice(NamedTuple):
+    """USD per 1M tokens."""
+
+    input: float
+    image_output: float
+    text_output: float  # text and "thinking" output
+
+
+# AI cost for the Operations log: USD per 1M tokens, from Google's Gemini API pricing page
+# (standard paid tier, Nov 2026). A model not listed here gets ai_cost_inr = null; never a guess.
+# Update these numbers when Google changes prices; the logic does not need to change.
+GEMINI_PRICES_USD_PER_1M: dict[str, GeminiPrice] = {
+    "gemini-nano-banana-2.1": GeminiPrice(input=1.50, image_output=30.00, text_output=7.50),
+    "gemini-3.1-flash-image-preview": GeminiPrice(input=0.50, image_output=60.00, text_output=3.00),
+    "gemini-3.1-flash-image": GeminiPrice(input=0.50, image_output=60.00, text_output=3.00),
 }
 USD_TO_INR = 84.0
 

@@ -169,18 +169,130 @@ def device_label(user_agent: Optional[str]) -> Optional[str]:
 
 # ---------------------------------------------------------------- AI usage and cost
 
-def ai_cost_inr(model_id: Optional[str], input_tokens: Optional[int], output_tokens: Optional[int]) -> Optional[float]:
-    prices = GEMINI_PRICES_USD_PER_1M.get(model_id or "")
-    if not prices or input_tokens is None or output_tokens is None:
-        return None
-    usd = (input_tokens * prices[0] + output_tokens * prices[1]) / 1_000_000
-    return round(usd * USD_TO_INR, 4)
-
-
 def _enum_text(value: Any) -> Optional[str]:
     if value is None:
         return None
     return str(getattr(value, "value", None) or getattr(value, "name", None) or value)
+
+
+def _get(obj: Any, name: str) -> Any:
+    return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+
+
+def _token_count(value: Any) -> Optional[int]:
+    try:
+        return None if value is None else max(0, int(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def ai_token_breakdown(usage: Any) -> dict:
+    """Split one Gemini call's usage into input / image output / text+thinking output.
+
+    - input = prompt_token_count.
+    - Image vs text output from candidates_tokens_details (per-modality counts) when present;
+      any modality other than IMAGE is priced as text. Without the details, the whole of
+      candidates_token_count counts as image output.
+    - thoughts_token_count always counts as text/thinking output.
+    - output_tokens is the total output exactly as before (candidates + thoughts).
+    Values are None when Google did not report them."""
+    input_tokens = _token_count(_get(usage, "prompt_token_count"))
+    candidates = _token_count(_get(usage, "candidates_token_count"))
+    thoughts = _token_count(_get(usage, "thoughts_token_count"))
+    output_tokens = None if candidates is None and thoughts is None else (candidates or 0) + (thoughts or 0)
+
+    image_tokens: Optional[int] = None
+    text_tokens: Optional[int] = None
+    from_details = False
+    details = _get(usage, "candidates_tokens_details") or []
+    image_sum = text_sum = 0
+    for detail in details if isinstance(details, (list, tuple)) else []:
+        count = _token_count(_get(detail, "token_count"))
+        if count is None:
+            continue
+        from_details = True
+        modality = (_enum_text(_get(detail, "modality")) or "").upper().rsplit(".", 1)[-1]
+        if modality == "IMAGE":
+            image_sum += count
+        else:
+            text_sum += count
+    if from_details:
+        image_tokens, text_tokens = image_sum, text_sum
+    elif candidates is not None:
+        image_tokens, text_tokens = candidates, 0
+    if thoughts is not None:
+        text_tokens = (text_tokens or 0) + thoughts
+    if output_tokens is not None:
+        image_tokens = image_tokens or 0
+        text_tokens = text_tokens or 0
+    return {
+        "input_tokens": input_tokens,
+        "image_output_tokens": image_tokens,
+        "text_output_tokens": text_tokens,
+        "output_tokens": output_tokens,
+        "from_details": from_details,
+    }
+
+
+def ai_cost_parts_inr(
+    model_id: Optional[str],
+    input_tokens: Optional[int],
+    image_output_tokens: Optional[int],
+    text_output_tokens: Optional[int] = 0,
+) -> Optional[dict]:
+    """Unrounded INR per token type, or None for an unknown model / missing counts."""
+    prices = GEMINI_PRICES_USD_PER_1M.get(model_id or "")
+    if not prices or input_tokens is None or (image_output_tokens is None and text_output_tokens is None):
+        return None
+    usd = {
+        "input": input_tokens * prices.input,
+        "image": (image_output_tokens or 0) * prices.image_output,
+        "text": (text_output_tokens or 0) * prices.text_output,
+    }
+    return {key: value / 1_000_000 * USD_TO_INR for key, value in usd.items()}
+
+
+def ai_cost_inr(
+    model_id: Optional[str],
+    input_tokens: Optional[int],
+    image_output_tokens: Optional[int],
+    text_output_tokens: Optional[int] = 0,
+) -> Optional[float]:
+    """input x input rate + image x image rate + text/thinking x text rate, in INR (2 decimals).
+    Unknown model or missing counts -> None (never a guess)."""
+    parts = ai_cost_parts_inr(model_id, input_tokens, image_output_tokens, text_output_tokens)
+    return None if parts is None else round(sum(parts.values()), 2)
+
+
+def ai_cost_breakdown(row: dict) -> Optional[dict]:
+    """Operations detail: tokens and INR per token type for a stored attempt row.
+    method "split" = priced per token type; "old" = a row from before the split, whose stored
+    ai_cost_inr priced every output token at the image rate. None if nothing was recorded."""
+    try:
+        input_tokens = _token_count(row.get("ai_input_tokens"))
+        image_tokens = _token_count(row.get("ai_image_output_tokens"))
+        text_tokens = _token_count(row.get("ai_text_output_tokens"))
+        stored = row.get("ai_cost_inr")
+        total = float(stored) if stored is not None else None
+        if image_tokens is None and text_tokens is None:
+            if total is None and row.get("ai_output_tokens") is None:
+                return None
+            return {"method": "old", "total_inr": total}
+        parts = ai_cost_parts_inr(row.get("model_id"), input_tokens, image_tokens, text_tokens)
+
+        def part(tokens: Optional[int], key: str) -> dict:
+            return {"tokens": tokens, "inr": round(parts[key], 4) if parts else None}
+
+        return {
+            "method": "split",
+            "input": part(input_tokens, "input"),
+            "image": part(image_tokens, "image"),
+            "text": part(text_tokens, "text"),
+            "total_inr": total if total is not None else (round(sum(parts.values()), 2) if parts else None),
+        }
+    except Exception as exc:
+        log_write_failed("ai_cost_breakdown", exc)
+        return None
 
 
 def _safety_list(ratings: Any) -> list[dict]:
@@ -200,18 +312,17 @@ def ai_response_fields(response: Any, model_id: Optional[str]) -> dict:
     """Token counts, cost, finish reason and safety from a Gemini response. Never raises."""
     fields: dict[str, Any] = {"model_id": model_id}
     try:
-        usage = getattr(response, "usage_metadata", None)
-        input_tokens = getattr(usage, "prompt_token_count", None)
-        candidates_tokens = getattr(usage, "candidates_token_count", None)
-        thoughts_tokens = getattr(usage, "thoughts_token_count", None)
-        output_tokens = (
-            None
-            if candidates_tokens is None and thoughts_tokens is None
-            else (candidates_tokens or 0) + (thoughts_tokens or 0)
-        )
-        fields["ai_input_tokens"] = input_tokens
-        fields["ai_output_tokens"] = output_tokens
-        fields["ai_cost_inr"] = ai_cost_inr(model_id, input_tokens, output_tokens)
+        try:
+            tokens = ai_token_breakdown(getattr(response, "usage_metadata", None))
+            fields["ai_input_tokens"] = tokens["input_tokens"]
+            fields["ai_output_tokens"] = tokens["output_tokens"]  # total output, as before
+            fields["ai_image_output_tokens"] = tokens["image_output_tokens"]
+            fields["ai_text_output_tokens"] = tokens["text_output_tokens"]
+            fields["ai_cost_inr"] = ai_cost_inr(
+                model_id, tokens["input_tokens"], tokens["image_output_tokens"], tokens["text_output_tokens"]
+            )
+        except Exception as exc:
+            print(f"[attempt_log] WARNING: AI cost not recorded: {_short(exc)}", flush=True)
 
         candidates = getattr(response, "candidates", None) or []
         first = candidates[0] if candidates else None
@@ -375,14 +486,42 @@ def _clean(fields: dict) -> dict:
     return out
 
 
-# Columns that may not exist until their SQL file has run. Always written on their own, so a
-# missing column only loses that value (logged as a write failure), never a status.
-_OPTIONAL_COLUMNS = ("image_size", "result_copy_path", "result_copy_saved_at")
+# Columns that may not exist until their SQL file has run, grouped by that file. Each group is
+# always written on its own, so a missing column only loses that group's values (with a
+# warning), never a status or another group.
+_OPTIONAL_COLUMN_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("sql/2026-11-02_shop_image_model.sql", ("image_size",)),
+    ("sql/2026-11-04_tryon_credits_and_results.sql", ("result_copy_path", "result_copy_saved_at")),
+    ("sql/2026-11-05_ai_cost_breakdown.sql", ("ai_image_output_tokens", "ai_text_output_tokens")),
+)
+_OPTIONAL_COLUMNS = tuple(column for _sql, columns in _OPTIONAL_COLUMN_GROUPS for column in columns)
+_OPTIONAL_SQL_FILE = {column: sql for sql, columns in _OPTIONAL_COLUMN_GROUPS for column in columns}
 
 
-def _split_optional(data: dict) -> tuple[dict, dict]:
-    optional = {key: data[key] for key in _OPTIONAL_COLUMNS if key in data}
-    return {key: value for key, value in data.items() if key not in optional}, optional
+def _split_optional(data: dict) -> tuple[dict, list[dict]]:
+    """(required fields, [one dict per optional column group present])."""
+    groups = [
+        {key: data[key] for key in columns if key in data} for _sql, columns in _OPTIONAL_COLUMN_GROUPS
+    ]
+    groups = [group for group in groups if group]
+    optional = {key for group in groups for key in group}
+    return {key: value for key, value in data.items() if key not in optional}, groups
+
+
+def _is_missing_column(exc: BaseException) -> bool:
+    text = str(exc)
+    return "42703" in text or "PGRST204" in text or ("column" in text.lower() and "does not exist" in text.lower())
+
+
+def _write_optional_group(client: Any, row_id: Any, group: dict, request_id: Any) -> None:
+    """One optional group. A missing column (SQL not run yet) is a warning, not a crash."""
+    try:
+        client.table(TABLE).update(group).eq("id", row_id).execute()
+    except Exception as exc:
+        if not _is_missing_column(exc):
+            raise
+        sql = _OPTIONAL_SQL_FILE.get(next(iter(group)), "its SQL file")
+        log_write_failed(request_id, f"WARNING: {', '.join(group)} not saved, column missing (run {sql}). {_short(exc, 120)}")
 
 
 def _is_unique_violation(exc: Exception) -> bool:
@@ -458,8 +597,11 @@ class AttemptRecord:
         row_id = self.id
         if data:
             _writer.submit(self.request_id, lambda client: client.table(TABLE).update(data).eq("id", row_id).execute())
-        if optional:
-            _writer.submit(self.request_id, lambda client: client.table(TABLE).update(optional).eq("id", row_id).execute())
+        request_id = self.request_id
+        for group in optional:
+            _writer.submit(
+                request_id, lambda client, group=group: _write_optional_group(client, row_id, group, request_id)
+            )
 
     def enrich(self, build: Callable[[Any], dict]) -> None:
         """Fields that need a DB lookup are resolved on the writer thread, off the request path."""
@@ -750,13 +892,12 @@ class WorkerAttempt:
             log_write_failed(f"generation:{self.generation_id}", "no attempt row for this generation")
         return None
 
-    def _write_optional(self, row_id: Any, optional: dict) -> None:
-        if not optional:
-            return
-        try:
-            _client().table(TABLE).update(optional).eq("id", row_id).execute()
-        except Exception as exc:
-            log_write_failed(f"generation:{self.generation_id}", exc)
+    def _write_optional(self, row_id: Any, optional: list[dict]) -> None:
+        for group in optional:
+            try:
+                _write_optional_group(_client(), row_id, group, f"generation:{self.generation_id}")
+            except Exception as exc:
+                log_write_failed(f"generation:{self.generation_id}", exc)
 
     def update(self, **fields: Any) -> None:
         try:

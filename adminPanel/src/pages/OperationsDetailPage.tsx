@@ -10,6 +10,7 @@ import {
   FAILED_STEP_LABELS,
   NOT_RECORDED,
   STATUS_LABELS,
+  formatApproxInr,
   formatCredits,
   formatDuration,
   formatInr,
@@ -17,11 +18,44 @@ import {
   garmentLabel,
   statusPillClass,
 } from "../lib/operations";
-import type { AttemptDetail } from "../lib/types";
+import type { AiCostPart, AttemptDetail } from "../lib/types";
 
 function yesNo(value: boolean | null | undefined): string {
   if (value === null || value === undefined) return NOT_RECORDED;
   return value ? "yes" : "no";
+}
+
+function tokensLabel(tokens: number | null | undefined): string {
+  return tokens === null || tokens === undefined ? NOT_RECORDED : `${tokens.toLocaleString("en-IN")} tokens`;
+}
+
+/** Tokens and estimated INR per token type, or the old single total for rows priced before the split. */
+function AiCostLine({ attempt }: { attempt: AttemptDetail }) {
+  const breakdown = attempt.ai_cost_breakdown;
+  if (breakdown?.method === "split") {
+    const parts: [string, AiCostPart][] = [
+      ["Input", breakdown.input],
+      ["Image", breakdown.image],
+      ["Thinking/text", breakdown.text],
+    ];
+    return (
+      <p className="tiny muted">
+        {parts.map(([label, part]) => (
+          <span key={label}>
+            {label}: {tokensLabel(part.tokens)} · {formatInr(part.inr)} |{" "}
+          </span>
+        ))}
+        Total {formatApproxInr(breakdown.total_inr ?? attempt.ai_cost_inr)} (estimate, Google list prices)
+      </p>
+    );
+  }
+  return (
+    <p className="tiny muted">
+      AI tokens in/out: {attempt.ai_input_tokens ?? NOT_RECORDED} / {attempt.ai_output_tokens ?? NOT_RECORDED} · Total{" "}
+      {formatApproxInr(attempt.ai_cost_inr)}
+      {breakdown?.method === "old" && attempt.ai_cost_inr !== null ? " (old method, may be higher than real)" : ""}
+    </p>
+  );
 }
 
 function CopyButton({ text, label = "Copy" }: { text: string; label?: string }) {
@@ -167,8 +201,8 @@ export function OperationsDetailPage() {
             <strong>{attempt.credits_refunded ?? (failed ? NOT_RECORDED : 0)}</strong>
           </div>
           <div className="card ops-tile">
-            <span className="tiny muted">AI cost</span>
-            <strong>{formatInr(attempt.ai_cost_inr)}</strong>
+            <span className="tiny muted">AI cost (est.)</span>
+            <strong>{formatApproxInr(attempt.ai_cost_inr)}</strong>
           </div>
           <div className="card ops-tile">
             <span className="tiny muted">Time taken</span>
@@ -184,12 +218,12 @@ export function OperationsDetailPage() {
           {attempt.image_size || NOT_RECORDED}
         </p>
         <p className="tiny muted">
-          Net credits: {formatCredits(attempt.credits_charged, attempt.credits_refunded)} · AI tokens in/out:{" "}
-          {attempt.ai_input_tokens ?? NOT_RECORDED} / {attempt.ai_output_tokens ?? NOT_RECORDED} · AI time:{" "}
+          Net credits: {formatCredits(attempt.credits_charged, attempt.credits_refunded)} · AI time:{" "}
           {attempt.ai_started_at && attempt.ai_finished_at
             ? formatDuration(new Date(attempt.ai_finished_at).getTime() - new Date(attempt.ai_started_at).getTime())
             : NOT_RECORDED}
         </p>
+        <AiCostLine attempt={attempt} />
 
         {failed ? (
           <section className="card stack ops-error-box">

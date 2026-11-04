@@ -2373,8 +2373,11 @@ async def upload_shop_looks_bulk(
 _ATTEMPT_LIST_COLUMNS = (
     "id, request_id, created_at, started_at, finished_at, duration_ms, shop_id, user_email, "
     "user_label, attempt_type, garment_type_name, fabric_mode, status, failed_step, "
-    "credits_charged, credits_refunded, output_path, tryon_result_path, backfilled, device_label, model_id"
+    "credits_charged, credits_refunded, output_path, tryon_result_path, backfilled, device_label, model_id, "
+    "ai_cost_inr"
 )
+_AI_COST_PAGE_ROWS = 1000  # PostgREST's default max rows per request
+_AI_COST_MAX_PAGES = 100
 # Until sql/2026-11-02_shop_image_model.sql has run, the list works without this column.
 _ATTEMPT_OPTIONAL_LIST_COLUMNS = ", image_size, result_copy_path"
 _ATTEMPT_OPTIONAL_LIST_COLUMN_NAMES = ("image_size", "result_copy_path")
@@ -2425,6 +2428,47 @@ def _count_attempts(supabase, **filters) -> int:
     query = supabase.table(attempt_log.TABLE).select("id", count="exact").limit(1)
     result = _apply_attempt_filters(query, **filters).execute()
     return int(getattr(result, "count", None) or 0)
+
+
+def _ai_cost_summary(supabase, **filters) -> dict:
+    """Sum of the stored ai_cost_inr (an estimate at Google list prices) for these filters, and
+    that sum divided by the succeeded attempts that have a cost. Never breaks the list."""
+    empty = {"ai_cost_inr": None, "ai_cost_succeeded_with_cost": 0, "ai_cost_avg_per_image_inr": None}
+    try:
+        total = 0.0
+        with_cost = 0
+        succeeded_with_cost = 0
+        for page_no in range(_AI_COST_MAX_PAGES):
+            start = page_no * _AI_COST_PAGE_ROWS
+            query = (
+                supabase.table(attempt_log.TABLE)
+                .select("id, status, ai_cost_inr")
+                .gt("ai_cost_inr", 0)
+                .order("id", desc=False)
+                .range(start, start + _AI_COST_PAGE_ROWS - 1)
+            )
+            rows = getattr(_apply_attempt_filters(query, **filters).execute(), "data", None) or []
+            for row in rows:
+                try:
+                    cost = float(row.get("ai_cost_inr"))
+                except (TypeError, ValueError):
+                    continue
+                total += cost
+                with_cost += 1
+                if row.get("status") == "succeeded":
+                    succeeded_with_cost += 1
+            if len(rows) < _AI_COST_PAGE_ROWS:
+                break
+        else:
+            print(f"[admin_api] WARNING: AI cost tile capped at {_AI_COST_MAX_PAGES * _AI_COST_PAGE_ROWS} rows")
+        return {
+            "ai_cost_inr": round(total, 2) if with_cost else 0.0,
+            "ai_cost_succeeded_with_cost": succeeded_with_cost,
+            "ai_cost_avg_per_image_inr": round(total / succeeded_with_cost, 2) if succeeded_with_cost else None,
+        }
+    except Exception as exc:
+        print(f"[admin_api] WARNING: AI cost tile not computed: {attempt_log.scrub(str(exc), 300)}")
+        return empty
 
 
 def _shop_names(supabase, shop_ids: list[str]) -> dict[str, str]:
@@ -2500,6 +2544,7 @@ def list_generation_attempts(
         all_count = _count_attempts(supabase, status_filter=None, **base_filters)
         succeeded_count = _count_attempts(supabase, status_filter="succeeded", **base_filters)
         failed_count = _count_attempts(supabase, status_filter="failed", **base_filters)
+        ai_cost = _ai_cost_summary(supabase, status_filter=None, **base_filters)
     except HTTPException:
         raise
     except Exception as exc:
@@ -2565,6 +2610,7 @@ def list_generation_attempts(
             "failed": failed_count,
             "running": max(0, all_count - finished),
             "success_rate": round(succeeded_count * 100.0 / finished, 1) if finished else None,
+            **ai_cost,
         },
     }
 
@@ -2618,4 +2664,6 @@ def get_generation_attempt(attempt_id: str):
         # Admin-only small copy of a try-on result (deleted automatically after the retention period).
         "result_copy_url": signed_copy.get(copy_path) if copy_path else None,
         "result_retention_days": get_settings().TRYON_RESULT_RETENTION_DAYS,
+        # Tokens and INR per token type ("split"), or "old" for rows priced before the split.
+        "ai_cost_breakdown": attempt_log.ai_cost_breakdown(row),
     }

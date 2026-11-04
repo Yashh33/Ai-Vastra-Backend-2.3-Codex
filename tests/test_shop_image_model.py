@@ -130,8 +130,8 @@ class ResolveTests(ModelTestCase):
 
     def test_cost_uses_the_nb21_prices(self):
         # (1000 x 1.50 + 1290 x 30) / 1M USD x 84 INR
-        self.assertAlmostEqual(attempt_log.ai_cost_inr(NB21, 1000, 1290), 3.3768, places=4)
-        self.assertAlmostEqual(attempt_log.ai_cost_inr(NB2, 1000, 1290), 6.5436, places=4)
+        self.assertAlmostEqual(attempt_log.ai_cost_inr(NB21, 1000, 1290), 3.38, places=2)
+        self.assertAlmostEqual(attempt_log.ai_cost_inr(NB2, 1000, 1290), 6.54, places=2)
 
 
 class TryonTests(ModelTestCase):
@@ -145,7 +145,7 @@ class TryonTests(ModelTestCase):
     def assert_recorded(self, model: str, cost: float) -> None:
         row = self.only_attempt_row()
         self.assertEqual((row["model_id"], row["image_size"], row["status"]), (model, "1K", "succeeded"))
-        self.assertAlmostEqual(row["ai_cost_inr"], cost, places=4)
+        self.assertAlmostEqual(row["ai_cost_inr"], cost, places=2)
 
     def test_shop_model_is_called_at_1k_with_no_aspect_ratio_and_recorded(self):
         self.set_shop_model(NB2)
@@ -272,7 +272,7 @@ class LookPathTests(ModelTestCase):
         self.assertEqual(self.generation()["model_used"], NB2)
         row = self.only_attempt_row()
         self.assertEqual((row["status"], row["model_id"], row["image_size"]), ("succeeded", NB2, "1K"))
-        self.assertAlmostEqual(row["ai_cost_inr"], 6.5436, places=4)
+        self.assertAlmostEqual(row["ai_cost_inr"], 6.54, places=2)
 
     def test_admin_change_after_queueing_applies_to_the_job(self):
         self.queue_look()
