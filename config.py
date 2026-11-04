@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     GEMINI_IMAGE_MODEL_ID: str = "gemini-3.1-flash-image-preview"
     # Output size of every generated image (looks and try-ons), for every model.
     GEMINI_IMAGE_SIZE: str = "1K"
+    # Days a small copy of each web try-on result is kept for the admin (then deleted by the worker).
+    TRYON_RESULT_RETENTION_DAYS: int = Field(default=7, ge=1)
 
     # Single source of truth for the credit/image ratio. A future ratio
     # change (e.g. perception pricing) is a one-line edit here.

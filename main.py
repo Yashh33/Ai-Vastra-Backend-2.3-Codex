@@ -3,12 +3,14 @@ import threading
 
 from cachetools import TTLCache
 from dotenv import dotenv_values
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
 from admin_api import router as admin_router
+import attempt_log
 from attempt_log import AttemptLogMiddleware
 from attempt_log import flush as flush_attempt_log
 from attempt_logs_api import router as attempt_logs_router
@@ -21,7 +23,12 @@ from images_api import router as images_router
 from payments_api import router as payments_router
 from prompt_library_api import router as prompt_library_router
 from segment_api import router as segment_router
-from supabase_client import get_supabase_admin_client
+from supabase_client import (
+    CONNECTION_PROBLEM_DETAIL,
+    TRANSIENT_ERROR_TYPES,
+    caused_by_connection_problem,
+    get_supabase_admin_client,
+)
 from tryon_api import router as tryon_router
 from whatsapp_api import router as whatsapp_router
 from whatsapp_watcher import start_completion_watcher
@@ -49,6 +56,30 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["X-Request-Id"],
 )
+
+
+def _connection_problem_response(request: Request, exc: BaseException) -> JSONResponse:
+    # Logged on the attempt row (for generation requests) with the real cause.
+    attempt_log.from_request(request).note_error(exc)
+    print(f"[main] connection problem on {request.url.path}: {type(exc).__name__}")
+    return JSONResponse(status_code=503, content={"detail": CONNECTION_PROBLEM_DETAIL})
+
+
+@app.exception_handler(HTTPException)
+async def _http_exception(request: Request, exc: HTTPException):
+    # "Failed to fetch ..." (500) raised from a dropped connection: 503, so the app can say "try again".
+    if exc.status_code >= 500 and exc.status_code != 503 and caused_by_connection_problem(exc):
+        return _connection_problem_response(request, exc)
+    return await http_exception_handler(request, exc)
+
+
+async def _transient_error(request: Request, exc: Exception):
+    # A dropped database / storage connection nothing caught: 503, not 500.
+    return _connection_problem_response(request, exc)
+
+
+for _error_type in TRANSIENT_ERROR_TYPES:
+    app.add_exception_handler(_error_type, _transient_error)
 
 
 app.include_router(folders_router)

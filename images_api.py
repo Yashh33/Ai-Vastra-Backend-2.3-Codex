@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 from auth_deps import CurrentShopContext, get_current_shop_context
 from config import get_settings
 from image_thumbs import store_hero_thumbnail_best_effort
-from supabase_client import get_supabase_admin_client
+from supabase_client import get_supabase_admin_client, retry_once
 
 router = APIRouter(tags=["Images"])
 
@@ -100,8 +100,8 @@ def create_hero_image_metadata(
 
     # Validate folder belongs to current shop
     try:
-        folder_check = (
-            supabase.table("garment_types")
+        folder_check = retry_once(
+            lambda: supabase.table("garment_types")
             .select("id")
             .eq("id", folder_id)
             .eq("shop_id", current.shop_id)
@@ -144,8 +144,8 @@ def create_hero_image_metadata(
 
     rows = getattr(result, "data", None) or []
     if not rows:
-        fetch = (
-            supabase.table("hero_images")
+        fetch = retry_once(
+            lambda: supabase.table("hero_images")
             .select("*")
             .eq("shop_id", current.shop_id)
             .eq("folder_id", folder_id)
@@ -181,8 +181,8 @@ def create_catalog_image_metadata(
     folder_id = _clean_required_text(body.folder_id, "folder_id")
 
     try:
-        folder_check = (
-            supabase.table("garment_types")
+        folder_check = retry_once(
+            lambda: supabase.table("garment_types")
             .select("id")
             .eq("id", folder_id)
             .eq("shop_id", current.shop_id)
@@ -227,8 +227,8 @@ def create_catalog_image_metadata(
 
     rows = getattr(result, "data", None) or []
     if not rows:
-        fetch = (
-            supabase.table("catalog_images")
+        fetch = retry_once(
+            lambda: supabase.table("catalog_images")
             .select("*")
             .eq("shop_id", current.shop_id)
             .eq("folder_id", folder_id)
@@ -326,8 +326,8 @@ def get_catalog_image_download_url(
     image_id = _clean_required_text(catalog_image_id, "catalog_image_id")
 
     try:
-        result = (
-            supabase.table("catalog_images")
+        result = retry_once(
+            lambda: supabase.table("catalog_images")
             .select("id, storage_path, is_active")
             .eq("id", image_id)
             .eq("shop_id", current.shop_id)
@@ -362,8 +362,8 @@ def get_catalog_image_download_url(
         )
 
     try:
-        signed = (
-            supabase.storage.from_("catalog-images")
+        signed = retry_once(
+            lambda: supabase.storage.from_("catalog-images")
             .create_signed_url(storage_path, expires_in_seconds)
         )
     except Exception as exc:
@@ -418,8 +418,8 @@ def create_fabric_image_metadata(
 
     rows = getattr(result, "data", None) or []
     if not rows:
-        fetch = (
-            supabase.table("fabric_images")
+        fetch = retry_once(
+            lambda: supabase.table("fabric_images")
             .select("*")
             .eq("shop_id", current.shop_id)
             .eq("storage_path", payload["storage_path"])
@@ -475,8 +475,8 @@ def get_fabric_image_metadata(
     image_id = _clean_required_text(fabric_image_id, "fabric_image_id")
 
     try:
-        result = (
-            supabase.table("fabric_images")
+        result = retry_once(
+            lambda: supabase.table("fabric_images")
             .select("*")
             .eq("id", image_id)
             .eq("shop_id", current.shop_id)

@@ -113,6 +113,7 @@ class WebTryonTests(PathTestCase):
         return self.client.post("/tryon/quick/v2", data=data, files=upload, headers=headers or {})
 
     def test_success_records_inputs_prompt_cost_and_request_id(self):
+        fakes.install_tryon_credits(self.db)
         client_id = str(uuid.uuid4())
         response = self.quick_v2(headers={"X-Client-Request-Id": client_id, "User-Agent": "Mozilla/5.0 (iPhone) Safari/604.1"})
 
@@ -139,7 +140,7 @@ class WebTryonTests(PathTestCase):
         self.assertEqual(row["device_label"], "iPhone · Safari")
         for key in ("ai_started_at", "ai_finished_at", "finished_at", "duration_ms"):
             self.assertIsNotNone(row[key], key)
-        self.assertIsNone(row.get("credits_charged"))  # web try-ons charge no credits
+        self.assertEqual(row["credits_charged"], 50)
         assert_no_customer_photo(self, self.db)
 
     def test_consent_missing_is_validation_with_exact_message(self):

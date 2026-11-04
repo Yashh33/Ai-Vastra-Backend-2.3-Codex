@@ -16,7 +16,7 @@ from image_models import resolve_image_model
 from image_thumbs import look_thumbnail_path
 from prompting import DEFAULT_LOOK_PROMPT, fill_prompt_placeholders
 from segment_api import mask_storage_prefix
-from supabase_client import get_supabase_admin_client
+from supabase_client import caused_by_connection_problem, get_supabase_admin_client, retry_once
 from tryon_api import _upload_generated_output
 
 router = APIRouter(prefix="/generations", tags=["Generations"])
@@ -93,8 +93,8 @@ def _sign_paths_with_fallback(
         return {}
 
     try:
-        signed_items = (
-            supabase.storage.from_("generated-outputs")
+        signed_items = retry_once(
+            lambda: supabase.storage.from_("generated-outputs")
             .create_signed_urls(unique_paths, expires_in)
         )
         return _build_signed_url_map(signed_items, settings)
@@ -114,8 +114,8 @@ def _sign_paths_with_fallback(
 
     for path in ordered_paths:
         try:
-            signed = (
-                supabase.storage.from_("generated-outputs")
+            signed = retry_once(
+                lambda: supabase.storage.from_("generated-outputs")
                 .create_signed_url(path, expires_in)
             )
         except Exception as exc:
@@ -325,8 +325,8 @@ def _attach_generation_fabric_metadata(
         return generation_rows
 
     try:
-        result = (
-            supabase.table("generation_fabrics")
+        result = retry_once(
+            lambda: supabase.table("generation_fabrics")
             .select("generation_id, apply_to, sort_order, fabric_code, fabric_color")
             .eq("shop_id", shop_id)
             .in_("generation_id", generation_ids)
@@ -339,8 +339,8 @@ def _attach_generation_fabric_metadata(
         message = str(exc).lower()
         if "fabric_code" in message or "fabric_color" in message:
             try:
-                fallback_result = (
-                    supabase.table("generation_fabrics")
+                fallback_result = retry_once(
+                    lambda: supabase.table("generation_fabrics")
                     .select("generation_id, apply_to, sort_order")
                     .eq("shop_id", shop_id)
                     .in_("generation_id", generation_ids)
@@ -405,8 +405,8 @@ def _persist_generation_fabric_metadata(
                 "fabric_color": _clean_optional_text(item.get("fabric_color")),
             }
 
-            (
-                supabase.table("generation_fabrics")
+            retry_once(
+                lambda: supabase.table("generation_fabrics")
                 .update(payload)
                 .eq("generation_id", generation_id)
                 .eq("shop_id", shop_id)
@@ -486,8 +486,8 @@ def _load_folder_prompt_context_for_hero_image(
     hero_image_id: str,
 ) -> dict:
     try:
-        hero_result = (
-            supabase.table("hero_images")
+        hero_result = retry_once(
+            lambda: supabase.table("hero_images")
             .select("id, folder_id")
             .eq("id", hero_image_id)
             .eq("shop_id", shop_id)
@@ -510,8 +510,8 @@ def _load_folder_prompt_context_for_hero_image(
     folder_id = str(hero_rows[0]["folder_id"])
 
     try:
-        folder_result = (
-            supabase.table("garment_types")
+        folder_result = retry_once(
+            lambda: supabase.table("garment_types")
             .select("id, name, look_prompt")
             .eq("id", folder_id)
             .eq("shop_id", shop_id)
@@ -540,8 +540,8 @@ _APPLY_TO_MAX_LENGTH = 80
 def _load_garment_fabric_slots(supabase, *, shop_id: str, folder_id: str) -> list[dict[str, Any]]:
     """Fabric slots the admin configured for a garment type, in sort order."""
     try:
-        result = (
-            supabase.table("garment_fabric_slots")
+        result = retry_once(
+            lambda: supabase.table("garment_fabric_slots")
             .select("label, apply_to, sort_order")
             .eq("folder_id", folder_id)
             .eq("shop_id", shop_id)
@@ -1151,8 +1151,8 @@ def create_generation(
 
     # Best-effort save: avoid failing the request after credits were already debited.
     try:
-        (
-            supabase.table("generations")
+        retry_once(
+            lambda: supabase.table("generations")
             .update(
                 {
                     "prompt_used": prompt_used,
@@ -1305,8 +1305,8 @@ def get_generation_download_urls_batch(
         )
 
     try:
-        result = (
-            supabase.table("generations")
+        result = retry_once(
+            lambda: supabase.table("generations")
             .select("id, status, output_path")
             .eq("shop_id", current.shop_id)
             .in_("id", ids)
@@ -1370,8 +1370,8 @@ def get_generation(
     generation_id = _clean_id(generation_id, "generation_id")
 
     try:
-        result = (
-            supabase.table("generations")
+        result = retry_once(
+            lambda: supabase.table("generations")
             .select("*")
             .eq("id", generation_id)
             .eq("shop_id", current.shop_id)
@@ -1411,8 +1411,8 @@ def get_generation_download_url(
     generation_id = _clean_id(generation_id, "generation_id")
 
     try:
-        result = (
-            supabase.table("generations")
+        result = retry_once(
+            lambda: supabase.table("generations")
             .select("id, status, output_path")
             .eq("id", generation_id)
             .eq("shop_id", current.shop_id)
@@ -1443,8 +1443,8 @@ def get_generation_download_url(
         )
 
     try:
-        signed = (
-            supabase.storage.from_("generated-outputs")
+        signed = retry_once(
+            lambda: supabase.storage.from_("generated-outputs")
             .create_signed_url(output_path, expires_in_seconds)
         )
     except Exception as exc:
@@ -1490,8 +1490,8 @@ def match_color_on_generation_output(
     normalized_edits = _normalize_match_color_edits(body)
 
     try:
-        result = (
-            supabase.table("generations")
+        result = retry_once(
+            lambda: supabase.table("generations")
             .select("id, status, output_path")
             .eq("id", generation_id)
             .eq("shop_id", current.shop_id)
@@ -1587,8 +1587,8 @@ def match_color_on_generation_output(
         print(f"WARNING: failed to generate/upload thumbnail for {new_output_path}: {exc}")
 
     try:
-        (
-            supabase.table("generations")
+        retry_once(
+            lambda: supabase.table("generations")
             .update({"output_path": new_output_path})
             .eq("id", generation_id)
             .eq("shop_id", current.shop_id)
@@ -1673,8 +1673,8 @@ _COLOR_CORRECTED_MAX_BYTES = 8 * 1024 * 1024
 
 def _load_own_look(supabase, *, shop_id: str, generation_id: str) -> dict:
     try:
-        result = (
-            supabase.table("generations")
+        result = retry_once(
+            lambda: supabase.table("generations")
             .select("id, generation_type, output_path, original_output_path")
             .eq("id", generation_id)
             .eq("shop_id", shop_id)
@@ -1804,8 +1804,8 @@ def _save_color_corrected_output(shop_id: str, generation_id: str, data: bytes) 
         print(f"[generations_api] WARNING: failed to generate/upload thumbnail for {new_path}: {exc}")
 
     try:
-        (
-            supabase.table("generations")
+        retry_once(
+            lambda: supabase.table("generations")
             .update({"output_path": new_path, "original_output_path": original_path})
             .eq("id", generation_id)
             .eq("shop_id", shop_id)
@@ -1843,8 +1843,8 @@ def restore_original_output(
         return {"id": generation_id, "output_path": current_path}
 
     try:
-        (
-            supabase.table("generations")
+        retry_once(
+            lambda: supabase.table("generations")
             .update({"output_path": original_path, "original_output_path": None})
             .eq("id", generation_id)
             .eq("shop_id", current.shop_id)
@@ -1870,7 +1870,8 @@ _OUTPUT_CONTENT_TYPES = {"png": "image/png", "webp": "image/webp"}
 def _copy_output_file(supabase, *, source_path: str, new_path: str, ext: str) -> None:
     storage_bucket = supabase.storage.from_("generated-outputs")
     try:
-        storage_bucket.copy(source_path, new_path)
+        # The new path is unique to this push: repeating the copy is harmless.
+        retry_once(lambda: storage_bucket.copy(source_path, new_path))
         return
     except Exception as exc:
         print(f"[generations_api] WARNING: storage copy failed for {source_path}, re-uploading: {exc}")
@@ -1879,7 +1880,7 @@ def _copy_output_file(supabase, *, source_path: str, new_path: str, ext: str) ->
         supabase,
         bucket="generated-outputs",
         path=new_path,
-        data=storage_bucket.download(source_path),
+        data=retry_once(lambda: storage_bucket.download(source_path)),
         content_type=_OUTPUT_CONTENT_TYPES.get(ext, "image/jpeg"),
     )
 
@@ -1906,8 +1907,8 @@ def push_look_to_screen(
         )
 
     try:
-        result = (
-            supabase.table("generations")
+        result = retry_once(
+            lambda: supabase.table("generations")
             .select("id, generation_type, status, output_path, folder_id, hero_image_id, fabric_image_id, model_used")
             .eq("id", generation_id)
             .eq("shop_id", shop_id)
@@ -1950,42 +1951,43 @@ def push_look_to_screen(
 
     now_iso = datetime.now(timezone.utc).isoformat()
 
+    generation_row = {
+        "id": new_generation_id,
+        "shop_id": shop_id,
+        "hero_image_id": look.get("hero_image_id"),
+        "fabric_image_id": look.get("fabric_image_id"),
+        "folder_id": look.get("folder_id"),
+        "status": "done",
+        "generation_type": "tryon",
+        "model_used": look.get("model_used") or settings.GEMINI_IMAGE_MODEL_ID,
+        "prompt_used": "web-app look (pushed to screen)",
+        "output_path": output_path,
+        "credits_used": 0,
+        "show_on_screen": True,
+        "created_at": now_iso,
+        "started_at": now_iso,
+        "completed_at": now_iso,
+    }
     try:
-        supabase.table("generations").insert(
-            {
-                "id": new_generation_id,
-                "shop_id": shop_id,
-                "hero_image_id": look.get("hero_image_id"),
-                "fabric_image_id": look.get("fabric_image_id"),
-                "folder_id": look.get("folder_id"),
-                "status": "done",
-                "generation_type": "tryon",
-                "model_used": look.get("model_used") or settings.GEMINI_IMAGE_MODEL_ID,
-                "prompt_used": "web-app look (pushed to screen)",
-                "output_path": output_path,
-                "credits_used": 0,
-                "show_on_screen": True,
-                "created_at": now_iso,
-                "started_at": now_iso,
-                "completed_at": now_iso,
-            }
-        ).execute()
+        # The row carries its own id, so a repeat after a dropped connection cannot add a second one.
+        retry_once(lambda: supabase.table("generations").insert(generation_row).execute(), duplicate_ok=True)
     except Exception as exc:
-        _remove_output_files_best_effort(supabase, [output_path])
+        # After a dropped connection the row may have landed: keep its image.
+        if not caused_by_connection_problem(exc):
+            _remove_output_files_best_effort(supabase, [output_path])
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to save pushed look",
         ) from exc
 
+    screen_state = {
+        "shop_id": shop_id,
+        "live_generation_id": new_generation_id,
+        "mode": "live",
+        "updated_at": now_iso,
+    }
     try:
-        supabase.table("shop_screen_state").upsert(
-            {
-                "shop_id": shop_id,
-                "live_generation_id": new_generation_id,
-                "mode": "live",
-                "updated_at": now_iso,
-            }
-        ).execute()
+        retry_once(lambda: supabase.table("shop_screen_state").upsert(screen_state).execute())
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2014,8 +2016,8 @@ def delete_generation_output(
     generation_id = _clean_id(generation_id, "generation_id")
 
     try:
-        result = (
-            supabase.table("generations")
+        result = retry_once(
+            lambda: supabase.table("generations")
             .select("id, status, output_path, original_output_path")
             .eq("id", generation_id)
             .eq("shop_id", current.shop_id)

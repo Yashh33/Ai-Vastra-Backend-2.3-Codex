@@ -10,6 +10,7 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 import attempt_log
+import tryon_results
 from admin_deps import verify_admin_secret
 from config import IMAGE_MODELS, get_settings
 from image_thumbs import (
@@ -2375,7 +2376,8 @@ _ATTEMPT_LIST_COLUMNS = (
     "credits_charged, credits_refunded, output_path, tryon_result_path, backfilled, device_label, model_id"
 )
 # Until sql/2026-11-02_shop_image_model.sql has run, the list works without this column.
-_ATTEMPT_OPTIONAL_LIST_COLUMNS = ", image_size"
+_ATTEMPT_OPTIONAL_LIST_COLUMNS = ", image_size, result_copy_path"
+_ATTEMPT_OPTIONAL_LIST_COLUMN_NAMES = ("image_size", "result_copy_path")
 _ATTEMPT_STATUS_FILTERS = {"succeeded", "failed", "running"}
 
 
@@ -2489,9 +2491,9 @@ def list_generation_attempts(
         try:
             result = _fetch_page(_ATTEMPT_LIST_COLUMNS + _ATTEMPT_OPTIONAL_LIST_COLUMNS)
         except Exception as exc:
-            if "image_size" not in str(exc):
+            if not any(name in str(exc) for name in _ATTEMPT_OPTIONAL_LIST_COLUMN_NAMES):
                 raise
-            print(f"[admin_api] WARNING: generation_attempts.image_size is missing: {attempt_log.scrub(str(exc), 300)}")
+            print(f"[admin_api] WARNING: generation_attempts columns missing: {attempt_log.scrub(str(exc), 300)}")
             result = _fetch_page(_ATTEMPT_LIST_COLUMNS)
 
         # Tiles: same shop / type / dates, every status.
@@ -2516,20 +2518,37 @@ def list_generation_attempts(
         if path:
             sign_paths.extend([look_thumbnail_path(path), path])
     signed = sign_existing_paths("generated-outputs", sorted(set(sign_paths)), expires_in=3600) if sign_paths else {}
+    # Try-on rows without a stored result: the admin-only small copy, while it is kept.
+    copy_paths = [
+        None if path else (row.get("result_copy_path") if tryon_results.is_copy_path(row.get("result_copy_path")) else None)
+        for row, path in zip(rows, result_paths)
+    ]
+    wanted_copies = sorted({path for path in copy_paths if path})
+    signed_copies = (
+        sign_existing_paths(tryon_results.BUCKET, wanted_copies, expires_in=tryon_results.SIGNED_URL_SECONDS)
+        if wanted_copies
+        else {}
+    )
 
     now = datetime.now(timezone.utc)
     items = []
-    for row, path in zip(rows, result_paths):
+    for row, path, copy_path in zip(rows, result_paths, copy_paths):
         thumb_url = None
         if path:
             thumb_url = signed.get(look_thumbnail_path(path)) or signed.get(path)
+        elif copy_path:
+            thumb_url = signed_copies.get(copy_path)
         items.append(
             {
-                **{key: value for key, value in row.items() if key not in ("output_path", "tryon_result_path")},
+                **{
+                    key: value
+                    for key, value in row.items()
+                    if key not in ("output_path", "tryon_result_path", "result_copy_path")
+                },
                 "raw_status": row.get("status"),
                 "status": attempt_log.effective_status(row, now),
                 "shop_name": names.get(str(row.get("shop_id") or "")),
-                "has_result": bool(path),
+                "has_result": bool(path or copy_path),
                 "thumb_url": thumb_url,
             }
         )
@@ -2572,6 +2591,12 @@ def get_generation_attempt(attempt_id: str):
     signed_hero = sign_existing_paths(hero_bucket, [hero_path]) if hero_path else {}
     signed_fabrics = sign_existing_paths("fabric-images", sorted(set(fabric_paths))) if fabric_paths else {}
     signed_outputs = sign_existing_paths("generated-outputs", output_paths) if output_paths else {}
+    copy_path = row.get("result_copy_path") if tryon_results.is_copy_path(row.get("result_copy_path")) else None
+    signed_copy = (
+        sign_existing_paths(tryon_results.BUCKET, [copy_path], expires_in=tryon_results.SIGNED_URL_SECONDS)
+        if copy_path
+        else {}
+    )
 
     shop_name = None
     if row.get("shop_id"):
@@ -2590,4 +2615,7 @@ def get_generation_attempt(attempt_id: str):
         ],
         "output_url": signed_outputs.get(row["output_path"]) if row.get("output_path") else None,
         "tryon_result_url": signed_outputs.get(row["tryon_result_path"]) if row.get("tryon_result_path") else None,
+        # Admin-only small copy of a try-on result (deleted automatically after the retention period).
+        "result_copy_url": signed_copy.get(copy_path) if copy_path else None,
+        "result_retention_days": get_settings().TRYON_RESULT_RETENTION_DAYS,
     }

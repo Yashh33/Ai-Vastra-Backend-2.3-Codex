@@ -15,6 +15,7 @@ from supabase import create_client
 
 import attempt_log
 import default_fabrics
+import tryon_results
 from config import get_settings
 from image_models import pick_image_model, read_shop_image_model, warn_read_failed
 from image_thumbs import look_thumbnail_path
@@ -648,6 +649,7 @@ def _attempt_ai_fields(ai_info: dict) -> dict:
 
 _SWEEP_EVERY_SECONDS = 120
 _RETENTION_EVERY_SECONDS = 24 * 60 * 60
+_TRYON_COPY_CLEANUP_EVERY_SECONDS = 60 * 60
 
 
 def run_attempt_log_housekeeping(state: dict) -> None:
@@ -667,6 +669,16 @@ def run_attempt_log_housekeeping(state: dict) -> None:
                 print(f"[worker] attempt log: deleted {deleted} row(s) older than 90 days")
     except Exception as exc:
         print(f"[worker] attempt log housekeeping failed: {short_error_message(exc)}")
+
+    # Separate, so one failing never stops the other.
+    try:
+        if now - state.get("last_tryon_copy_cleanup", float("-inf")) >= _TRYON_COPY_CLEANUP_EVERY_SECONDS:
+            state["last_tryon_copy_cleanup"] = now
+            deleted = tryon_results.delete_expired(get_supabase())
+            if deleted:
+                print(f"[worker] try-on results: deleted {deleted} copy(ies) older than the retention period")
+    except Exception as exc:
+        print(f"[worker] try-on result cleanup failed: {short_error_message(exc)}")
 
 
 def main() -> None:

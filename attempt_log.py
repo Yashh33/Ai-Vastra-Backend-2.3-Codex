@@ -271,6 +271,10 @@ def _client() -> Any:
 
 def _reset_client() -> None:
     _thread_clients.client = None
+    if _client_factory is None:
+        from supabase_client import reset_thread_client
+
+        reset_thread_client()  # the retry gets fresh connections, not the dropped ones
 
 
 def _is_transport_error(exc: BaseException) -> bool:
@@ -373,7 +377,7 @@ def _clean(fields: dict) -> dict:
 
 # Columns that may not exist until their SQL file has run. Always written on their own, so a
 # missing column only loses that value (logged as a write failure), never a status.
-_OPTIONAL_COLUMNS = ("image_size",)
+_OPTIONAL_COLUMNS = ("image_size", "result_copy_path", "result_copy_saved_at")
 
 
 def _split_optional(data: dict) -> tuple[dict, dict]:

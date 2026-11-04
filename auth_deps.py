@@ -8,7 +8,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
 from config import get_settings
-from supabase_client import get_supabase_admin_client
+from supabase_client import get_supabase_admin_client, retry_once
 
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -176,8 +176,8 @@ def _extract_is_suspended(shops_field) -> bool:
 
 def _resolve_shop_context_fallback(supabase, auth_user_id: str) -> tuple[str, str, bool]:
     try:
-        result = (
-            supabase.table("shop_users")
+        result = retry_once(
+            lambda: supabase.table("shop_users")
             .select("shop_id, role")
             .eq("auth_user_id", auth_user_id)
             .limit(1)
@@ -202,8 +202,8 @@ def _resolve_shop_context_fallback(supabase, auth_user_id: str) -> tuple[str, st
 
     is_suspended = False
     try:
-        shop_result = (
-            supabase.table("shops")
+        shop_result = retry_once(
+            lambda: supabase.table("shops")
             .select("is_suspended")
             .eq("id", shop_id)
             .limit(1)
@@ -223,8 +223,8 @@ def _resolve_shop_context_fallback(supabase, auth_user_id: str) -> tuple[str, st
 
 def _resolve_shop_context(supabase, auth_user_id: str) -> tuple[str, str, bool]:
     try:
-        result = (
-            supabase.table("shop_users")
+        result = retry_once(
+            lambda: supabase.table("shop_users")
             .select("shop_id, role, shops(is_suspended)")
             .eq("auth_user_id", auth_user_id)
             .limit(1)

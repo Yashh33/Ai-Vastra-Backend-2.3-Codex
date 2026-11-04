@@ -25,11 +25,13 @@ from pydantic import BaseModel, Field
 
 import attempt_log
 import default_fabrics
+import tryon_credits
+import tryon_results
 from auth_deps import CurrentShopContext, get_current_shop_context
 from config import get_settings
 from image_models import resolve_image_model
 from prompting import DEFAULT_TRYON_PROMPT, fill_prompt_placeholders
-from supabase_client import get_supabase_admin_client
+from supabase_client import get_supabase_admin_client, is_transient_error, retry_once
 
 from google import genai
 from google.genai import types
@@ -119,11 +121,13 @@ def _fetch_storage_bytes(supabase, bucket: str, path: str) -> bytes:
         return cached
 
     try:
-        result = supabase.storage.from_(bucket).download(path)
+        result = retry_once(lambda: supabase.storage.from_(bucket).download(path))
         if isinstance(result, (bytes, bytearray)):
             data = bytes(result)
         else:
             raise RuntimeError("Unexpected storage response type")
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -326,12 +330,45 @@ def _start_attempt(request: Request, current: CurrentShopContext, **fields: Any)
     return attempt
 
 
-def _begin_ai_call(attempt, supabase, shop_id: str) -> str:
-    """Picks the shop's model and logs it with the size. Does a DB read: async callers use a thread."""
+class _AiCall:
+    """One web try-on's AI call: the model to use and the credits charged for it."""
+
+    def __init__(self, supabase, shop_id: str, charge_key: str, credits_charged: int, model_id: str) -> None:
+        self.supabase = supabase
+        self.shop_id = shop_id
+        self.charge_key = charge_key
+        self.credits_charged = credits_charged
+        self.model_id = model_id
+        self._refunded: Optional[int] = None
+        self._refund_done = False
+
+    def refund(self) -> Optional[int]:
+        """Refund the charge, at most once. Returns what to log as credits_refunded."""
+        if not self._refund_done:
+            self._refund_done = True
+            self._refunded = (
+                tryon_credits.refund(self.supabase, shop_id=self.shop_id, charge_key=self.charge_key)
+                if self.credits_charged
+                else 0
+            )
+        return self._refunded
+
+
+def _begin_ai_call(attempt, supabase, shop_id: str) -> _AiCall:
+    """Charges the try-on (402 if the shop has too few credits, before any AI call), then picks
+    the shop's model and logs both. DB calls: async callers run this in a thread."""
+    attempt.set_step("credits")
+    charge_key = attempt_log.valid_uuid(attempt.id) or str(uuid4())
+    settings = get_settings()
+    credits_charged = tryon_credits.charge(
+        supabase, shop_id=shop_id, charge_key=charge_key, amount=settings.CREDITS_PER_IMAGE
+    )
+    attempt.update(credits_charged=credits_charged)
+
     attempt.set_step("ai_call")
     model_id = resolve_image_model(supabase, shop_id)
-    attempt.update(model_id=model_id, image_size=get_settings().GEMINI_IMAGE_SIZE)
-    return model_id
+    attempt.update(model_id=model_id, image_size=settings.GEMINI_IMAGE_SIZE)
+    return _AiCall(supabase, shop_id, charge_key, credits_charged, model_id)
 
 
 @contextmanager
@@ -342,7 +379,7 @@ def _input_stage(attempt):
         yield
     except HTTPException as exc:
         attempt.note_error(exc)
-        if exc.status_code == status.HTTP_502_BAD_GATEWAY:
+        if exc.status_code in (status.HTTP_502_BAD_GATEWAY, status.HTTP_503_SERVICE_UNAVAILABLE):
             attempt.set_step("upload")
         raise
     except Exception as exc:
@@ -370,7 +407,16 @@ def _ai_fields(ai_info: dict) -> dict:
     return {key: value for key, value in ai_info.items() if key != "no_image_step"}
 
 
-def _log_ai_failure(attempt, ai_info: dict, exc: Exception) -> None:
+def _log_ai_failure(attempt, ai_info: dict, exc: BaseException, *, credits_refunded: Optional[int]) -> None:
+    if not isinstance(exc, Exception):
+        # Cancelled (the client went away) while the AI was working.
+        attempt.fail(
+            "client_network",
+            error="Request cancelled before a response (client disconnected).",
+            credits_refunded=credits_refunded,
+            **_ai_fields(ai_info),
+        )
+        return
     if isinstance(exc, HTTPException):
         message, code = exc.detail, exc.status_code
     else:
@@ -380,6 +426,7 @@ def _log_ai_failure(attempt, ai_info: dict, exc: Exception) -> None:
         user_message=message if isinstance(message, str) else str(message),
         error=exc,
         http_status=code,
+        credits_refunded=credits_refunded,
         **_ai_fields(ai_info),
     )
 
@@ -411,8 +458,8 @@ def _prepare_tryon_assets_sync(
 ) -> Tuple[bytes, Optional[str], Optional[str]]:
     """Blocking DB + storage prep phase for try-on from a look.
     Returns (look_bytes, garment_name, look_tryon_prompt). meta (optional) gets folder_id."""
-    gen_result = (
-        supabase.table("generations")
+    gen_result = retry_once(
+        lambda: supabase.table("generations")
         .select("id, shop_id, output_path, folder_id, status")
         .eq("id", generation_id)
         .eq("shop_id", shop_id)
@@ -439,8 +486,8 @@ def _prepare_tryon_assets_sync(
     if meta is not None:
         meta["folder_id"] = folder_id
     if folder_id:
-        folder_result = (
-            supabase.table("garment_types")
+        folder_result = retry_once(
+            lambda: supabase.table("garment_types")
             .select("name, look_tryon_prompt")
             .eq("id", folder_id)
             .limit(1)
@@ -464,8 +511,8 @@ def _prepare_tryon_quick_assets_sync(
     supabase, shop_id: str, folder_id: str, fabric_image_id: str
 ) -> Tuple[bytes, str, bytes, str, Optional[str], Optional[str]]:
     """Blocking DB + storage prep phase for /tryon/quick/v2. Runs off the event loop."""
-    folder_result = (
-        supabase.table("garment_types")
+    folder_result = retry_once(
+        lambda: supabase.table("garment_types")
         .select("id, name, default_hero_image_id, tryon_prompt")
         .eq("id", folder_id)
         .eq("shop_id", shop_id)
@@ -489,8 +536,8 @@ def _prepare_tryon_quick_assets_sync(
             detail="No hero image set for this garment type",
         )
 
-    hero_result = (
-        supabase.table("hero_images")
+    hero_result = retry_once(
+        lambda: supabase.table("hero_images")
         .select("id, storage_path, mime_type")
         .eq("id", default_hero_id)
         .eq("shop_id", shop_id)
@@ -505,8 +552,8 @@ def _prepare_tryon_quick_assets_sync(
         )
     hero = hero_rows[0]
 
-    fabric_result = (
-        supabase.table("fabric_images")
+    fabric_result = retry_once(
+        lambda: supabase.table("fabric_images")
         .select("id, storage_path, mime_type")
         .eq("id", fabric_image_id)
         .eq("shop_id", shop_id)
@@ -544,8 +591,8 @@ def _prepare_tryon_quick_assets_sync(
 
 def _load_fabric_slots_sync(supabase, shop_id: str, folder_id: str) -> list[dict]:
     """This shop's fabric slots for a garment type, in sort order (empty apply_to skipped)."""
-    result = (
-        supabase.table("garment_fabric_slots")
+    result = retry_once(
+        lambda: supabase.table("garment_fabric_slots")
         .select("label, apply_to, sort_order")
         .eq("folder_id", folder_id)
         .eq("shop_id", shop_id)
@@ -564,8 +611,8 @@ def _prepare_tryon_multi_assets_sync(
 ) -> Tuple[bytes, str, list[Tuple[bytes, str]], Optional[str], Optional[str]]:
     """Blocking DB + storage prep phase for /tryon/multi/v2. Runs off the event loop.
     fabric_entries: {"fabric_image_id"} or a built-in {"default_fabric"}, in image order."""
-    folder_result = (
-        supabase.table("garment_types")
+    folder_result = retry_once(
+        lambda: supabase.table("garment_types")
         .select("id, name, tryon_prompt")
         .eq("id", folder_id)
         .eq("shop_id", shop_id)
@@ -581,8 +628,8 @@ def _prepare_tryon_multi_assets_sync(
     folder_name = folder_rows[0].get("name")
     tryon_prompt = folder_rows[0].get("tryon_prompt")
 
-    hero_result = (
-        supabase.table("hero_images")
+    hero_result = retry_once(
+        lambda: supabase.table("hero_images")
         .select("id, storage_path, mime_type")
         .eq("id", hero_image_id)
         .eq("shop_id", shop_id)
@@ -609,8 +656,8 @@ def _prepare_tryon_multi_assets_sync(
             fabric_assets.append(default_fabrics.load(entry["default_fabric"]))
             continue
         fabric_image_id = entry["fabric_image_id"]
-        fabric_result = (
-            supabase.table("fabric_images")
+        fabric_result = retry_once(
+            lambda: supabase.table("fabric_images")
             .select("id, storage_path, mime_type")
             .eq("id", fabric_image_id)
             .eq("shop_id", shop_id)
@@ -663,8 +710,8 @@ def tryon(
         attempt.enrich(attempt_log.inputs_builder(current.shop_id, source_generation_id=source_generation_id))
 
     # Fetch the generation and verify it belongs to this shop
-    gen_result = (
-        supabase.table("generations")
+    gen_result = retry_once(
+        lambda: supabase.table("generations")
         .select("id, shop_id, output_path, folder_id, status")
         .eq("id", body.generation_id.strip())
         .eq("shop_id", current.shop_id)
@@ -690,8 +737,8 @@ def tryon(
     folder_look_tryon_prompt: Optional[str] = None
     folder_id = gen.get("folder_id")
     if folder_id:
-        folder_result = (
-            supabase.table("garment_types")
+        folder_result = retry_once(
+            lambda: supabase.table("garment_types")
             .select("name, look_tryon_prompt")
             .eq("id", folder_id)
             .limit(1)
@@ -722,22 +769,24 @@ def tryon(
         customer_bytes = _decode_photo(body.customer_photo_b64)
 
     # Call Gemini: look first, customer last
-    model_id = _begin_ai_call(attempt, supabase, current.shop_id)
+    ai_call = _begin_ai_call(attempt, supabase, current.shop_id)
     ai_info: dict = {}
     try:
         result = _call_gemini_tryon(
             prompt=prompt,
-            model_id=model_id,
+            model_id=ai_call.model_id,
             image_parts=[
                 (garment_bytes, "image/jpeg"),
                 (customer_bytes, body.customer_photo_mime),
             ],
             ai_info=ai_info,
         )
-    except Exception as exc:
-        _log_ai_failure(attempt, ai_info, exc)
+    except BaseException as exc:
+        # The AI failed, returned no image, or the request was cancelled: refund once.
+        _log_ai_failure(attempt, ai_info, exc, credits_refunded=ai_call.refund())
         raise
     attempt.succeed(**_ai_fields(ai_info))
+    background_tasks.add_task(tryon_results.save_copy, supabase, attempt, base64.b64decode(result.result_b64))
     return result
 
 
@@ -767,8 +816,8 @@ def tryon_quick(
     shop_id = current.shop_id
 
     # Fetch folder -> default hero image
-    folder_result = (
-        supabase.table("garment_types")
+    folder_result = retry_once(
+        lambda: supabase.table("garment_types")
         .select("id, name, default_hero_image_id, tryon_prompt")
         .eq("id", body.folder_id.strip())
         .eq("shop_id", shop_id)
@@ -794,8 +843,8 @@ def tryon_quick(
         )
 
     # Fetch hero image storage path
-    hero_result = (
-        supabase.table("hero_images")
+    hero_result = retry_once(
+        lambda: supabase.table("hero_images")
         .select("id, storage_path, mime_type")
         .eq("id", default_hero_id)
         .eq("shop_id", shop_id)
@@ -811,8 +860,8 @@ def tryon_quick(
     hero = hero_rows[0]
 
     # Fetch this garment's fabric slots (multi-fabric garments, e.g. saree)
-    slots_result = (
-        supabase.table("garment_fabric_slots")
+    slots_result = retry_once(
+        lambda: supabase.table("garment_fabric_slots")
         .select("id, label, apply_to, sort_order")
         .eq("folder_id", body.folder_id.strip())
         .order("sort_order")
@@ -850,8 +899,8 @@ def tryon_quick(
             fabric_images.append({"default_fabric": entry["default_fabric"]})
             continue
         fabric_id = entry["fabric_image_id"]
-        fabric_result = (
-            supabase.table("fabric_images")
+        fabric_result = retry_once(
+            lambda: supabase.table("fabric_images")
             .select("id, storage_path, mime_type")
             .eq("id", fabric_id)
             .eq("shop_id", shop_id)
@@ -928,12 +977,12 @@ def tryon_quick(
     )
 
     # Call Gemini: hero first, then fabrics in slot order, customer last
-    model_id = _begin_ai_call(attempt, supabase, shop_id)
+    ai_call = _begin_ai_call(attempt, supabase, shop_id)
     ai_info: dict = {}
     try:
         result = _call_gemini_tryon(
             prompt=prompt,
-            model_id=model_id,
+            model_id=ai_call.model_id,
             image_parts=[
                 (hero_bytes, hero.get("mime_type") or "image/jpeg"),
                 *fabric_image_parts,
@@ -941,10 +990,12 @@ def tryon_quick(
             ],
             ai_info=ai_info,
         )
-    except Exception as exc:
-        _log_ai_failure(attempt, ai_info, exc)
+    except BaseException as exc:
+        # The AI failed, returned no image, or the request was cancelled: refund once.
+        _log_ai_failure(attempt, ai_info, exc, credits_refunded=ai_call.refund())
         raise
     attempt.succeed(**_ai_fields(ai_info))
+    background_tasks.add_task(tryon_results.save_copy, supabase, attempt, base64.b64decode(result.result_b64))
     return result
 
 
@@ -1003,22 +1054,24 @@ async def tryon_v2(
     garment_bytes, garment_mime = _downscale_image_if_needed(garment_bytes, "image/jpeg")
 
     # Look first, customer last
-    model_id = await anyio.to_thread.run_sync(_begin_ai_call, attempt, supabase, current.shop_id)
+    ai_call = await anyio.to_thread.run_sync(_begin_ai_call, attempt, supabase, current.shop_id)
     ai_info: dict = {}
     try:
         image_bytes, result_mime = await _call_gemini_tryon_async(
             prompt=prompt,
-            model_id=model_id,
+            model_id=ai_call.model_id,
             image_parts=[
                 (garment_bytes, garment_mime),
                 (customer_bytes, customer_mime),
             ],
             ai_info=ai_info,
         )
-    except Exception as exc:
-        _log_ai_failure(attempt, ai_info, exc)
+    except BaseException as exc:
+        # The AI failed, returned no image, or the request was cancelled: refund once.
+        _log_ai_failure(attempt, ai_info, exc, credits_refunded=ai_call.refund())
         raise
     attempt.succeed(**_ai_fields(ai_info))
+    background_tasks.add_task(tryon_results.save_copy, supabase, attempt, image_bytes)
 
     return Response(content=image_bytes, media_type=result_mime)
 
@@ -1092,12 +1145,12 @@ async def tryon_quick_v2(
     )
     _log_prompt(attempt, prompt, garment_type_id=garment_type_id, prompt_field="tryon_prompt", template=folder_tryon_prompt)
 
-    model_id = await anyio.to_thread.run_sync(_begin_ai_call, attempt, supabase, current.shop_id)
+    ai_call = await anyio.to_thread.run_sync(_begin_ai_call, attempt, supabase, current.shop_id)
     ai_info: dict = {}
     try:
         image_bytes, result_mime = await _call_gemini_tryon_async(
             prompt=prompt,
-            model_id=model_id,
+            model_id=ai_call.model_id,
             image_parts=[
                 (hero_bytes, hero_mime),
                 (fabric_bytes, fabric_mime),
@@ -1105,10 +1158,12 @@ async def tryon_quick_v2(
             ],
             ai_info=ai_info,
         )
-    except Exception as exc:
-        _log_ai_failure(attempt, ai_info, exc)
+    except BaseException as exc:
+        # The AI failed, returned no image, or the request was cancelled: refund once.
+        _log_ai_failure(attempt, ai_info, exc, credits_refunded=ai_call.refund())
         raise
     attempt.succeed(**_ai_fields(ai_info))
+    background_tasks.add_task(tryon_results.save_copy, supabase, attempt, image_bytes)
 
     return Response(content=image_bytes, media_type=result_mime)
 
@@ -1251,29 +1306,37 @@ async def tryon_multi_v2(
 
     image_parts = [(hero_bytes, hero_mime), *fabric_assets, (customer_bytes, customer_mime)]
 
-    model_id = await anyio.to_thread.run_sync(_begin_ai_call, attempt, supabase, current.shop_id)
+    ai_call = await anyio.to_thread.run_sync(_begin_ai_call, attempt, supabase, current.shop_id)
     ai_info: dict = {}
     try:
         image_bytes, result_mime = await _call_gemini_tryon_async(
             prompt=prompt,
-            model_id=model_id,
+            model_id=ai_call.model_id,
             image_parts=image_parts,
             ai_info=ai_info,
         )
-    except Exception as exc:
-        _log_ai_failure(attempt, ai_info, exc)
+    except BaseException as exc:
+        # The AI failed, returned no image, or the request was cancelled: refund once.
+        _log_ai_failure(attempt, ai_info, exc, credits_refunded=ai_call.refund())
         raise
     attempt.succeed(**_ai_fields(ai_info))
+    background_tasks.add_task(tryon_results.save_copy, supabase, attempt, image_bytes)
 
     return Response(content=image_bytes, media_type=result_mime)
 
 
 def _upload_generated_output(supabase, *, bucket: str, path: str, data: bytes, content_type: str) -> None:
     options = {"content-type": content_type, "upsert": "true"}
-    try:
-        supabase.storage.from_(bucket).upload(path, data, options)
-    except Exception:
-        supabase.storage.from_(bucket).update(path, data, options)
+
+    def _store() -> None:
+        try:
+            supabase.storage.from_(bucket).upload(path, data, options)
+        except Exception as exc:
+            if is_transient_error(exc):
+                raise
+            supabase.storage.from_(bucket).update(path, data, options)
+
+    retry_once(_store)  # upsert: safe to repeat
 
 
 @router.post("/push-to-screen")
@@ -1315,34 +1378,33 @@ async def push_tryon_to_screen(
 
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    supabase.table("generations").insert(
-        {
-            "id": new_generation_id,
-            "shop_id": shop_id,
-            "hero_image_id": (hero_image_id or "").strip() or None,
-            "fabric_image_id": (fabric_image_id or "").strip() or None,
-            "folder_id": folder_id.strip(),
-            "status": "done",
-            "generation_type": "tryon",
-            "model_used": model_used,
-            "prompt_used": "web-app try-on (pushed to screen)",
-            "output_path": output_path,
-            "credits_used": 0,
-            "show_on_screen": True,
-            "created_at": now_iso,
-            "started_at": now_iso,
-            "completed_at": now_iso,
-        }
-    ).execute()
+    generation_row = {
+        "id": new_generation_id,
+        "shop_id": shop_id,
+        "hero_image_id": (hero_image_id or "").strip() or None,
+        "fabric_image_id": (fabric_image_id or "").strip() or None,
+        "folder_id": folder_id.strip(),
+        "status": "done",
+        "generation_type": "tryon",
+        "model_used": model_used,
+        "prompt_used": "web-app try-on (pushed to screen)",
+        "output_path": output_path,
+        "credits_used": 0,
+        "show_on_screen": True,
+        "created_at": now_iso,
+        "started_at": now_iso,
+        "completed_at": now_iso,
+    }
+    # The row carries its own id, so a repeat after a dropped connection cannot add a second one.
+    retry_once(lambda: supabase.table("generations").insert(generation_row).execute(), duplicate_ok=True)
 
-    supabase.table("shop_screen_state").upsert(
-        {
-            "shop_id": shop_id,
-            "live_generation_id": new_generation_id,
-            "mode": "live",
-            "updated_at": now_iso,
-        }
-    ).execute()
+    screen_state = {
+        "shop_id": shop_id,
+        "live_generation_id": new_generation_id,
+        "mode": "live",
+        "updated_at": now_iso,
+    }
+    retry_once(lambda: supabase.table("shop_screen_state").upsert(screen_state).execute())
 
     # Optional X-Client-Request-Id (the try-on's id): attach the stored result to its log row.
     attempt_log.link_tryon_result(

@@ -122,8 +122,12 @@ export function OperationsDetailPage() {
 
   const isTryon = attempt.attempt_type !== "look";
   const failed = attempt.status === "failed" || attempt.status === "timed_out";
-  const resultUrl = isTryon ? attempt.tryon_result_url : attempt.output_url;
+  const resultUrl = isTryon ? attempt.tryon_result_url || attempt.result_copy_url : attempt.output_url;
   const resultPath = isTryon ? attempt.tryon_result_path : attempt.output_path;
+  const retentionDays = attempt.result_retention_days ?? 7;
+  const showingCopy = isTryon && !attempt.tryon_result_url && !!attempt.result_copy_url;
+  const olderThanRetention =
+    Date.now() - new Date(attempt.started_at || attempt.created_at).getTime() > retentionDays * 24 * 60 * 60 * 1000;
   const stepLabel = attempt.failed_step ? FAILED_STEP_LABELS[attempt.failed_step] ?? attempt.failed_step : null;
   const timedOutBeforeSweep = attempt.status === "timed_out" && attempt.raw_status !== "timed_out";
 
@@ -289,10 +293,17 @@ export function OperationsDetailPage() {
               {resultPath
                 ? "The result image is no longer in storage."
                 : isTryon && attempt.status === "succeeded"
-                  ? "Try-on results are not stored unless they are pushed to the TV."
+                  ? olderThanRetention
+                    ? `Result not kept (older than ${retentionDays} days).`
+                    : "Result copy not saved."
                   : "No result image."}
             </div>
           )}
+          {showingCopy ? (
+            <p className="tiny muted">
+              Small copy, visible to admins only. Deleted automatically after {retentionDays} days.
+            </p>
+          ) : null}
           {resultUrl ? <p className="tiny muted">Click the image to open it full size.</p> : null}
         </section>
 

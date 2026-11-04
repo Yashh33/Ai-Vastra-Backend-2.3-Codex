@@ -236,6 +236,9 @@ export type AttemptDetail = Omit<AttemptRow, "has_result" | "thumb_url"> & {
   hero_url: string | null;
   output_url: string | null;
   tryon_result_url: string | null;
+  /** Admin-only small copy of a try-on result; null once deleted (or never kept). */
+  result_copy_url?: string | null;
+  result_retention_days?: number;
 };
 
 export type ShopNameRow = { id: string; name: string | null };

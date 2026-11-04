@@ -9,6 +9,7 @@ from typing import Optional
 import httpx
 
 from config import get_settings
+from supabase_client import retry_once
 
 _HERO_BUCKET = "hero-images"
 _DISPLAY_THUMB_MAX_EDGE = 600
@@ -125,14 +126,17 @@ def sign_existing_paths(
     settings = get_settings()
     base_url = f"{settings.SUPABASE_URL.rstrip('/')}/storage/v1"
     try:
-        response = httpx.post(
-            f"{base_url}/object/sign/{bucket}",
-            headers={
-                "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY}",
-                "apikey": settings.SUPABASE_SERVICE_ROLE_KEY,
-            },
-            json={"paths": list(result), "expiresIn": expires_in},
-            timeout=20,
+        # Signing is safe to repeat: one retry on a dropped connection.
+        response = retry_once(
+            lambda: httpx.post(
+                f"{base_url}/object/sign/{bucket}",
+                headers={
+                    "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY}",
+                    "apikey": settings.SUPABASE_SERVICE_ROLE_KEY,
+                },
+                json={"paths": list(result), "expiresIn": expires_in},
+                timeout=20,
+            )
         )
         response.raise_for_status()
         items = response.json()
