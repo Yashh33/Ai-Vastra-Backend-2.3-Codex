@@ -5,6 +5,8 @@
 --   * storage bucket "tryon-results"     new, PRIVATE (no policies: only the service role can read)
 --   * debit_credits_for_tryon / refund_credits_for_tryon   new functions, service role only
 --
+-- Uses public.get_shop_credit_balance(uuid), the balance function the live look charge uses.
+--
 -- RUN THIS BEFORE deploying the backend + worker.
 -- Until it runs: try-ons still work but are NOT charged (a warning is logged), result copies
 -- are not kept (a warning is logged) and the worker's hourly cleanup logs an error.
@@ -40,7 +42,9 @@ insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_typ
 values ('tryon-results', 'tryon-results', false, 2097152, array['image/jpeg'])
 on conflict (id) do nothing;
 
--- 4. Debit. Locks the shop row so concurrent debits for one shop run one at a time.
+-- 4. Debit. Same lock and same balance function as the look charge
+--    (create_generation_with_credit_debit_v2): a look and a try-on for one shop are never
+--    charged at the same time from the same balance.
 --    Repeating a call for the same attempt returns the first result and charges nothing more.
 create or replace function public.debit_credits_for_tryon(
   p_shop_id uuid,
@@ -61,8 +65,8 @@ begin
     raise exception 'Invalid credit amount';
   end if;
 
-  perform 1 from shops where id = p_shop_id for update;
-  if not found then
+  perform pg_advisory_xact_lock(2401, hashtext(p_shop_id::text));
+  if not exists (select 1 from shops where id = p_shop_id) then
     raise exception 'Shop not found';
   end if;
 
@@ -75,27 +79,21 @@ begin
     return;
   end if;
 
-  select l.balance_after into v_balance
-  from credit_ledger l
-  where l.shop_id = p_shop_id
-  order by l.created_at desc
-  limit 1;
-  v_balance := coalesce(v_balance, 0);
+  v_balance := coalesce(public.get_shop_credit_balance(p_shop_id), 0);
 
   if v_balance < p_amount then
     raise exception 'Insufficient credits';
   end if;
 
-  -- clock_timestamp(): the row is ordered by when it was written, after the lock.
-  insert into credit_ledger (shop_id, delta, reason, balance_after, attempt_id, created_at)
-  values (p_shop_id, -p_amount, 'web_tryon', v_balance - p_amount, p_attempt_id, clock_timestamp());
+  insert into credit_ledger (shop_id, delta, reason, balance_after, attempt_id)
+  values (p_shop_id, -p_amount, 'web_tryon', v_balance - p_amount, p_attempt_id);
 
   return query select true, p_amount, v_balance, v_balance - p_amount;
 end;
 $function$;
 
--- 5. Refund. Only for an attempt that was charged; at most once. Repeating a call returns
---    the first refund and adds nothing.
+-- 5. Refund. Same lock and balance function as the debit. Only for an attempt that was
+--    charged; at most once. Repeating a call returns the first refund and adds nothing.
 create or replace function public.refund_credits_for_tryon(
   p_shop_id uuid,
   p_attempt_id uuid
@@ -111,8 +109,8 @@ declare
   v_existing record;
   v_balance integer;
 begin
-  perform 1 from shops where id = p_shop_id for update;
-  if not found then
+  perform pg_advisory_xact_lock(2401, hashtext(p_shop_id::text));
+  if not exists (select 1 from shops where id = p_shop_id) then
     raise exception 'Shop not found';
   end if;
 
@@ -134,15 +132,10 @@ begin
     return;
   end if;
 
-  select l.balance_after into v_balance
-  from credit_ledger l
-  where l.shop_id = p_shop_id
-  order by l.created_at desc
-  limit 1;
-  v_balance := coalesce(v_balance, 0);
+  v_balance := coalesce(public.get_shop_credit_balance(p_shop_id), 0);
 
-  insert into credit_ledger (shop_id, delta, reason, balance_after, attempt_id, created_at)
-  values (p_shop_id, -v_debit.delta, 'web_tryon_refund', v_balance - v_debit.delta, p_attempt_id, clock_timestamp());
+  insert into credit_ledger (shop_id, delta, reason, balance_after, attempt_id)
+  values (p_shop_id, -v_debit.delta, 'web_tryon_refund', v_balance - v_debit.delta, p_attempt_id);
 
   return query select true, -v_debit.delta, v_balance - v_debit.delta;
 end;
