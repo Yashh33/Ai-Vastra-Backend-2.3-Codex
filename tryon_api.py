@@ -23,6 +23,7 @@ from fastapi import (
 )
 from pydantic import BaseModel, Field
 
+import ai_call
 import attempt_log
 import default_fabrics
 import tryon_credits
@@ -92,7 +93,8 @@ def _get_gemini_client() -> genai.Client:
         with _gemini_client_lock:
             if _gemini_client is None:
                 settings = get_settings()
-                _gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+                # Time limit on every call (sync and client.aio share these options).
+                _gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY, http_options=ai_call.http_options())
     return _gemini_client
 
 
@@ -206,6 +208,24 @@ def _resolve_tryon_prompt(
 _NO_IMAGE_DETAIL = "Gemini did not return an image for try-on"
 
 
+class AiFailure(HTTPException):
+    """An AI failure the app can explain: the JSON gets "error_code" beside the plain "detail"
+    (main.py's HTTPException handler adds it). ai_busy = 503, ai_blocked / ai_no_image = 502."""
+
+    def __init__(self, status_code: int, detail: str, error_code: str) -> None:
+        super().__init__(status_code=status_code, detail=detail)
+        self.error_code = error_code
+
+
+def _ai_busy() -> AiFailure:
+    return AiFailure(status.HTTP_503_SERVICE_UNAVAILABLE, ai_call.AI_BUSY_DETAIL, ai_call.AI_BUSY)
+
+
+def _no_image(response) -> AiFailure:
+    # Same rule as the attempt log's failed_step: ai_blocked when the model refused.
+    return AiFailure(status.HTTP_502_BAD_GATEWAY, _NO_IMAGE_DETAIL, attempt_log.no_image_step(response))
+
+
 def _first_inline_image(response) -> Optional[Any]:
     # A blocked request comes back with no candidates or no content: same 502 as "no image".
     candidates = getattr(response, "candidates", None) or []
@@ -249,14 +269,24 @@ def _call_gemini_tryon(
         )
     response = None
     try:
-        response = client.models.generate_content(
-            model=model_id,
-            contents=contents_parts,
-            config=types.GenerateContentConfig(
-                response_modalities=["IMAGE", "TEXT"],
-                image_config=types.ImageConfig(image_size=settings.GEMINI_IMAGE_SIZE),
+        # One retry for a dropped connection or a busy Google (429/5xx), never after a
+        # timeout: the customer is waiting. The credit charge happened before and is not repeated.
+        response = ai_call.call_with_retry(
+            lambda: client.models.generate_content(
+                model=model_id,
+                contents=contents_parts,
+                config=types.GenerateContentConfig(
+                    response_modalities=["IMAGE", "TEXT"],
+                    image_config=types.ImageConfig(image_size=settings.GEMINI_IMAGE_SIZE),
+                ),
             ),
+            retry_on_timeout=False,
+            label="tryon",
         )
+    except Exception as exc:
+        if ai_call.is_busy_error(exc):
+            raise _ai_busy() from exc
+        raise
     finally:
         _note_ai_response(ai_info, response, model_id)
 
@@ -267,10 +297,7 @@ def _call_gemini_tryon(
             result_mime=inline.mime_type or "image/png",
         )
 
-    raise HTTPException(
-        status_code=status.HTTP_502_BAD_GATEWAY,
-        detail=_NO_IMAGE_DETAIL,
-    )
+    raise _no_image(response)
 
 
 async def _call_gemini_tryon_async(
@@ -295,14 +322,23 @@ async def _call_gemini_tryon_async(
         )
     response = None
     try:
-        response = await client.aio.models.generate_content(
-            model=model_id,
-            contents=contents_parts,
-            config=types.GenerateContentConfig(
-                response_modalities=["IMAGE", "TEXT"],
-                image_config=types.ImageConfig(image_size=settings.GEMINI_IMAGE_SIZE),
+        # Same single retry as the sync call (not after a timeout).
+        response = await ai_call.call_with_retry_async(
+            lambda: client.aio.models.generate_content(
+                model=model_id,
+                contents=contents_parts,
+                config=types.GenerateContentConfig(
+                    response_modalities=["IMAGE", "TEXT"],
+                    image_config=types.ImageConfig(image_size=settings.GEMINI_IMAGE_SIZE),
+                ),
             ),
+            retry_on_timeout=False,
+            label="tryon",
         )
+    except Exception as exc:
+        if ai_call.is_busy_error(exc):
+            raise _ai_busy() from exc
+        raise
     finally:
         _note_ai_response(ai_info, response, model_id)
 
@@ -310,10 +346,7 @@ async def _call_gemini_tryon_async(
     if inline is not None:
         return inline.data, inline.mime_type or "image/png"
 
-    raise HTTPException(
-        status_code=status.HTTP_502_BAD_GATEWAY,
-        detail=_NO_IMAGE_DETAIL,
-    )
+    raise _no_image(response)
 
 
 # --- Operations log helpers ---------------------------------------------------
@@ -1387,7 +1420,7 @@ async def push_tryon_to_screen(
         "status": "done",
         "generation_type": "tryon",
         "model_used": model_used,
-        "prompt_used": "web-app try-on (pushed to screen)",
+        "prompt_used": tryon_results.PUSHED_TRYON_PROMPT,
         "output_path": output_path,
         "credits_used": 0,
         "show_on_screen": True,

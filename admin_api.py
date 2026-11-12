@@ -10,6 +10,7 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 import attempt_log
+import credit_balance
 import tryon_results
 from admin_deps import verify_admin_secret
 from config import IMAGE_MODELS, get_settings
@@ -346,20 +347,9 @@ def _ensure_shop_for_auth_user(
 
 
 def _get_shop_balance(supabase, shop_id: str) -> int:
-    result = (
-        supabase.table("credit_ledger")
-        .select("balance_after")
-        .eq("shop_id", shop_id)
-        .order("created_at", desc=True)
-        .limit(1)
-        .execute()
-    )
-
-    rows = getattr(result, "data", None) or []
-    if not rows:
-        return 0
-
-    return int(rows[0].get("balance_after") or 0)
+    # The ledger total (get_shop_credit_balance), like GET /me; if that RPC fails, the newest
+    # ledger row's balance_after as before.
+    return credit_balance.shop_balance(supabase, shop_id)
 
 
 def _append_credit_ledger(supabase, shop_id: str, delta: int, reason: str) -> dict[str, int]:

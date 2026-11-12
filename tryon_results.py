@@ -14,6 +14,9 @@ from config import get_settings
 from supabase_client import retry_once
 
 BUCKET = "tryon-results"
+# generations.prompt_used of a row made by POST /tryon/push-to-screen. The worker's hourly
+# clean-up finds pushed customer try-ons by this exact text: never change it.
+PUSHED_TRYON_PROMPT = "web-app try-on (pushed to screen)"
 MAX_EDGE = 768
 JPEG_QUALITY = 80
 SIGNED_URL_SECONDS = 600

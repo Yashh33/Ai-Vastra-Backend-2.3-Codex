@@ -27,6 +27,8 @@ The owner deploys manually (see `DEPLOY.md`). A second developer also pushes to 
   `WhatsApp watcher disabled (WHATSAPP_WATCHER_ENABLED=false)`; if it shows
   `[whatsapp_watcher] started`, stop the server immediately.
 - With that set, start the backend normally (`uvicorn main:app`); no special launcher is needed.
+- Never start `worker.py` locally: it would claim real shops' jobs (it refuses to start outside
+  Render unless `WORKER_ALLOW_LOCAL=true`; never set that).
 - Test only with the demo shop (the `demo@gmail.com` account).
 - Never read or modify real shops' data.
 - Never run scripts that delete storage objects or database rows.

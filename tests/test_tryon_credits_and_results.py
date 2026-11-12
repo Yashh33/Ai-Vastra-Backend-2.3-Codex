@@ -496,7 +496,8 @@ class AdminCopyTests(ApiTestCase):
             for path in pathlib.Path(".").glob("*.py")
             if "tryon_results.BUCKET" in path.read_text(encoding="utf-8-sig") or "result_copy_path" in path.read_text(encoding="utf-8-sig")
         ]
-        self.assertEqual(sorted(users), ["admin_api.py", "attempt_log.py", "tryon_results.py"])
+        # worker_housekeeping.py is worker-only: its refund sweep only checks the column is empty.
+        self.assertEqual(sorted(users), ["admin_api.py", "attempt_log.py", "tryon_results.py", "worker_housekeeping.py"])
 
 
 if __name__ == "__main__":

@@ -77,6 +77,27 @@ def _base_image_payload_dict(
     }
 
 
+INVALID_STORAGE_PATH_DETAIL = "Invalid storage path"
+
+
+def check_storage_path(storage_path: str, shop_id: str, *, allow_temp: bool = False) -> str:
+    """The path must be inside the caller's own shop folder: "<shop_id>/..." or, for hero
+    images only, "temp/<shop_id>/...". No "..", no leading "/", no backslashes. 400 otherwise."""
+    path = (storage_path or "").strip()
+    shop = (shop_id or "").strip().lower()
+    prefixes = [f"{shop}/"] + ([f"temp/{shop}/"] if allow_temp else [])
+    lowered = path.lower()
+    if (
+        not shop
+        or ".." in path
+        or path.startswith("/")
+        or "\\" in path
+        or not any(lowered.startswith(prefix) and len(path) > len(prefix) for prefix in prefixes)
+    ):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=INVALID_STORAGE_PATH_DETAIL)
+    return path
+
+
 def _extract_signed_url(signed_payload: object) -> Optional[str]:
     if isinstance(signed_payload, dict):
         return (
@@ -97,6 +118,7 @@ def create_hero_image_metadata(
     supabase = get_supabase_admin_client()
 
     folder_id = _clean_required_text(body.folder_id, "folder_id")
+    check_storage_path(body.storage_path, current.shop_id, allow_temp=True)
 
     # Validate folder belongs to current shop
     try:
@@ -179,6 +201,7 @@ def create_catalog_image_metadata(
     supabase = get_supabase_admin_client()
 
     folder_id = _clean_required_text(body.folder_id, "folder_id")
+    check_storage_path(body.storage_path, current.shop_id)
 
     try:
         folder_check = retry_once(
@@ -395,6 +418,7 @@ def create_fabric_image_metadata(
     current: CurrentShopContext = Depends(get_current_shop_context),
 ):
     supabase = get_supabase_admin_client()
+    check_storage_path(body.storage_path, current.shop_id)
 
     payload = {
         "shop_id": current.shop_id,

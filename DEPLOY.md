@@ -65,3 +65,4 @@ After the first deploy that contains `/healthz`, once step 5 shows `{"ok": true}
 Render → "Ai Vastra Backend 2.3" → Settings → **Health Check Path** = `/healthz`.
 This applies to the backend web service only. A Background Worker service has no health
 check setting.
+`/healthz/queue` (stuck or failing jobs) is for the uptime monitor only: never set it as Render's Health Check Path.

@@ -50,7 +50,10 @@ class _Query:
         self.payload: Any = None
         self.filters: list[Callable[[dict], bool]] = []
         self._limit: Optional[int] = None
-        self._order: Optional[tuple[str, bool]] = None
+        self._offset = 0
+        self._orders: list[tuple[str, bool]] = []
+        self._negate_next = False
+        self._filter_columns: list[str] = []
         self._count = None
         self.columns: tuple = ()
 
@@ -77,9 +80,27 @@ class _Query:
         return self
 
     # --- filters
-    def eq(self, column, value):
-        self.filters.append(lambda row: str(row.get(column)) == str(value))
+    def _add(self, check: Callable[[dict], bool]) -> "_Query":
+        if self._negate_next:
+            self._negate_next = False
+            self.filters.append(lambda row: not check(row))
+        else:
+            self.filters.append(check)
         return self
+
+    @property
+    def not_(self):
+        self._negate_next = True
+        return self
+
+    def is_(self, column, value):
+        if str(value).lower() != "null":
+            raise ValueError("fake is_ supports only 'null'")
+        self._filter_columns.append(column)
+        return self._add(lambda row: row.get(column) is None)
+
+    def eq(self, column, value):
+        return self._add(lambda row: str(row.get(column)) == str(value))
 
     def in_(self, column, values):
         allowed = {str(v) for v in values}
@@ -99,7 +120,7 @@ class _Query:
         return self
 
     def order(self, column, desc=False):
-        self._order = (column, desc)
+        self._orders.append((column, desc))
         return self
 
     def limit(self, n):
@@ -107,12 +128,14 @@ class _Query:
         return self
 
     def range(self, start, end):
+        self._offset = start
         self._limit = end - start + 1
         return self
 
     def _check_columns(self) -> None:
         items = self.payload if isinstance(self.payload, list) else [self.payload] if self.payload else []
         used = " ".join(self.columns) + " " + " ".join(key for item in items for key in item)
+        used += " " + " ".join(self._filter_columns)
         for column in self.db.missing_columns.get(self.table, ()):
             if column in used:
                 raise FakeDBError(f"column {self.table}.{column} does not exist (42703)")
@@ -157,10 +180,11 @@ class _Query:
                 rows.remove(row)
             return SimpleNamespace(data=copy.deepcopy(matched), count=None)
 
-        if self._order:
-            column, desc = self._order
+        # Like PostgREST: the first order() is the main key (stable sorts, last key first).
+        for column, desc in reversed(self._orders):
             matched = sorted(matched, key=lambda row: str(row.get(column) or ""), reverse=desc)
         count = len(matched)
+        matched = matched[self._offset:]
         if self._limit is not None:
             matched = matched[: self._limit]
         return SimpleNamespace(data=copy.deepcopy(matched), count=count if self._count else None)

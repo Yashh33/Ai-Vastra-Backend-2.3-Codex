@@ -16,12 +16,14 @@ from attempt_log import flush as flush_attempt_log
 from attempt_logs_api import router as attempt_logs_router
 from auth_deps import CurrentShopContext, get_current_shop_context
 from config import get_settings
+import credit_balance
 from folders_api import router as folders_router
 from garment_types_api import router as garment_types_router
 from generations_api import router as generations_router
 from images_api import router as images_router
 from payments_api import router as payments_router
 from prompt_library_api import router as prompt_library_router
+import queue_health
 from segment_api import router as segment_router
 from supabase_client import (
     CONNECTION_PROBLEM_DETAIL,
@@ -67,6 +69,15 @@ def _connection_problem_response(request: Request, exc: BaseException) -> JSONRe
 
 @app.exception_handler(HTTPException)
 async def _http_exception(request: Request, exc: HTTPException):
+    # AI failures (tryon_api.AiFailure): the plain-string "detail" plus "error_code" beside it.
+    # Never turned into the connection-problem text: that is only for our database / storage.
+    error_code = getattr(exc, "error_code", None)
+    if error_code:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail, "error_code": error_code},
+            headers=getattr(exc, "headers", None),
+        )
     # "Failed to fetch ..." (500) raised from a dropped connection: 503, so the app can say "try again".
     if exc.status_code >= 500 and exc.status_code != 503 and caused_by_connection_problem(exc):
         return _connection_problem_response(request, exc)
@@ -160,11 +171,20 @@ def healthz():
     return {"ok": True}
 
 
+@app.get("/healthz/queue", include_in_schema=False)
+def healthz_queue():
+    """Alarm link for the uptime monitor only (NEVER Render's Health Check Path): 200 {"ok": true}
+    or 503 {"ok": false, "reasons": [...]}. No auth; counts and reason words only. Cached 60 s."""
+    status_code, body = queue_health.cached_result(get_supabase_admin_client)
+    return JSONResponse(status_code=status_code, content=body)
+
+
 _me_shop_summary_cache: TTLCache = TTLCache(maxsize=1000, ttl=60)
 _me_shop_summary_lock = threading.Lock()
 
 
 def _get_shop_summary(shop_id: str) -> dict:
+    """Shop name and header text (cached 60 s). The balance is never cached: see _get_credits_balance."""
     with _me_shop_summary_lock:
         cached = _me_shop_summary_cache.get(shop_id)
         if cached is not None:
@@ -172,7 +192,6 @@ def _get_shop_summary(shop_id: str) -> dict:
 
     shop_name = None
     header_display_text = None
-    credits_balance = 0
 
     try:
         supabase = get_supabase_admin_client()
@@ -187,33 +206,30 @@ def _get_shop_summary(shop_id: str) -> dict:
         if shop_rows:
             shop_name = shop_rows[0].get("name")
             header_display_text = shop_rows[0].get("header_display_text")
-
-        ledger_result = (
-            supabase.table("credit_ledger")
-            .select("balance_after")
-            .eq("shop_id", shop_id)
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        ledger_rows = getattr(ledger_result, "data", None) or []
-        if ledger_rows:
-            credits_balance = int(ledger_rows[0].get("balance_after") or 0)
     except Exception:
         shop_name = None
         header_display_text = None
-        credits_balance = 0
 
     summary = {
         "shop_name": shop_name,
         "header_display_text": header_display_text,
-        "credits_balance": credits_balance,
     }
 
     with _me_shop_summary_lock:
         _me_shop_summary_cache[shop_id] = summary
 
     return summary
+
+
+def _get_credits_balance(shop_id: str) -> int:
+    """The ledger total (get_shop_credit_balance), read fresh on every call. If the RPC fails:
+    the newest ledger row's balance_after, as before; if that fails too, 0, as before."""
+    try:
+        supabase = get_supabase_admin_client()
+        value = credit_balance.rpc_balance(supabase, shop_id)
+        return value if value is not None else credit_balance.latest_ledger_balance(supabase, shop_id)
+    except Exception:
+        return 0
 
 
 @app.get("/me")
@@ -227,5 +243,5 @@ def me(current: CurrentShopContext = Depends(get_current_shop_context)):
         "role": current.role,
         "shop_name": summary["shop_name"],
         "header_display_text": summary["header_display_text"],
-        "credits_balance": summary["credits_balance"],
+        "credits_balance": _get_credits_balance(current.shop_id),
     }

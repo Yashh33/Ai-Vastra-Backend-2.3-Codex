@@ -6,3 +6,7 @@ __pycache__/
 # Local dump files and one-off scripts (never commit)
 *_latest*.txt
 cleanup_storage.py
+backend_code.txt
+supabase_context.txt
+adminPanel/admin_code.txt
+adminPanel/adminpanel*.txt

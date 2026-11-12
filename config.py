@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     GEMINI_IMAGE_MODEL_ID: str = "gemini-3.1-flash-image-preview"
     # Output size of every generated image (looks and try-ons), for every model.
     GEMINI_IMAGE_SIZE: str = "1K"
+    # Time limit for one Gemini call (looks and try-ons). Optional; the default is fine.
+    GEMINI_TIMEOUT_SECONDS: float = Field(default=150, gt=0)
     # Days a small copy of each web try-on result is kept for the admin (then deleted by the worker).
     TRYON_RESULT_RETENTION_DAYS: int = Field(default=7, ge=1)
 

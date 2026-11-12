@@ -1,11 +1,13 @@
 import base64
 import io
+import os
+import sys
 import threading
 import time
 import traceback
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime, timezone
-from typing import Any, Optional, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Any, Mapping, Optional, Tuple
 
 import httpcore
 import httpx
@@ -13,9 +15,11 @@ from google import genai
 from google.genai import types
 from supabase import create_client
 
+import ai_call
 import attempt_log
 import default_fabrics
 import tryon_results
+import worker_housekeeping
 from config import get_settings
 from image_models import pick_image_model, read_shop_image_model, warn_read_failed
 from image_thumbs import look_thumbnail_path
@@ -166,7 +170,7 @@ def fetch_generation_assets(supabase, job: dict) -> dict:
             .execute()
         )
 
-    base_columns = "id, shop_id, hero_image_id, fabric_image_id, prompt_used"
+    base_columns = "id, shop_id, hero_image_id, fabric_image_id, prompt_used, created_at"
     try:
         gen_result = _fetch_generation(f"{base_columns}, default_fabric_slots")
     except Exception as exc:
@@ -266,7 +270,7 @@ def fetch_generation_assets(supabase, job: dict) -> dict:
             }
         )
 
-    prompt_used = generation.get("prompt_used")
+    prompt_used = wait_for_prompt(supabase, generation, generation_id=generation_id, shop_id=shop_id)
     if not prompt_used:
         raise RuntimeError("prompt_used is empty; create generation again after Step 21")
 
@@ -281,6 +285,49 @@ def fetch_generation_assets(supabase, job: dict) -> dict:
         "fabrics": mapped_fabrics,
         "prompt_used": str(prompt_used),
     }
+
+
+# A look can be claimed a moment before its prompt is saved: wait briefly, for a NEW row only.
+_PROMPT_WAIT_MAX_AGE = timedelta(seconds=30)
+_PROMPT_WAIT_SECONDS = 2.0
+_PROMPT_WAIT_TRIES = 5
+
+
+def _parse_time(value: Any) -> Optional[datetime]:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def wait_for_prompt(
+    supabase, generation: dict, *, generation_id: str, shop_id: str, now: Optional[datetime] = None
+) -> Optional[str]:
+    """prompt_used; if it is empty and the row is under 30 s old, re-read it every 2 s, up to 5 times."""
+    prompt_used = generation.get("prompt_used")
+    if prompt_used:
+        return prompt_used
+    created_at = _parse_time(generation.get("created_at"))
+    if created_at is None or (now or datetime.now(timezone.utc)) - created_at >= _PROMPT_WAIT_MAX_AGE:
+        return prompt_used
+
+    for _ in range(_PROMPT_WAIT_TRIES):
+        time.sleep(_PROMPT_WAIT_SECONDS)
+        result = (
+            supabase.table("generations")
+            .select("prompt_used")
+            .eq("id", generation_id)
+            .eq("shop_id", shop_id)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(result, "data", None) or []
+        prompt_used = rows[0].get("prompt_used") if rows else None
+        if prompt_used:
+            print(f"[worker] prompt arrived after a short wait: generation={generation_id}")
+            return prompt_used
+    return prompt_used
 
 
 def download_storage_bytes(supabase, bucket: str, path: str) -> bytes:
@@ -357,16 +404,22 @@ def call_gemini_image_generation(
         ai_info.setdefault("ai_started_at", attempt_log.utc_now())
         ai_info.update(model_id=model_id, image_size=image_size)
     try:
-        response = client.models.generate_content(
-            model=model_id,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                response_modalities=["IMAGE"],
-                image_config=types.ImageConfig(
-                aspect_ratio="3:4",
-                image_size=image_size,
+        # One retry (after ~5 s) for a timeout, a dropped connection or a busy Google (429/5xx).
+        # Only this AI call is repeated: the look was charged once, by the API, before the job.
+        response = ai_call.call_with_retry(
+            lambda: client.models.generate_content(
+                model=model_id,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    response_modalities=["IMAGE"],
+                    image_config=types.ImageConfig(
+                    aspect_ratio="3:4",
+                    image_size=image_size,
+                    ),
                 ),
             ),
+            retry_on_timeout=True,
+            label="worker",
         )
     finally:
         if ai_info is not None:
@@ -467,6 +520,46 @@ def mark_generation_failed_with_refund(
 
     return rows[0]
 
+
+
+_error_code_warned = False
+
+
+def look_error_code(exc: BaseException, ai_info: dict, step: Optional[str]) -> Optional[str]:
+    """ai_blocked / ai_no_image (the model answered without an image), ai_busy (timeout,
+    connection or Google 429/5xx after the retry), or None when the AI was not the cause."""
+    no_image = ai_info.get("no_image_step")
+    if no_image in (ai_call.AI_BLOCKED, ai_call.AI_NO_IMAGE):
+        return no_image
+    if step == "ai_call" and ai_call.is_busy_error(exc):
+        return ai_call.AI_BUSY
+    return None
+
+
+def save_generation_error_code(supabase, *, generation_id: str, shop_id: str, error_code: Optional[str]) -> None:
+    """Best effort, after the look was marked failed. Never raises."""
+    global _error_code_warned
+    if not error_code:
+        return
+    try:
+        (
+            supabase.table("generations")
+            .update({"error_code": error_code})
+            .eq("id", generation_id)
+            .eq("shop_id", shop_id)
+            .eq("status", "failed")
+            .execute()
+        )
+    except Exception as exc:
+        if attempt_log._is_missing_column(exc):
+            if not _error_code_warned:
+                _error_code_warned = True
+                print(
+                    "[worker] WARNING: generations.error_code missing "
+                    "(run sql/2026-11-13_a_generation_error_code.sql); failure reason not saved"
+                )
+            return
+        print(f"[worker] WARNING: error_code not saved for generation={generation_id}: {short_error_message(exc, 300)}")
 
 
 def resolve_job_image_model(shop_id: str) -> str:
@@ -635,6 +728,12 @@ def process_job(gemini_client: genai.Client, settings, job: dict) -> None:
                 f"balance_after={refund_info.get('balance_after')}"
             )
             credits_refunded = int(refund_info.get("refund_amount") or 0) if refund_info.get("refunded") else 0
+            save_generation_error_code(
+                get_supabase(),
+                generation_id=generation_id,
+                shop_id=shop_id,
+                error_code=look_error_code(exc, ai_info, attempt.step),
+            )
 
         except Exception as mark_exc:
             print(f"[worker] failed to mark generation as failed: {mark_exc}")
@@ -652,9 +751,13 @@ _RETENTION_EVERY_SECONDS = 24 * 60 * 60
 _TRYON_COPY_CLEANUP_EVERY_SECONDS = 60 * 60
 
 
-def run_attempt_log_housekeeping(state: dict) -> None:
-    """Operations log upkeep from the main loop: mark stuck attempts timed out (every 2 min)
-    and delete log rows older than 90 days (daily; rows only, never images). Never raises."""
+def run_attempt_log_housekeeping(state: dict, active_ids: Optional[set] = None) -> None:
+    """Upkeep from the main loop. Never raises; each part is separate, so one failing never stops another.
+    - every 2 min: mark stuck attempts timed out; fail + refund looks stuck in processing
+      (skipping active_ids, the jobs this process is still working on); refund charged
+      try-ons whose refund did not happen;
+    - hourly: delete expired try-on result copies and expired pushed customer try-ons;
+    - daily: delete log rows older than 90 days (rows only, never images)."""
     now = time.monotonic()
     try:
         if now - state.get("last_sweep", float("-inf")) >= _SWEEP_EVERY_SECONDS:
@@ -670,6 +773,21 @@ def run_attempt_log_housekeeping(state: dict) -> None:
     except Exception as exc:
         print(f"[worker] attempt log housekeeping failed: {short_error_message(exc)}")
 
+    try:
+        if now - state.get("last_job_sweep", float("-inf")) >= _SWEEP_EVERY_SECONDS:
+            state["last_job_sweep"] = now
+            client = get_supabase()
+            try:
+                worker_housekeeping.sweep_stuck_looks(client, active_ids or set())
+            except Exception as exc:
+                print(f"[worker] stuck-look sweep failed: {short_error_message(exc)}")
+            try:
+                worker_housekeeping.sweep_missed_tryon_refunds(client)
+            except Exception as exc:
+                print(f"[worker] try-on refund sweep failed: {short_error_message(exc)}")
+    except Exception as exc:
+        print(f"[worker] job sweeps failed: {short_error_message(exc)}")
+
     # Separate, so one failing never stops the other.
     try:
         if now - state.get("last_tryon_copy_cleanup", float("-inf")) >= _TRYON_COPY_CLEANUP_EVERY_SECONDS:
@@ -680,14 +798,65 @@ def run_attempt_log_housekeeping(state: dict) -> None:
     except Exception as exc:
         print(f"[worker] try-on result cleanup failed: {short_error_message(exc)}")
 
+    try:
+        if now - state.get("last_pushed_tryon_cleanup", float("-inf")) >= _TRYON_COPY_CLEANUP_EVERY_SECONDS:
+            state["last_pushed_tryon_cleanup"] = now
+            deleted = worker_housekeeping.delete_expired_pushed_tryons(get_supabase())
+            if deleted:
+                print(f"[worker] pushed try-ons: deleted {deleted} older than the retention period")
+    except Exception as exc:
+        print(f"[worker] pushed try-on cleanup failed: {short_error_message(exc)}")
+
+
+_RENDER_ENV_NAMES = ("RENDER", "RENDER_SERVICE_ID", "RENDER_INSTANCE_ID")
+_NOT_RENDER_MESSAGE = (
+    "[worker] NOT STARTING: this machine is not Render. A local worker would take real shops' jobs. "
+    "Set WORKER_ALLOW_LOCAL=true only if you really mean it."
+)
+
+
+def worker_start_reason(env: Mapping[str, str], dotenv: Optional[Mapping[str, Optional[str]]] = None) -> Optional[str]:
+    """Why this worker may start: "render" (a Render environment variable is set), or
+    "WORKER_ALLOW_LOCAL=true" (process environment, else the local .env). None = must not start."""
+    if any(str(env.get(name) or "").strip() for name in _RENDER_ENV_NAMES):
+        return "render"
+    allow = env.get("WORKER_ALLOW_LOCAL")
+    if allow is None and dotenv:
+        allow = dotenv.get("WORKER_ALLOW_LOCAL")
+    if str(allow or "").strip().lower() == "true":
+        return "WORKER_ALLOW_LOCAL=true"
+    return None
+
+
+def _local_dotenv() -> dict:
+    try:
+        from dotenv import dotenv_values
+
+        return dict(dotenv_values(".env")) if os.path.exists(".env") else {}
+    except Exception:
+        return {}
+
+
+def enforce_worker_start_guard() -> str:
+    reason = worker_start_reason(os.environ, _local_dotenv())
+    if reason is None:
+        print(_NOT_RENDER_MESSAGE, flush=True)
+        sys.exit(1)
+    if reason == "render":
+        print("[worker] start guard: allowed, running on Render", flush=True)
+    else:
+        print("[worker] start guard: allowed by WORKER_ALLOW_LOCAL=true (local run on purpose)", flush=True)
+    return reason
+
 
 def main() -> None:
+    enforce_worker_start_guard()  # first: a local worker would take real shops' jobs
     settings = get_settings()
 
     if not settings.GEMINI_API_KEY or settings.GEMINI_API_KEY == "PENDING_NANO_KEY":
         raise RuntimeError("Set a real GEMINI_API_KEY in backend/.env before running worker")
 
-    gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+    gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY, http_options=ai_call.http_options())
     # Worker log writes are synchronous (durable before the next job), on each thread's own client.
     attempt_log.configure(client_factory=get_supabase, sync=True)
     housekeeping_state: dict = {}
@@ -697,9 +866,10 @@ def main() -> None:
     print(f"[worker] default model: {settings.GEMINI_IMAGE_MODEL_ID}")
     print(f"[worker] image size: {settings.GEMINI_IMAGE_SIZE}")
     print(f"[worker] max concurrent jobs: {_MAX_CONCURRENT_JOBS}")
+    print(f"[worker] AI time limit: {settings.GEMINI_TIMEOUT_SECONDS:g}s")
 
     executor = ThreadPoolExecutor(max_workers=_MAX_CONCURRENT_JOBS)
-    in_flight: set[Future] = set()
+    in_flight: dict[Future, str] = {}  # future -> generation id (the stuck-look sweep skips these)
 
     try:
         while True:
@@ -717,21 +887,21 @@ def main() -> None:
                     print(f"[worker] claimed generation={generation_id} shop={shop_id}")
 
                     future = executor.submit(process_job, gemini_client, settings, job)
-                    in_flight.add(future)
+                    in_flight[future] = generation_id
 
                 if not claimed_any or len(in_flight) >= _MAX_CONCURRENT_JOBS:
                     time.sleep(settings.WORKER_POLL_INTERVAL_SECONDS)
 
                 completed = {future for future in in_flight if future.done()}
                 for future in completed:
-                    in_flight.discard(future)
+                    in_flight.pop(future, None)
                     try:
                         future.result()
                     except Exception as exc:
                         print(f"[worker] job future raised: {short_error_message(exc)}")
                         traceback.print_exc()
 
-                run_attempt_log_housekeeping(housekeeping_state)
+                run_attempt_log_housekeeping(housekeeping_state, set(in_flight.values()))
 
             except Exception as exc:
                 print(f"[worker] loop error: {short_error_message(exc)}")
