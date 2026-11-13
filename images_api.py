@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 
 from auth_deps import CurrentShopContext, get_current_shop_context
 from config import get_settings
-from image_thumbs import store_hero_thumbnail_best_effort
+from image_thumbs import FABRIC_BUCKET, fabric_thumbnail_path, store_hero_thumbnail_best_effort
 from supabase_client import get_supabase_admin_client, retry_once
 
 router = APIRouter(tags=["Images"])
@@ -24,6 +24,14 @@ class HeroImageCreateRequest(BaseModel):
 class FabricImageCreateRequest(BaseModel):
     storage_path: str = Field(..., min_length=1, max_length=500)
     original_filename: Optional[str] = Field(default=None, max_length=255)
+    mime_type: Optional[str] = Field(default=None, max_length=100)
+    file_size_bytes: Optional[int] = Field(default=None, ge=0)
+    width: Optional[int] = Field(default=None, gt=0)
+    height: Optional[int] = Field(default=None, gt=0)
+
+
+class FabricImageReplacePhotoRequest(BaseModel):
+    storage_path: str = Field(..., min_length=1, max_length=500)
     mime_type: Optional[str] = Field(default=None, max_length=100)
     file_size_bytes: Optional[int] = Field(default=None, ge=0)
     width: Optional[int] = Field(default=None, gt=0)
@@ -521,3 +529,114 @@ def get_fabric_image_metadata(
         )
 
     return rows[0]
+
+
+def _fetch_own_fabric(supabase, image_id: str, shop_id: str) -> Optional[dict]:
+    result = retry_once(
+        lambda: supabase.table("fabric_images")
+        .select("*")
+        .eq("id", image_id)
+        .eq("shop_id", shop_id)
+        .limit(1)
+        .execute()
+    )
+    rows = getattr(result, "data", None) or []
+    return rows[0] if rows else None
+
+
+def _remove_replaced_fabric_files(supabase, *, shop_id: str, old_path: str, new_path: str) -> None:
+    """Best effort, after the row already points at the new photo: delete the previous photo
+    and its small copy. Only paths inside this shop's own folder, never the new photo (or its
+    small copy), never a file another fabric_images row still uses. Never raises."""
+    try:
+        try:
+            check_storage_path(old_path, shop_id)
+        except HTTPException:
+            return  # not inside this shop's own folder: leave it alone
+        keep = {new_path, fabric_thumbnail_path(new_path)}
+        candidates = [p for p in dict.fromkeys([old_path, fabric_thumbnail_path(old_path)]) if p not in keep]
+        if not candidates:
+            return
+
+        # Any row (in any shop) still using one of these paths keeps that file.
+        in_use = retry_once(
+            lambda: supabase.table("fabric_images")
+            .select("id, storage_path")
+            .in_("storage_path", candidates)
+            .execute()
+        )
+        used = {str(row.get("storage_path") or "") for row in (getattr(in_use, "data", None) or [])}
+        if old_path in used:
+            return  # the photo is still used: keep its small copy too
+        targets = [p for p in candidates if p not in used]
+        if targets:
+            supabase.storage.from_(FABRIC_BUCKET).remove(targets)
+    except Exception as exc:
+        print(f"[images_api] WARNING: previous fabric photo not deleted: {exc.__class__.__name__}")
+
+
+@router.post("/fabric-images/{fabric_image_id}/replace-photo")
+def replace_fabric_image_photo(
+    fabric_image_id: str,
+    body: FabricImageReplacePhotoRequest,
+    current: CurrentShopContext = Depends(get_current_shop_context),
+):
+    """Point a saved fabric at a new photo (e.g. after "Match colour"). The row keeps its id,
+    original_filename and created_at, so the library shows one fabric and every look that used
+    it still points at it. The previous photo and its small copy are deleted afterwards."""
+    supabase = get_supabase_admin_client()
+    image_id = _clean_required_text(fabric_image_id, "fabric_image_id")
+
+    try:
+        row = _fetch_own_fabric(supabase, image_id, current.shop_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch fabric image metadata",
+        ) from exc
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fabric image not found")
+
+    new_path = check_storage_path(body.storage_path, current.shop_id)
+    old_path = str(row.get("storage_path") or "").strip()
+    if new_path == old_path:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="storage_path must be different from the current photo",
+        )
+    if new_path.lower().endswith("_thumb.jpg"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=INVALID_STORAGE_PATH_DETAIL)
+
+    payload = {
+        "storage_path": new_path,
+        "mime_type": _clean_optional_text(body.mime_type),
+        "file_size_bytes": body.file_size_bytes,
+        "width": body.width,
+        "height": body.height,
+    }
+    try:
+        # The same update twice gives the same row: safe to repeat.
+        result = retry_once(
+            lambda: supabase.table("fabric_images")
+            .update(payload)
+            .eq("id", image_id)
+            .eq("shop_id", current.shop_id)
+            .execute()
+        )
+        rows = getattr(result, "data", None) or []
+        updated = rows[0] if rows else _fetch_own_fabric(supabase, image_id, current.shop_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to replace fabric photo",
+        ) from exc
+    if not updated or str(updated.get("storage_path") or "").strip() != new_path:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to replace fabric photo",
+        )
+
+    if old_path:
+        _remove_replaced_fabric_files(supabase, shop_id=current.shop_id, old_path=old_path, new_path=new_path)
+
+    return updated

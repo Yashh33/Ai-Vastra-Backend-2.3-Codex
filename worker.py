@@ -1,4 +1,5 @@
 import base64
+import gc
 import io
 import os
 import sys
@@ -19,6 +20,7 @@ import ai_call
 import attempt_log
 import default_fabrics
 import picture_backfill
+import process_memory
 import tryon_results
 import worker_housekeeping
 from config import get_settings
@@ -69,6 +71,11 @@ def call_with_retry(fn):
         reset_thread_client()
         time.sleep(1)
         return fn()
+
+
+def log_memory(label: str) -> None:
+    """One short line with the worker's current memory, e.g. "[worker] memory: 212 MB (job claimed)"."""
+    print(f"[worker] memory: {process_memory.describe()} ({label})", flush=True)
 
 
 def utc_now_iso() -> str:
@@ -740,6 +747,11 @@ def process_job(gemini_client: genai.Client, settings, job: dict) -> None:
 
         attempt.fail(failed_step, error=exc, credits_refunded=credits_refunded, **_attempt_ai_fields(ai_info))
 
+    finally:
+        # Give the large buffers back before the next job: the worker runs close to its memory limit.
+        assets = hero_bytes = fabric_inputs = fabric_bytes = output_bytes = thumb_bytes = None  # noqa: F841
+        gc.collect()
+
 
 def _attempt_ai_fields(ai_info: dict) -> dict:
     return {key: value for key, value in ai_info.items() if key != "no_image_step"}
@@ -866,6 +878,7 @@ def main() -> None:
     print(f"[worker] image size: {settings.GEMINI_IMAGE_SIZE}")
     print(f"[worker] max concurrent jobs: {_MAX_CONCURRENT_JOBS}")
     print(f"[worker] AI time limit: {settings.GEMINI_TIMEOUT_SECONDS:g}s")
+    log_memory("start")
 
     executor = ThreadPoolExecutor(max_workers=_MAX_CONCURRENT_JOBS)
     in_flight: dict[Future, str] = {}  # future -> generation id (the stuck-look sweep skips these)
@@ -876,7 +889,7 @@ def main() -> None:
         picture_backfill.start_in_background(
             jobs_in_flight=lambda: len(in_flight),
             client_factory=lambda: create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY),
-            make_thumbnail=build_thumbnail_jpeg_bytes,
+            max_memory=picture_backfill.max_memory_mb(settings.PICTURE_BACKFILL_MAX_MEMORY_MB),
         )
     else:
         print("[worker] picture backfill disabled (PICTURE_BACKFILL_ENABLED=false)")
@@ -898,6 +911,7 @@ def main() -> None:
 
                     future = executor.submit(process_job, gemini_client, settings, job)
                     in_flight[future] = generation_id
+                    log_memory("job claimed")
 
                 if not claimed_any or len(in_flight) >= _MAX_CONCURRENT_JOBS:
                     time.sleep(settings.WORKER_POLL_INTERVAL_SECONDS)
@@ -910,6 +924,7 @@ def main() -> None:
                     except Exception as exc:
                         print(f"[worker] job future raised: {short_error_message(exc)}")
                         traceback.print_exc()
+                    log_memory("job finished")
 
                 run_attempt_log_housekeeping(housekeeping_state, set(in_flight.values()))
 

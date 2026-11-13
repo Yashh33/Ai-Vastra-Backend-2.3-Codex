@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     # Worker only: "false" switches off the background fill-in of thumbnails / view copies for
     # existing pictures. Unset or anything else = on.
     PICTURE_BACKFILL_ENABLED: str = Field(default="true")
+    # Worker only: the backfill does no work while the worker uses more memory than this (MB).
+    # Blank or unreadable = 320.
+    PICTURE_BACKFILL_MAX_MEMORY_MB: str = Field(default="320")
 
     # Used by /admin endpoints. Keep this long and private.
     ADMIN_PANEL_SECRET: str = Field(default="")
