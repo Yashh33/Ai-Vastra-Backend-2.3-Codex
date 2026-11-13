@@ -1358,16 +1358,32 @@ async def tryon_multi_v2(
     return Response(content=image_bytes, media_type=result_mime)
 
 
-def _upload_generated_output(supabase, *, bucket: str, path: str, data: bytes, content_type: str) -> None:
-    options = {"content-type": content_type, "upsert": "true"}
+def _upload_generated_output(
+    supabase,
+    *,
+    bucket: str,
+    path: str,
+    data: bytes,
+    content_type: str,
+    cache_control: Optional[str] = None,
+) -> None:
+    """cache_control (seconds, as a string) only for files whose path never gets different
+    content (a look's output / thumbnail); None keeps storage's default."""
+
+    def _options() -> dict:
+        # Fresh dict per call: storage3 pops keys from the options it is given.
+        options = {"content-type": content_type, "upsert": "true"}
+        if cache_control:
+            options["cache-control"] = cache_control
+        return options
 
     def _store() -> None:
         try:
-            supabase.storage.from_(bucket).upload(path, data, options)
+            supabase.storage.from_(bucket).upload(path, data, _options())
         except Exception as exc:
             if is_transient_error(exc):
                 raise
-            supabase.storage.from_(bucket).update(path, data, options)
+            supabase.storage.from_(bucket).update(path, data, _options())
 
     retry_once(_store)  # upsert: safe to repeat
 

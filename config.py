@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     # WhatsApp shadow-shop opening trial, expressed in images (not credits).
     WHATSAPP_FREE_IMAGES: int = Field(default=3, ge=0)
     WORKER_POLL_INTERVAL_SECONDS: float = Field(default=3, gt=0)
+    # Worker only: "false" switches off the background fill-in of thumbnails / view copies for
+    # existing pictures. Unset or anything else = on.
+    PICTURE_BACKFILL_ENABLED: str = Field(default="true")
 
     # Used by /admin endpoints. Keep this long and private.
     ADMIN_PANEL_SECRET: str = Field(default="")

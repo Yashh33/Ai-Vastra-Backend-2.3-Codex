@@ -1,4 +1,5 @@
-﻿from typing import Optional
+﻿import threading
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
@@ -16,6 +17,40 @@ _MAX_LAZY_HERO_THUMBS_PER_REQUEST = 10
 # don't retry them on every request.
 _hero_thumb_failures: TTLCache = TTLCache(maxsize=2000, ttl=600)
 
+# Phones cache pictures by URL: hand out the SAME signed link for a while instead of a new one
+# on every call. Links are signed for 6 hours and reused for 4, so a reused link always has
+# at least 2 hours left. Keyed by storage path (paths include the shop id).
+_SIGNED_URL_SECONDS = 6 * 60 * 60
+_SIGNED_URL_REUSE_SECONDS = 4 * 60 * 60
+_hero_image_url_cache: TTLCache = TTLCache(maxsize=5000, ttl=_SIGNED_URL_REUSE_SECONDS)
+_hero_thumb_url_cache: TTLCache = TTLCache(maxsize=5000, ttl=_SIGNED_URL_REUSE_SECONDS)
+_url_cache_lock = threading.Lock()
+
+
+def _reuse_signed_urls(cache: TTLCache, storage_paths: list[str], sign) -> dict[str, Optional[str]]:
+    """storage path -> signed URL. Paths with a remembered link get it back; the others are
+    signed with sign(paths) and remembered (only real links; None is never remembered)."""
+    result: dict[str, Optional[str]] = {}
+    missing: list[str] = []
+    with _url_cache_lock:
+        for path in storage_paths:
+            url = cache.get(path)
+            if url:
+                result[path] = url
+            else:
+                missing.append(path)
+    if not missing:
+        return result
+
+    fresh = sign(missing) or {}
+    with _url_cache_lock:
+        for path in missing:
+            url = fresh.get(path)
+            result[path] = url
+            if url:
+                cache[path] = url
+    return result
+
 
 def _hero_thumb_signed_urls(supabase, storage_paths: list[str]) -> dict[str, Optional[str]]:
     """Hero storage path -> signed display-thumbnail URL (None if unavailable).
@@ -26,7 +61,7 @@ def _hero_thumb_signed_urls(supabase, storage_paths: list[str]) -> dict[str, Opt
     try:
         thumb_path_by_storage_path = {path: hero_thumbnail_path(path) for path in storage_paths}
         url_by_thumb_path = sign_existing_paths(
-            "hero-images", list(thumb_path_by_storage_path.values())
+            "hero-images", list(thumb_path_by_storage_path.values()), expires_in=_SIGNED_URL_SECONDS
         )
 
         created: list[str] = []
@@ -46,7 +81,9 @@ def _hero_thumb_signed_urls(supabase, storage_paths: list[str]) -> dict[str, Opt
                 )
 
         if created:
-            url_by_thumb_path.update(sign_existing_paths("hero-images", created))
+            url_by_thumb_path.update(
+                sign_existing_paths("hero-images", created, expires_in=_SIGNED_URL_SECONDS)
+            )
 
         return {
             storage_path: url_by_thumb_path.get(thumb_path)
@@ -80,7 +117,7 @@ def _create_hero_image_signed_url(supabase, storage_path: str) -> Optional[str]:
 
         signed = supabase.storage.from_("hero-images").create_signed_url(
             cleaned_path,
-            3600,
+            _SIGNED_URL_SECONDS,
         )
 
         signed_url = _extract_signed_url(signed)
@@ -106,7 +143,7 @@ def _create_hero_image_signed_urls_batch(
     try:
         signed_items = supabase.storage.from_("hero-images").create_signed_urls(
             storage_paths,
-            3600,
+            _SIGNED_URL_SECONDS,
         )
     except Exception:
         # Fall back to per-path signing so the endpoint never regresses to broken.
@@ -189,14 +226,24 @@ def list_garment_types(
 
     storage_paths = sorted(set(storage_path_by_hero_image_id.values()))
     try:
-        signed_url_by_storage_path = _create_hero_image_signed_urls_batch(
-            supabase, storage_paths
+        signed_url_by_storage_path = _reuse_signed_urls(
+            _hero_image_url_cache,
+            storage_paths,
+            lambda paths: _create_hero_image_signed_urls_batch(supabase, paths),
         )
     except Exception as exc:
         print(f"[garment_types_api] failed to sign hero image URLs: {exc}")
         signed_url_by_storage_path = {}
 
-    thumb_url_by_storage_path = _hero_thumb_signed_urls(supabase, storage_paths)
+    try:
+        thumb_url_by_storage_path = _reuse_signed_urls(
+            _hero_thumb_url_cache,
+            storage_paths,
+            lambda paths: _hero_thumb_signed_urls(supabase, paths),
+        )
+    except Exception as exc:
+        print(f"[garment_types_api] failed to sign hero thumbnail URLs: {exc}")
+        thumb_url_by_storage_path = {}
 
     all_folder_ids = [folder.get("id") for folder in folders if folder.get("id")]
 

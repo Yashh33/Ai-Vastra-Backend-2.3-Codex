@@ -15,10 +15,12 @@ import tryon_results
 from admin_deps import verify_admin_secret
 from config import IMAGE_MODELS, get_settings
 from image_thumbs import (
+    IMMUTABLE_CACHE_SECONDS,
     hero_thumbnail_path,
     look_thumbnail_path,
     sign_existing_paths,
     store_hero_thumbnail_best_effort,
+    store_look_view_copy_best_effort,
 )
 from supabase_client import get_supabase_admin_client
 from tryon_api import _upload_generated_output
@@ -2195,6 +2197,7 @@ def _store_uploaded_look(
         path=output_path,
         data=jpeg_bytes,
         content_type="image/jpeg",
+        cache_control=IMMUTABLE_CACHE_SECONDS,
     )
 
     stored_paths = [output_path]
@@ -2205,10 +2208,18 @@ def _store_uploaded_look(
             path=thumb_path,
             data=build_thumbnail_jpeg_bytes(jpeg_bytes),
             content_type="image/jpeg",
+            cache_control=IMMUTABLE_CACHE_SECONDS,
         )
         stored_paths.append(thumb_path)
     except Exception as exc:
         print(f"[admin_api] WARNING: failed to generate/upload thumbnail for {output_path}: {exc}")
+
+    # Usually None: these uploads are already light JPEGs. Best effort: never fails the upload.
+    view_path = store_look_view_copy_best_effort(
+        supabase, output_path, jpeg_bytes, log_prefix="[admin_api]"
+    )
+    if view_path:
+        stored_paths.append(view_path)
 
     now_iso = _utc_now_iso()
     try:

@@ -13,7 +13,13 @@ import default_fabrics
 from auth_deps import CurrentShopContext, get_current_shop_context
 from config import get_settings
 from image_models import resolve_image_model
-from image_thumbs import look_thumbnail_path
+from image_thumbs import (
+    IMMUTABLE_CACHE_SECONDS,
+    immutable_upload_options,
+    look_thumbnail_path,
+    look_view_path,
+    store_look_view_copy_best_effort,
+)
 from prompting import DEFAULT_LOOK_PROMPT, fill_prompt_placeholders
 from segment_api import mask_storage_prefix
 from supabase_client import caused_by_connection_problem, get_supabase_admin_client, retry_once
@@ -1492,7 +1498,7 @@ def match_color_on_generation_output(
     try:
         result = retry_once(
             lambda: supabase.table("generations")
-            .select("id, status, output_path")
+            .select("id, status, output_path, generation_type")
             .eq("id", generation_id)
             .eq("shop_id", current.shop_id)
             .limit(1)
@@ -1514,6 +1520,8 @@ def match_color_on_generation_output(
     row = rows[0]
     generation_status = str(row.get("status") or "")
     output_path = str(row.get("output_path") or "").strip()
+    # View copies exist only for looks: never made or removed for try-ons / pushed copies.
+    is_look = row.get("generation_type") == "look"
 
     if generation_status != "done" or not output_path:
         raise HTTPException(
@@ -1552,10 +1560,7 @@ def match_color_on_generation_output(
         storage_bucket.upload(
             new_output_path,
             edited_bytes,
-            {
-                "content-type": edited_mime_type,
-                "upsert": "false",
-            },
+            immutable_upload_options(edited_mime_type, upsert=False),
         )
     except Exception as exc:
         raise HTTPException(
@@ -1578,13 +1583,15 @@ def match_color_on_generation_output(
         storage_bucket.upload(
             new_thumb_path,
             thumb_buf.getvalue(),
-            {
-                "content-type": "image/jpeg",
-                "upsert": "false",
-            },
+            immutable_upload_options("image/jpeg", upsert=False),
         )
     except Exception as exc:
         print(f"WARNING: failed to generate/upload thumbnail for {new_output_path}: {exc}")
+
+    if is_look:
+        store_look_view_copy_best_effort(
+            supabase, new_output_path, edited_bytes, log_prefix="[generations_api]"
+        )
 
     try:
         retry_once(
@@ -1599,6 +1606,8 @@ def match_color_on_generation_output(
             storage_bucket.remove([new_output_path, new_thumb_path])
         except Exception:
             pass
+        if is_look:
+            _remove_output_files_best_effort(supabase, [look_view_path(new_output_path)])
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to update generation output path",
@@ -1608,6 +1617,8 @@ def match_color_on_generation_output(
         storage_bucket.remove([old_output_path, look_thumbnail_path(old_output_path)])
     except Exception:
         pass
+    if is_look:
+        _remove_output_files_best_effort(supabase, [look_view_path(old_output_path)])
 
     return {
         "generation_id": generation_id,
@@ -1785,6 +1796,7 @@ def _save_color_corrected_output(shop_id: str, generation_id: str, data: bytes) 
             path=new_path,
             data=jpeg_bytes,
             content_type="image/jpeg",
+            cache_control=IMMUTABLE_CACHE_SECONDS,
         )
     except Exception as exc:
         raise HTTPException(
@@ -1799,9 +1811,13 @@ def _save_color_corrected_output(shop_id: str, generation_id: str, data: bytes) 
             path=new_thumb_path,
             data=build_thumbnail_jpeg_bytes(jpeg_bytes),
             content_type="image/jpeg",
+            cache_control=IMMUTABLE_CACHE_SECONDS,
         )
     except Exception as exc:
         print(f"[generations_api] WARNING: failed to generate/upload thumbnail for {new_path}: {exc}")
+
+    # _load_own_look only returns looks. Best effort: never fails the save.
+    store_look_view_copy_best_effort(supabase, new_path, jpeg_bytes, log_prefix="[generations_api]")
 
     try:
         retry_once(
@@ -1812,7 +1828,7 @@ def _save_color_corrected_output(shop_id: str, generation_id: str, data: bytes) 
             .execute()
         )
     except Exception as exc:
-        _remove_output_files_best_effort(supabase, [new_path, new_thumb_path])
+        _remove_output_files_best_effort(supabase, [new_path, new_thumb_path, look_view_path(new_path)])
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to save colour-corrected image",
@@ -1821,7 +1837,8 @@ def _save_color_corrected_output(shop_id: str, generation_id: str, data: bytes) 
     # The original is kept forever; only an earlier corrected version is replaced.
     if previous_path not in (original_path, new_path):
         _remove_output_files_best_effort(
-            supabase, [previous_path, look_thumbnail_path(previous_path)]
+            supabase,
+            [previous_path, look_thumbnail_path(previous_path), look_view_path(previous_path)],
         )
 
     return {"id": generation_id, "output_path": new_path}
@@ -1858,7 +1875,8 @@ def restore_original_output(
 
     if current_path != original_path:
         _remove_output_files_best_effort(
-            supabase, [current_path, look_thumbnail_path(current_path)]
+            supabase,
+            [current_path, look_thumbnail_path(current_path), look_view_path(current_path)],
         )
 
     return {"id": generation_id, "output_path": original_path}
@@ -2018,7 +2036,7 @@ def delete_generation_output(
     try:
         result = retry_once(
             lambda: supabase.table("generations")
-            .select("id, status, output_path, original_output_path")
+            .select("id, status, output_path, original_output_path, generation_type")
             .eq("id", generation_id)
             .eq("shop_id", current.shop_id)
             .limit(1)
@@ -2082,12 +2100,19 @@ def delete_generation_output(
         # Keep delete successful even if storage cleanup fails.
         storage_warning = f"Generation deleted, but storage cleanup failed: {exc}"
 
-    _remove_output_files_best_effort(supabase, [look_thumbnail_path(output_path)])
+    # View copies exist only for looks: never touched for try-ons / pushed copies.
+    is_look = row.get("generation_type") == "look"
+    _remove_output_files_best_effort(
+        supabase,
+        [look_thumbnail_path(output_path)] + ([look_view_path(output_path)] if is_look else []),
+    )
 
     original_output_path = str(row.get("original_output_path") or "").strip()
     if original_output_path and original_output_path != output_path:
         _remove_output_files_best_effort(
-            supabase, [original_output_path, look_thumbnail_path(original_output_path)]
+            supabase,
+            [original_output_path, look_thumbnail_path(original_output_path)]
+            + ([look_view_path(original_output_path)] if is_look else []),
         )
     _remove_generation_masks_best_effort(
         supabase, shop_id=current.shop_id, generation_id=generation_id

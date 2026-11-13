@@ -18,11 +18,12 @@ from supabase import create_client
 import ai_call
 import attempt_log
 import default_fabrics
+import picture_backfill
 import tryon_results
 import worker_housekeeping
 from config import get_settings
 from image_models import pick_image_model, read_shop_image_model, warn_read_failed
-from image_thumbs import look_thumbnail_path
+from image_thumbs import immutable_upload_options, look_thumbnail_path, store_look_view_copy_best_effort
 
 _MAX_INPUT_IMAGE_DIMENSION = 1536
 _THUMB_MAX_WIDTH = 400
@@ -664,10 +665,7 @@ def process_job(gemini_client: genai.Client, settings, job: dict) -> None:
             lambda: get_supabase().storage.from_("generated-outputs").upload(
                 output_path,
                 output_bytes,
-                {
-                    "content-type": output_mime,
-                    "upsert": "true",
-                },
+                immutable_upload_options(output_mime, upsert=True),
             )
         )
 
@@ -678,15 +676,16 @@ def process_job(gemini_client: genai.Client, settings, job: dict) -> None:
                 lambda: get_supabase().storage.from_("generated-outputs").upload(
                     thumb_path,
                     thumb_bytes,
-                    {
-                        "content-type": "image/jpeg",
-                        "upsert": "true",
-                    },
+                    immutable_upload_options("image/jpeg", upsert=True),
                 )
             )
             print(f"[worker] uploaded thumbnail: {thumb_path}")
         except Exception as exc:
             print(f"[worker] WARNING: failed to generate/upload thumbnail for {output_path}: {exc}")
+
+        # Light copy for full-screen viewing, looks only. Best effort: never fails the look.
+        if str(job.get("generation_type") or "look") == "look":
+            store_look_view_copy_best_effort(get_supabase(), output_path, output_bytes, log_prefix="[worker]")
 
         attempt.step = "db_save"
         call_with_retry(
@@ -870,6 +869,17 @@ def main() -> None:
 
     executor = ThreadPoolExecutor(max_workers=_MAX_CONCURRENT_JOBS)
     in_flight: dict[Future, str] = {}  # future -> generation id (the stuck-look sweep skips these)
+
+    # Low-priority fill-in of light pictures for existing files, on its own thread and client.
+    # It pauses while any job is in flight, so it never delays claiming or processing one.
+    if picture_backfill.enabled(settings.PICTURE_BACKFILL_ENABLED):
+        picture_backfill.start_in_background(
+            jobs_in_flight=lambda: len(in_flight),
+            client_factory=lambda: create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY),
+            make_thumbnail=build_thumbnail_jpeg_bytes,
+        )
+    else:
+        print("[worker] picture backfill disabled (PICTURE_BACKFILL_ENABLED=false)")
 
     try:
         while True:
