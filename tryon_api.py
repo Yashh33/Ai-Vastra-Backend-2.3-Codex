@@ -27,6 +27,7 @@ import ai_call
 import attempt_log
 import default_fabrics
 import tryon_credits
+import tryon_recent
 import tryon_results
 from auth_deps import CurrentShopContext, get_current_shop_context
 from config import get_settings
@@ -404,6 +405,29 @@ def _begin_ai_call(attempt, supabase, shop_id: str) -> _AiCall:
     return _AiCall(supabase, shop_id, charge_key, credits_charged, model_id)
 
 
+def _earlier_ticket(request: Request, attempt, supabase, shop_id: str) -> Optional[tuple[bytes, str]]:
+    """Same X-Client-Request-Id again, checked before any charge. Returns the stored picture
+    (bytes, mime) to send back uncharged, raises 409 while an earlier one is still being made,
+    or returns None for a normal new try-on. DB calls: async callers run this in a thread."""
+    ticket = attempt_log.valid_uuid(request.headers.get("x-client-request-id"))
+    if not ticket:
+        return None
+    earlier = tryon_recent.check_ticket(supabase, shop_id, ticket, exclude_id=getattr(attempt, "id", None))
+    if earlier is None:
+        return None
+    if earlier.kind == "running":
+        attempt.set_step("validation")
+        raise AiFailure(status.HTTP_409_CONFLICT, tryon_recent.STILL_RUNNING_DETAIL, tryon_recent.STILL_RUNNING_CODE)
+    attempt.succeed(
+        credits_charged=0,
+        user_message=(
+            f"Repeated an earlier request (same X-Client-Request-Id {ticket}): returned the stored "
+            f"result of attempt {earlier.row.get('id')}, nothing charged."
+        ),
+    )
+    return earlier.image_bytes, earlier.mime_type
+
+
 @contextmanager
 def _input_stage(attempt):
     """Loading stored inputs: 4xx = validation, 502 = a stored image could not be read."""
@@ -739,6 +763,10 @@ def tryon(
             detail=_CONSENT_REJECTED_DETAIL,
         )
     background_tasks.add_task(_log_tryon_consent, supabase, current.shop_id)
+    # Same ticket again: the stored picture uncharged, or 409 while still being made.
+    replay = _earlier_ticket(request, attempt, supabase, current.shop_id)
+    if replay is not None:
+        return TryOnResponse(result_b64=base64.b64encode(replay[0]).decode("utf-8"), result_mime=replay[1])
     if source_generation_id:
         attempt.enrich(attempt_log.inputs_builder(current.shop_id, source_generation_id=source_generation_id))
 
@@ -818,8 +846,13 @@ def tryon(
         # The AI failed, returned no image, or the request was cancelled: refund once.
         _log_ai_failure(attempt, ai_info, exc, credits_refunded=ai_call.refund())
         raise
+    result_bytes = base64.b64decode(result.result_b64)
+    # Kept for the shop for 24 hours, before the answer goes out. Never fails the try-on.
+    # Stored while the attempt is still running, so a repeat of the ticket never finds it
+    # "succeeded" with nothing kept (it gets 409, then the stored picture).
+    tryon_recent.store_result(supabase, attempt, result_bytes, result.result_mime)
     attempt.succeed(**_ai_fields(ai_info))
-    background_tasks.add_task(tryon_results.save_copy, supabase, attempt, base64.b64decode(result.result_b64))
+    background_tasks.add_task(tryon_results.save_copy, supabase, attempt, result_bytes)
     return result
 
 
@@ -845,6 +878,10 @@ def tryon_quick(
             detail=_CONSENT_REJECTED_DETAIL,
         )
     background_tasks.add_task(_log_tryon_consent, supabase, current.shop_id)
+    # Same ticket again: the stored picture uncharged, or 409 while still being made.
+    replay = _earlier_ticket(request, attempt, supabase, current.shop_id)
+    if replay is not None:
+        return TryOnResponse(result_b64=base64.b64encode(replay[0]).decode("utf-8"), result_mime=replay[1])
 
     shop_id = current.shop_id
 
@@ -1027,8 +1064,13 @@ def tryon_quick(
         # The AI failed, returned no image, or the request was cancelled: refund once.
         _log_ai_failure(attempt, ai_info, exc, credits_refunded=ai_call.refund())
         raise
+    result_bytes = base64.b64decode(result.result_b64)
+    # Kept for the shop for 24 hours, before the answer goes out. Never fails the try-on.
+    # Stored while the attempt is still running, so a repeat of the ticket never finds it
+    # "succeeded" with nothing kept (it gets 409, then the stored picture).
+    tryon_recent.store_result(supabase, attempt, result_bytes, result.result_mime)
     attempt.succeed(**_ai_fields(ai_info))
-    background_tasks.add_task(tryon_results.save_copy, supabase, attempt, base64.b64decode(result.result_b64))
+    background_tasks.add_task(tryon_results.save_copy, supabase, attempt, result_bytes)
     return result
 
 
@@ -1055,6 +1097,10 @@ async def tryon_v2(
             detail=_CONSENT_REJECTED_DETAIL,
         )
     background_tasks.add_task(_log_tryon_consent, supabase, current.shop_id)
+    # Same ticket again: the stored picture uncharged, or 409 while still being made.
+    replay = await anyio.to_thread.run_sync(_earlier_ticket, request, attempt, supabase, current.shop_id)
+    if replay is not None:
+        return Response(content=replay[0], media_type=replay[1])
     if source_generation_id:
         attempt.enrich(attempt_log.inputs_builder(current.shop_id, source_generation_id=source_generation_id))
 
@@ -1103,7 +1149,13 @@ async def tryon_v2(
         # The AI failed, returned no image, or the request was cancelled: refund once.
         _log_ai_failure(attempt, ai_info, exc, credits_refunded=ai_call.refund())
         raise
-    attempt.succeed(**_ai_fields(ai_info))
+    # Kept for the shop for 24 hours, before the answer goes out. Never fails the try-on.
+    # Stored while the attempt is still running (see the sync route).
+    try:
+        await anyio.to_thread.run_sync(tryon_recent.store_result, supabase, attempt, image_bytes, result_mime)
+    finally:
+        # The AI succeeded: recorded as succeeded even if the request is cancelled meanwhile.
+        attempt.succeed(**_ai_fields(ai_info))
     background_tasks.add_task(tryon_results.save_copy, supabase, attempt, image_bytes)
 
     return Response(content=image_bytes, media_type=result_mime)
@@ -1133,6 +1185,10 @@ async def tryon_quick_v2(
             detail=_CONSENT_REJECTED_DETAIL,
         )
     background_tasks.add_task(_log_tryon_consent, supabase, current.shop_id)
+    # Same ticket again: the stored picture uncharged, or 409 while still being made.
+    replay = await anyio.to_thread.run_sync(_earlier_ticket, request, attempt, supabase, current.shop_id)
+    if replay is not None:
+        return Response(content=replay[0], media_type=replay[1])
     if garment_type_id and attempt_log.valid_uuid(fabric_image_id):
         attempt.enrich(
             attempt_log.inputs_builder(
@@ -1195,7 +1251,13 @@ async def tryon_quick_v2(
         # The AI failed, returned no image, or the request was cancelled: refund once.
         _log_ai_failure(attempt, ai_info, exc, credits_refunded=ai_call.refund())
         raise
-    attempt.succeed(**_ai_fields(ai_info))
+    # Kept for the shop for 24 hours, before the answer goes out. Never fails the try-on.
+    # Stored while the attempt is still running (see the sync route).
+    try:
+        await anyio.to_thread.run_sync(tryon_recent.store_result, supabase, attempt, image_bytes, result_mime)
+    finally:
+        # The AI succeeded: recorded as succeeded even if the request is cancelled meanwhile.
+        attempt.succeed(**_ai_fields(ai_info))
     background_tasks.add_task(tryon_results.save_copy, supabase, attempt, image_bytes)
 
     return Response(content=image_bytes, media_type=result_mime)
@@ -1235,6 +1297,10 @@ async def tryon_multi_v2(
             detail=_CONSENT_REJECTED_DETAIL,
         )
     background_tasks.add_task(_log_tryon_consent, supabase, current.shop_id)
+    # Same ticket again: the stored picture uncharged, or 409 while still being made.
+    replay = await anyio.to_thread.run_sync(_earlier_ticket, request, attempt, supabase, current.shop_id)
+    if replay is not None:
+        return Response(content=replay[0], media_type=replay[1])
 
     raw_pairs = [
         (fabric_image_id_1, apply_to_1),
@@ -1352,10 +1418,32 @@ async def tryon_multi_v2(
         # The AI failed, returned no image, or the request was cancelled: refund once.
         _log_ai_failure(attempt, ai_info, exc, credits_refunded=ai_call.refund())
         raise
-    attempt.succeed(**_ai_fields(ai_info))
+    # Kept for the shop for 24 hours, before the answer goes out. Never fails the try-on.
+    # Stored while the attempt is still running (see the sync route).
+    try:
+        await anyio.to_thread.run_sync(tryon_recent.store_result, supabase, attempt, image_bytes, result_mime)
+    finally:
+        # The AI succeeded: recorded as succeeded even if the request is cancelled meanwhile.
+        attempt.succeed(**_ai_fields(ai_info))
     background_tasks.add_task(tryon_results.save_copy, supabase, attempt, image_bytes)
 
     return Response(content=image_bytes, media_type=result_mime)
+
+
+@router.get("/recent")
+def recent_tryons(current: CurrentShopContext = Depends(get_current_shop_context)):
+    """This shop's finished try-ons from the last TRYON_SHOP_RESULT_HOURS (24), newest first,
+    at most 30. Links are signed for 15 minutes."""
+    supabase = get_supabase_admin_client()
+    return tryon_recent.recent(supabase, current.shop_id)
+
+
+@router.get("/result/{request_id}")
+def tryon_result(request_id: str, current: CurrentShopContext = Depends(get_current_shop_context)):
+    """What happened to one try-on of this shop, by request_id or client_request_id:
+    ready (with links) | running | failed | unknown."""
+    supabase = get_supabase_admin_client()
+    return tryon_recent.result_status(supabase, current.shop_id, request_id)
 
 
 def _upload_generated_output(

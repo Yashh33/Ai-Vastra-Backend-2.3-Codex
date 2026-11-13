@@ -133,18 +133,36 @@ def _tryon_refund_query(client: Any, now: datetime, status: str, limit: int):
 
 def find_missed_tryon_refunds(client: Any, now: Optional[datetime] = None) -> list[dict]:
     """Charged try-on attempts, 10 min to 24 h old, never refunded, that failed, or timed out
-    without any result having been kept (no admin copy, not pushed to the TV)."""
+    without any result having been kept (no admin copy, no 24-hour shop copy, not pushed to the TV)."""
     now = now or _utc_now()
     rows = _tryon_refund_query(client, now, "failed", TRYON_REFUND_MAX).execute().data or []
     room = TRYON_REFUND_MAX - len(rows)
     if room > 0:
         try:
-            rows += (
-                _tryon_refund_query(client, now, "timed_out", room)
-                .is_("result_copy_path", "null")
-                .is_("tryon_result_path", "null")
-                .execute()
-            ).data or []
+            try:
+                # A result kept for the shop (Round 2A) is proof the try-on succeeded too.
+                rows += (
+                    _tryon_refund_query(client, now, "timed_out", room)
+                    .is_("result_copy_path", "null")
+                    .is_("tryon_result_path", "null")
+                    .is_("shop_result_path", "null")
+                    .execute()
+                ).data or []
+            except Exception as exc:
+                if not attempt_log._is_missing_column(exc) or "shop_result_path" not in str(exc):
+                    raise
+                # Before the Round 2A SQL no shop result can exist: the check before it is enough.
+                _warn_once(
+                    "shop_result_path",
+                    "[worker] try-on refund sweep: WARNING: shop_result_path missing "
+                    "(run sql/2026-11-13_round2a_tickets_and_recent_tryons.sql); checked without it",
+                )
+                rows += (
+                    _tryon_refund_query(client, now, "timed_out", room)
+                    .is_("result_copy_path", "null")
+                    .is_("tryon_result_path", "null")
+                    .execute()
+                ).data or []
         except Exception as exc:
             if not attempt_log._is_missing_column(exc):
                 raise

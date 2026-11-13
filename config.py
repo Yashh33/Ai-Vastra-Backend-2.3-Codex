@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     GEMINI_TIMEOUT_SECONDS: float = Field(default=150, gt=0)
     # Days a small copy of each web try-on result is kept for the admin (then deleted by the worker).
     TRYON_RESULT_RETENTION_DAYS: int = Field(default=7, ge=1)
+    # Hours every finished web try-on is kept for the shop (GET /tryon/recent), then deleted by the worker.
+    TRYON_SHOP_RESULT_HOURS: int = Field(default=24, ge=1)
 
     # Single source of truth for the credit/image ratio. A future ratio
     # change (e.g. perception pricing) is a one-line edit here.

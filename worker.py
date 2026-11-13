@@ -21,6 +21,7 @@ import attempt_log
 import default_fabrics
 import picture_backfill
 import process_memory
+import tryon_recent
 import tryon_results
 import worker_housekeeping
 from config import get_settings
@@ -767,7 +768,8 @@ def run_attempt_log_housekeeping(state: dict, active_ids: Optional[set] = None) 
     - every 2 min: mark stuck attempts timed out; fail + refund looks stuck in processing
       (skipping active_ids, the jobs this process is still working on); refund charged
       try-ons whose refund did not happen;
-    - hourly: delete expired try-on result copies and expired pushed customer try-ons;
+    - hourly: delete expired try-on result copies, expired 24-hour shop try-on results and
+      expired pushed customer try-ons;
     - daily: delete log rows older than 90 days (rows only, never images)."""
     now = time.monotonic()
     try:
@@ -808,6 +810,15 @@ def run_attempt_log_housekeeping(state: dict, active_ids: Optional[set] = None) 
                 print(f"[worker] try-on results: deleted {deleted} copy(ies) older than the retention period")
     except Exception as exc:
         print(f"[worker] try-on result cleanup failed: {short_error_message(exc)}")
+
+    try:
+        if now - state.get("last_shop_tryon_cleanup", float("-inf")) >= _TRYON_COPY_CLEANUP_EVERY_SECONDS:
+            state["last_shop_tryon_cleanup"] = now
+            deleted = tryon_recent.delete_expired(get_supabase())
+            if deleted:
+                print(f"[worker] shop try-on results: deleted {deleted} file(s) older than TRYON_SHOP_RESULT_HOURS")
+    except Exception as exc:
+        print(f"[worker] shop try-on result cleanup failed: {short_error_message(exc)}")
 
     try:
         if now - state.get("last_pushed_tryon_cleanup", float("-inf")) >= _TRYON_COPY_CLEANUP_EVERY_SECONDS:

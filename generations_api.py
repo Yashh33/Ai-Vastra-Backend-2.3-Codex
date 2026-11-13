@@ -991,6 +991,83 @@ def _apply_match_color_full_res(
     return buf.getvalue(), mime_type
 
 
+_V3_SQL_FILE = "sql/2026-11-13_round2a_tickets_and_recent_tryons.sql"
+_v3_missing_warned = False
+
+
+def _is_missing_function(exc: BaseException) -> bool:
+    """PostgREST's answer for a function the SQL has not created yet."""
+    text = str(exc).lower()
+    return "pgrst202" in text or "could not find the function" in text
+
+
+def _warn_v3_missing_once() -> None:
+    global _v3_missing_warned
+    if not _v3_missing_warned:
+        _v3_missing_warned = True
+        print(
+            "[generations_api] WARNING: create_generation_with_credit_debit_v3 missing "
+            f"(run {_V3_SQL_FILE}); using v2",
+            flush=True,
+        )
+
+
+def _raise_debit_error(attempt, exc: BaseException) -> None:
+    """Map a failed debit RPC (v2 or v3) to the same HTTP answer as before. Always raises."""
+    message = str(exc).lower()
+    # The response stays exactly as before; only the logged step depends on the cause.
+    attempt.note_error(exc)
+    if "insufficient credits" in message:
+        attempt.set_step("credits")
+    elif "not found" in message or "apply_to" in message or "suit_full_body" in message or (
+        "count must be between" in message or "fabric_code is required" in message
+    ):
+        attempt.set_step("validation")
+
+    if "insufficient credits" in message:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail="Insufficient credits",
+        ) from exc
+
+    if "hero image not found" in message:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Hero image not found for this shop",
+        ) from exc
+
+    if "fabric image not found" in message:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Fabric image not found for this shop",
+        ) from exc
+
+    if "one or more fabric images not found" in message:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="One or more fabric images not found for this shop",
+        ) from exc
+
+    if (
+        "invalid apply_to value" in message
+        or "duplicate apply_to value" in message
+        or "suit_full_body cannot be combined" in message
+        or "count must be between 1 and 3" in message
+        or "count must be between 1 and 6" in message
+        or "must include fabric_image_id and apply_to" in message
+        or "fabric_code is required" in message
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail="Failed to create generation",
+    ) from exc
+
+
 @router.post("")
 def create_generation(
     body: GenerationCreateRequest,
@@ -1074,71 +1151,53 @@ def create_generation(
     )
 
     attempt.set_step("db_save")
+    # The ticket: the same X-Client-Request-Id again returns the look already made, uncharged.
+    ticket = attempt_log.valid_uuid(request.headers.get("x-client-request-id"))
+    details = body.details_payload(only_set=False)
+    result = None
     try:
         result = (
             supabase.rpc(
-                "create_generation_with_credit_debit_v2",
+                "create_generation_with_credit_debit_v3",
                 {
                     "p_shop_id": current.shop_id,
                     "p_hero_image_id": hero_image_id,
                     "p_fabrics": normalized_fabrics,
                     "p_credits_cost": settings.CREDITS_PER_IMAGE,
+                    "p_prompt_used": prompt_used,
+                    "p_model_used": model_id,
+                    "p_client_request_id": ticket,
+                    "p_barcode": details.get("barcode"),
+                    "p_mrp": details.get("mrp"),
+                    "p_description": details.get("description"),
+                    "p_default_fabric_slots": default_slots or None,
                 },
             )
             .execute()
         )
     except Exception as exc:
-        message = str(exc).lower()
-        # The response stays exactly as before; only the logged step depends on the cause.
-        attempt.note_error(exc)
-        if "insufficient credits" in message:
-            attempt.set_step("credits")
-        elif "not found" in message or "apply_to" in message or "suit_full_body" in message or (
-            "count must be between" in message or "fabric_code is required" in message
-        ):
-            attempt.set_step("validation")
+        if not _is_missing_function(exc):
+            _raise_debit_error(attempt, exc)
+        _warn_v3_missing_once()
 
-        if "insufficient credits" in message:
-            raise HTTPException(
-                status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                detail="Insufficient credits",
-            ) from exc
-
-        if "hero image not found" in message:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Hero image not found for this shop",
-            ) from exc
-
-        if "fabric image not found" in message:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Fabric image not found for this shop",
-            ) from exc
-
-        if "one or more fabric images not found" in message:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="One or more fabric images not found for this shop",
-            ) from exc
-
-        if (
-            "invalid apply_to value" in message
-            or "duplicate apply_to value" in message
-            or "suit_full_body cannot be combined" in message
-            or "count must be between 1 and 3" in message
-            or "must include fabric_image_id and apply_to" in message
-            or "fabric_code is required" in message
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=str(exc),
-            ) from exc
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create generation",
-        ) from exc
+    saved_by_v3 = result is not None
+    if not saved_by_v3:
+        # The SQL file has not run yet: today's v2 path, exactly as before.
+        try:
+            result = (
+                supabase.rpc(
+                    "create_generation_with_credit_debit_v2",
+                    {
+                        "p_shop_id": current.shop_id,
+                        "p_hero_image_id": hero_image_id,
+                        "p_fabrics": normalized_fabrics,
+                        "p_credits_cost": settings.CREDITS_PER_IMAGE,
+                    },
+                )
+                .execute()
+            )
+        except Exception as exc:
+            _raise_debit_error(attempt, exc)
 
     rows = getattr(result, "data", None) or []
     if not rows:
@@ -1149,43 +1208,68 @@ def create_generation(
 
     row = rows[0]
     generation_id = row["generation_id"]
+
+    if saved_by_v3 and row.get("duplicate"):
+        # Nothing charged. This attempt row finishes now and is NOT linked by generation_id,
+        # so the worker keeps finishing the original attempt row for that look.
+        attempt.succeed(
+            credits_charged=0,
+            user_message=(
+                f"Repeated an earlier request (same X-Client-Request-Id {ticket}): "
+                f"answered with look {generation_id}, nothing charged."
+            ),
+        )
+        return {
+            "id": generation_id,
+            "status": row.get("status"),
+            # This request charged nothing.
+            "credits_used": 0,
+            "balance_before": row.get("balance_before"),
+            "balance_after": row.get("balance_after"),
+            "prompt_saved": True,
+            "duplicate": True,
+        }
+
     # Charged by the RPC above; the worker writes the final status.
     attempt.running(generation_id=generation_id, credits_charged=row.get("credits_used"))
 
     prompt_saved = True
     prompt_save_warning = None
+    fabric_metadata_warning = None
 
-    # Best-effort save: avoid failing the request after credits were already debited.
-    try:
-        retry_once(
-            lambda: supabase.table("generations")
-            .update(
-                {
-                    "prompt_used": prompt_used,
-                    # Keep legacy column populated for backward compatibility.
-                    "fabric_image_id": primary_fabric_image_id,
-                    "generation_type": "look",
-                    "model_used": model_id,
-                    **body.details_payload(only_set=False),
-                    # Saved with prompt_used: if this update fails the worker fails the job
-                    # ("prompt_used is empty") and refunds, never runs without its defaults.
-                    **({"default_fabric_slots": default_slots} if default_slots else {}),
-                }
+    if not saved_by_v3:
+        # v2 only: v3 saved all of this in the same step as the charge.
+        # Best-effort save: avoid failing the request after credits were already debited.
+        try:
+            retry_once(
+                lambda: supabase.table("generations")
+                .update(
+                    {
+                        "prompt_used": prompt_used,
+                        # Keep legacy column populated for backward compatibility.
+                        "fabric_image_id": primary_fabric_image_id,
+                        "generation_type": "look",
+                        "model_used": model_id,
+                        **details,
+                        # Saved with prompt_used: if this update fails the worker fails the job
+                        # ("prompt_used is empty") and refunds, never runs without its defaults.
+                        **({"default_fabric_slots": default_slots} if default_slots else {}),
+                    }
+                )
+                .eq("id", generation_id)
+                .eq("shop_id", current.shop_id)
+                .execute()
             )
-            .eq("id", generation_id)
-            .eq("shop_id", current.shop_id)
-            .execute()
-        )
-    except Exception as exc:
-        prompt_saved = False
-        prompt_save_warning = f"Generation queued, but prompt could not be saved: {exc}"
+        except Exception as exc:
+            prompt_saved = False
+            prompt_save_warning = f"Generation queued, but prompt could not be saved: {exc}"
 
-    fabric_metadata_warning = _persist_generation_fabric_metadata(
-        supabase=supabase,
-        shop_id=current.shop_id,
-        generation_id=generation_id,
-        normalized_fabrics=normalized_fabrics,
-    )
+        fabric_metadata_warning = _persist_generation_fabric_metadata(
+            supabase=supabase,
+            shop_id=current.shop_id,
+            generation_id=generation_id,
+            normalized_fabrics=normalized_fabrics,
+        )
 
     response = {
         "id": generation_id,
